@@ -28,6 +28,7 @@ from .writer import make_writer
 @dataclass(frozen=True)
 class Job:
     goal: str
+    act: bool = True  # False is a dry run: it decides and reports, and never touches the machine
 
 
 class Daemon:
@@ -42,11 +43,16 @@ class Daemon:
         self.jobs: queue.Queue = queue.Queue()
         self.stopped = threading.Event()
         self.running = False
+        self.act = True  # the panel flips this; the headless daemon always acts
+        self.voice_enabled = True
 
     # ------------------------------------------------------------------ hotkey handlers
 
     def on_talk(self) -> None:
         """Record, transcribe, and let the classifier say what it was."""
+        if not self.voice_enabled:
+            self.log("voice is off")
+            return
         try:
             said = self.listen_now()
         except VoiceUnavailable as e:
@@ -66,6 +72,28 @@ class Daemon:
         if not typed or not typed.strip():
             return
         self.queue_goal(typed.strip())
+
+    def probe_voice(self):
+        """Hear one line and say what it was taken for, without acting on it.
+
+        The honest way to try a microphone, a model and a phrasing: it runs the whole path up to
+        the dispatch and stops there, so nothing is queued and no flag is flipped.
+        """
+        try:
+            said = self.listen_now()
+        except VoiceUnavailable as e:
+            self.log(f"voice unavailable: {e}")
+            return None
+        except Exception as e:
+            self.log(f"voice failed: {e}")
+            return None
+        if not said or not said.strip():
+            self.log("test: heard nothing")
+            return None
+        decided = self.interpret_line(said, self.running, self.control.paused)
+        verdict = "would act" if decided.actionable else "would be ignored"
+        self.log(f"test: heard {said!r} -> {decided.command} ({decided.confidence:.2f}, heard {decided.heard:.2f}); {verdict}")
+        return decided
 
     def on_pause(self) -> None:
         self.log("paused" if self.control.toggle_pause() else "resumed")
@@ -112,8 +140,8 @@ class Daemon:
             self.log("resumed")
 
     def queue_goal(self, goal: str) -> None:
-        self.jobs.put(Job(goal))
-        self.log(f"  queued: {goal!r}")
+        self.jobs.put(Job(goal, act=self.act))
+        self.log(f"  queued: {goal!r}" + ("" if self.act else "  (dry run: it will decide, not act)"))
 
     # ------------------------------------------------------------------ the run worker
 
@@ -155,6 +183,11 @@ class Service:
         self._stopping = False
 
     # ------------------------------------------------------------------ wiring
+
+    def post(self, handler) -> None:
+        """Run something on the input worker. For work that blocks — recording holds until the key
+        comes up — called from a hotkey callback or from the Tk thread, neither of which may wait."""
+        self.commands.put(handler)
 
     def bind_hotkeys(self) -> None:
         """Give every hotkey a callback that posts and returns: the pump must never block."""
@@ -250,7 +283,7 @@ def build(log=print) -> Daemon:
     writer = make_writer()
 
     def run_job(job: Job, control: Control) -> None:
-        cfg = RunConfig(goal=job.goal, out=Path("runs") / time.strftime("%Y%m%d-%H%M%S"), act=True)
+        cfg = RunConfig(goal=job.goal, out=Path("runs") / time.strftime("%Y%m%d-%H%M%S"), act=job.act)
 
         def ctx_factory(typesafe, history):
             return Context(

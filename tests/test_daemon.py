@@ -272,3 +272,62 @@ def test_a_service_without_hotkeys_still_runs_its_two_workers(monkeypatch):
         service.stop()
     for thread in service.threads:
         assert not thread.is_alive()
+
+
+# ------------------------------------------------------------------ act / voice toggles
+
+
+def test_a_queued_goal_carries_the_act_flag_the_daemon_is_set_to():
+    daemon, _ = make_daemon()
+    daemon.act = False
+    daemon.queue_goal("look but do not touch")
+    assert daemon.jobs.get_nowait() == Job("look but do not touch", act=False)
+
+
+def test_a_job_defaults_to_acting_so_the_headless_daemon_is_unchanged():
+    daemon, _ = make_daemon()
+    daemon.queue_goal("go")
+    assert daemon.jobs.get_nowait().act is True
+
+
+def test_turning_voice_off_stops_the_talk_hotkey_reaching_the_microphone():
+    daemon, _ = make_daemon()
+    daemon.voice_enabled = False
+
+    def recorded():
+        raise AssertionError("voice is off, so nothing should have been recorded")
+
+    daemon.listen_now = recorded
+    daemon.on_talk()
+    assert daemon.jobs.empty()
+
+
+def test_probe_voice_reports_the_verdict_without_queueing_or_flipping_anything():
+    daemon, _ = make_daemon(intent=Intent("run_goal", "open the console", 0.9, 0.9, "open the console", 0.55))
+    logged = []
+    daemon.log = logged.append
+    decided = daemon.probe_voice()
+    assert decided.command == "run_goal"
+    assert daemon.jobs.empty(), "a test must never start a run"
+    assert daemon.control.aborting is False and daemon.control.paused is False
+    assert any("would act" in line for line in logged)
+
+
+def test_probe_voice_says_when_a_line_would_be_ignored():
+    daemon, _ = make_daemon(intent=Intent("ignore", "", 0.9, 0.9, "lunch?", 0.55))
+    logged = []
+    daemon.log = logged.append
+    daemon.probe_voice()
+    assert any("would be ignored" in line for line in logged)
+    assert daemon.jobs.empty()
+
+
+def test_probe_voice_survives_a_missing_microphone():
+    from typesafe_computer_use_win.voice import VoiceUnavailable
+
+    logged = []
+    daemon, _ = make_daemon()
+    daemon.log = logged.append
+    daemon.listen_now = lambda: (_ for _ in ()).throw(VoiceUnavailable("no microphone"))
+    assert daemon.probe_voice() is None
+    assert any("no microphone" in line for line in logged)

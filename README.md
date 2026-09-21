@@ -148,7 +148,15 @@ uv run winclicker-ui
 ```
 
 A local control panel, in three tabs. **Run** takes a goal typed or spoken and shows the step feed
-as it happens, with Start, Pause and Abort wired to the same control the hotkeys drive. **History**
+as it happens, with Start, Pause and Abort wired to the same control the hotkeys drive.
+
+It opens in **Dry run**, and that is the default on purpose: a goal is captured, perceived and
+decided, the choice and its confidence are printed, and nothing is clicked. Switch to **Act** when
+you want it to drive. The **voice** switch turns push-to-talk off without stopping the daemon, and
+**Test voice** runs the whole voice path once — record, transcribe, classify — then reports what
+the line was taken for and whether it would have acted, without queueing anything. That is the
+cheap way to find out how your microphone and your phrasing survive the model before letting a run
+loose on the machine. **History**
 lists the `runs/` folder, and for any step shows the annotated capture that step decided on.
 **Settings** edits the hotkeys, the OCR engine, the whisper model and the confidence floors, and
 writes them back to `.env` in place, keeping your comments and any key it was not asked to change.

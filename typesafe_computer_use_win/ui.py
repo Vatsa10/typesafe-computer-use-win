@@ -156,6 +156,42 @@ class Panel:
         self.pause_button.pack(side="left", padx=2)
         ttk.Button(entry_row, text="Abort", command=self.abort).pack(side="left", padx=2)
 
+        modes = tk.Frame(frame, bg=BG)
+        modes.pack(fill="x", padx=12, pady=(0, 4))
+        self.act_mode = tk.BooleanVar(value=False)  # dry run by default: nothing clicks until you say so
+        self.act_mode.trace_add("write", lambda *_: self._apply_mode())
+        for label, value, hint in (
+            ("Dry run", False, "decide and report, touch nothing"),
+            ("Act", True, "really click and type"),
+        ):
+            tk.Radiobutton(
+                modes,
+                text=f"{label}  ({hint})",
+                variable=self.act_mode,
+                value=value,
+                bg=BG,
+                fg=MUTED,
+                selectcolor=PANEL,
+                activebackground=BG,
+                activeforeground=INK,
+                font=("Segoe UI", 9),
+            ).pack(side="left", padx=(0, 16))
+
+        self.voice_on = tk.BooleanVar(value=True)
+        self.voice_on.trace_add("write", lambda *_: self._apply_mode())
+        tk.Checkbutton(
+            modes,
+            text="voice",
+            variable=self.voice_on,
+            bg=BG,
+            fg=MUTED,
+            selectcolor=PANEL,
+            activebackground=BG,
+            activeforeground=INK,
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        ttk.Button(modes, text="Test voice", command=self.test_voice).pack(side="left", padx=8)
+
         options = tk.Frame(frame, bg=BG)
         options.pack(fill="x", padx=12)
         self.hide_while_acting = tk.BooleanVar(value=True)
@@ -179,6 +215,24 @@ class Panel:
         scroll.pack(side="right", fill="y")
         self.feed.pack(side="left", fill="both", expand=True)
         _append(self.feed, "ready. type a goal, or hold the talk hotkey and say one.")
+
+    def _apply_mode(self) -> None:
+        """Push the toggles onto the daemon. Both are read at dispatch, so a change lands on the
+        next goal rather than on the run already going."""
+        self.daemon.act = bool(self.act_mode.get())
+        self.daemon.voice_enabled = bool(self.voice_on.get())
+
+    def test_voice(self) -> None:
+        """Hear one line and report what it was taken for, without running it.
+
+        Recording blocks for as long as the key is held, so it cannot happen on the Tk thread:
+        the window would freeze mid-utterance. It goes to the input worker like a hotkey does.
+        """
+        if not self.voice_on.get():
+            _append(self.feed, "voice is off")
+            return
+        _append(self.feed, "test: hold the talk hotkey and say something")
+        self.service.post(self.daemon.probe_voice)
 
     def start(self) -> None:
         goal = self.goal_entry.get().strip()
