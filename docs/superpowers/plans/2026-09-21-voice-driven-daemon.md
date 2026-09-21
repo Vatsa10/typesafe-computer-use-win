@@ -356,7 +356,7 @@ VK_NAMES = {
 
 
 def parse_hotkey(spec: str) -> tuple[int, int]:
-    """"ctrl+alt+space" to the modifier mask and virtual key RegisterHotKey wants."""
+    """ "ctrl+alt+space" to the modifier mask and virtual key RegisterHotKey wants."""
     parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
     if not parts:
         raise ValueError(f"hotkey {spec!r} is empty")
@@ -561,7 +561,11 @@ def test_a_transcript_is_stripped_and_joined(monkeypatch):
         def __init__(self, text):
             self.text = text
 
-    monkeypatch.setattr(voice, "_load_model", lambda name: type("M", (), {"transcribe": lambda self, a: [FakeSegment(" open "), FakeSegment("the console ")]})())
+    monkeypatch.setattr(
+        voice,
+        "_load_model",
+        lambda name: type("M", (), {"transcribe": lambda self, a: [FakeSegment(" open "), FakeSegment("the console ")]})(),
+    )
     monkeypatch.setattr(voice, "frames_to_audio", lambda frames: "audio")
     assert voice.transcribe_frames([b"\x00\x00"], "base.en") == "open the console"
 ```
@@ -827,7 +831,7 @@ def _default_factory(prompt: str):
 
 def ask_for_goal(prompt: str = "goal", tk_factory: Callable[[], tuple] | None = None) -> str | None:
     """Show the bar and block until the user submits or cancels. None means nothing to run."""
-    root, entry = (_default_factory(prompt) if tk_factory is None else tk_factory())
+    root, entry = _default_factory(prompt) if tk_factory is None else tk_factory()
     typed: list[str] = []
 
     def submit(_event=None):
@@ -1266,8 +1270,7 @@ def interpret(client, transcript: str, running: bool, paused: bool, min_confiden
         "a_run_is_active": running,
         "the_run_is_paused": paused,
         "what_the_assistant_does": (
-            "drives this Windows machine toward a goal spoken in plain English: opening sites, "
-            "clicking controls, filling fields"
+            "drives this Windows machine toward a goal spoken in plain English: opening sites, clicking controls, filling fields"
         ),
     }
     questions = {

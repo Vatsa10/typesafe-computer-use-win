@@ -40,6 +40,13 @@ dependencies = [
 # Install with `uv sync --extra rapidocr` and set CLICKER_OCR_ENGINE=rapidocr.
 rapidocr = ["rapidocr-onnxruntime==1.4.4"]
 
+# Push-to-talk. whisper.cpp ships a prebuilt wheel for Windows AMD64, so this needs no compiler.
+voice = [
+    "pywhispercpp==1.5.1",
+    "sounddevice==0.5.6",
+    "numpy>=2.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/Vatsa10/typesafe-computer-use-win"
 Issues = "https://github.com/Vatsa10/typesafe-computer-use-win/issues"
@@ -48,6 +55,7 @@ Upstream = "https://github.com/awlevin/typesafe-computer-use"
 [project.scripts]
 winclicker = "typesafe_computer_use_win.cli:main"
 winclicker-inspect = "typesafe_computer_use_win.cli:inspect"
+winclicker-daemon = "typesafe_computer_use_win.cli:daemon"
 
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.16.8"]

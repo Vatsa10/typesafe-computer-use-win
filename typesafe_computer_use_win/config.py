@@ -54,3 +54,33 @@ def answer_model() -> str:
 
 def email() -> str | None:
     return os.environ.get("CLICKER_EMAIL") or None
+
+
+# The daemon's global hotkeys. Ctrl+Alt is the least contested corner of the Windows keyboard:
+# Win+key belongs to the shell, and Ctrl+Shift+key to whatever app has focus.
+DEFAULT_HOTKEYS = {
+    "talk": "ctrl+alt+space",
+    "goal": "ctrl+alt+g",
+    "pause": "ctrl+alt+p",
+    "abort": "ctrl+alt+x",
+    "quit": "ctrl+alt+q",
+}
+DEFAULT_WHISPER_MODEL = "base.en"
+DEFAULT_VOICE_MAX_SECONDS = 30.0
+DEFAULT_VOICE_MIN_CONFIDENCE = 0.55
+
+
+def hotkey(name: str) -> str:
+    return os.environ.get(f"CLICKER_HOTKEY_{name.upper()}", DEFAULT_HOTKEYS[name])
+
+
+def whisper_model() -> str:
+    return os.environ.get("CLICKER_WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
+
+
+def voice_max_seconds() -> float:
+    return float(os.environ.get("CLICKER_VOICE_MAX_SECONDS", DEFAULT_VOICE_MAX_SECONDS))
+
+
+def voice_min_confidence() -> float:
+    return float(os.environ.get("CLICKER_VOICE_MIN_CONFIDENCE", DEFAULT_VOICE_MIN_CONFIDENCE))
