@@ -16,6 +16,10 @@ fiftieth of a cent per step. It never sends a screenshot to a big model. Instead
 reads the screen deterministically, asks a small classifier which action comes next,
 and only calls a writing model when a text field genuinely needs free text.
 
+A Windows port of [awlevin/typesafe-computer-use](https://github.com/awlevin/typesafe-computer-use):
+same loop and the same decision design, with the platform adapter rewritten over UI
+Automation, `user32` and the OCR engine that ships with Windows.
+
 ```
 winclicker "go to techcrunch and take me to the checkout page for the cheapest tickets to their next upcoming event" --act
 ```
@@ -193,9 +197,10 @@ under 0.1 s. A step against Chrome costs about 0.4 s in the tree and 0.13 s in O
 
 A pattern invoke does not need an element to be visible. Chromium delivers a press to a link
 it clamped to a 1 px sliver because the page is scrolled past it, a collapsed side panel still
-exposes its buttons, and an app's tab strip keeps offering the tabs scrolled out of it. So the same walk keeps the labelled, pressable nodes
-it pruned, and offers them as a separate capped list rather than mixing them into the items:
-nothing on the capture points at them, and a mouse click would land somewhere else entirely.
+exposes its buttons, and an app's tab strip keeps offering the tabs scrolled out of it. So the
+same walk keeps the labelled, pressable nodes it pruned, and offers them as a separate capped
+list rather than mixing them into the items: nothing on the capture points at them, and a
+mouse click would land somewhere else entirely.
 
 The list is deduplicated by role and label, drops any label the visible items already carry,
 and stops at 120 controls, after which those subtrees are pruned as before, so the walk costs
@@ -297,10 +302,9 @@ the capture all speak the same physical pixels. A port to another platform repla
 file: the walk in `axwalk.py` takes its children, attributes and actions as callables, so only
 those three bindings change.
 
-This is a Windows fork of [awlevin/typesafe-computer-use](https://github.com/awlevin/typesafe-computer-use),
-which targets macOS through Quartz, the accessibility API and Vision OCR. The loop, the
-decision design, the OCR cache and the run folder are that project's; the platform adapter
-here is a rewrite. MIT either way.
+The upstream project targets macOS through Quartz, the accessibility API and Vision OCR. The
+loop, the decision design, the OCR cache and the run folder are its work; `windows.py`,
+`axwalk.py` and the OCR engine selection are this port's.
 
 ## Known limits
 
@@ -328,4 +332,5 @@ CI runs the same on `windows-latest`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Copyright the upstream author for the original, and this port's author for
+the Windows work; both notices are in the file, as MIT requires.
