@@ -153,3 +153,122 @@ def test_a_voice_error_is_reported_and_survived():
     daemon.on_talk()
     assert any("no microphone" in str(line) for line in logged)
     assert daemon.jobs.empty()
+
+
+# ---------------------------------------------------------------- the service wrapper
+
+
+def make_service(monkeypatch, **kw):
+    """A Service over a fake daemon, with every win32 call replaced by a fake."""
+    import time as _time
+
+    from typesafe_computer_use_win import hotkeys as hotkeys_module
+    from typesafe_computer_use_win import windows
+    from typesafe_computer_use_win.daemon import Service
+
+    registered: list[int] = []
+    unregistered: list[int] = []
+    pumping = threading.Event()
+
+    def pump(on_hotkey, stop):
+        pumping.set()
+        while not stop():
+            _time.sleep(0.01)
+
+    monkeypatch.setattr(windows, "register_hotkey", lambda i, m, k: registered.append(i) or True)
+    monkeypatch.setattr(windows, "unregister_hotkey", unregistered.append)
+    monkeypatch.setattr(windows, "post_quit_message", lambda tid: None)
+    monkeypatch.setattr(windows, "current_thread_id", lambda: 1)
+    monkeypatch.setattr(windows, "pump_messages", pump)
+
+    daemon, ran = make_daemon(**kw)
+    daemon.keys = hotkeys_module.Hotkeys()
+    service = Service(daemon, log=lambda *a: None)
+    return service, ran, registered, unregistered, pumping
+
+
+def test_the_service_starts_three_threads_without_blocking(monkeypatch):
+    service, _, registered, _, pumping = make_service(monkeypatch)
+    service.start()
+    try:
+        assert pumping.wait(2.0), "the hotkey thread must register and then pump"
+        assert len(registered) == 5, "every binding is claimed on the pumping thread"
+        assert sorted(t.name for t in service.threads) == ["hotkeys", "input", "runs"]
+    finally:
+        service.stop()
+
+
+def test_stopping_the_service_leaves_no_thread_alive(monkeypatch):
+    service, _, _, unregistered, pumping = make_service(monkeypatch)
+    service.start()
+    assert pumping.wait(2.0)
+    service.stop()
+    assert service.daemon.stopped.is_set()
+    assert len(unregistered) == 5
+    for thread in service.threads:
+        assert not thread.is_alive(), f"{thread.name} outlived stop()"
+
+
+def test_stopping_twice_is_harmless(monkeypatch):
+    service, _, _, _, pumping = make_service(monkeypatch)
+    service.start()
+    assert pumping.wait(2.0)
+    service.stop()
+    service.stop()  # the Tk thread may stop a service that already quit itself
+    for thread in service.threads:
+        assert not thread.is_alive()
+
+
+def test_starting_twice_starts_one_set_of_threads(monkeypatch):
+    service, _, registered, _, pumping = make_service(monkeypatch)
+    service.start()
+    assert pumping.wait(2.0)
+    service.start()
+    try:
+        assert len(service.threads) == 3
+        assert len(registered) == 5
+    finally:
+        service.stop()
+
+
+def test_a_hotkey_callback_posts_and_the_input_worker_runs_it(monkeypatch):
+    done = threading.Event()
+    service, ran, _, _, pumping = make_service(monkeypatch)
+    service.daemon.run_job = lambda job, control: (ran.append(job.goal), done.set())
+    service.start()
+    try:
+        assert pumping.wait(2.0)
+        keys = service.daemon.keys
+        keys.dispatch(keys.id_of("goal"))  # as the pump would, on the pumping thread
+        assert done.wait(2.0), "the input worker must pick the posted handler up"
+        assert ran == ["open the console"]
+    finally:
+        service.stop()
+
+
+def test_the_service_join_returns_once_the_daemon_quits(monkeypatch):
+    service, _, _, _, pumping = make_service(monkeypatch)
+    service.start()
+    try:
+        assert pumping.wait(2.0)
+        service.join(timeout=0.3)  # still running: the timeout is what ends the wait
+        assert not service.daemon.stopped.is_set()
+        service.daemon.on_quit()
+        service.join(timeout=2.0)
+        assert service.daemon.stopped.is_set()
+    finally:
+        service.stop()
+
+
+def test_a_service_without_hotkeys_still_runs_its_two_workers(monkeypatch):
+    from typesafe_computer_use_win.daemon import Service
+
+    daemon, _ = make_daemon()
+    service = Service(daemon, log=lambda *a: None)
+    service.start()
+    try:
+        assert sorted(t.name for t in service.threads) == ["input", "runs"]
+    finally:
+        service.stop()
+    for thread in service.threads:
+        assert not thread.is_alive()

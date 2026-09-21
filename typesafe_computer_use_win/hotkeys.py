@@ -116,6 +116,18 @@ class Hotkeys:
         self._thread_id = windows.current_thread_id()
         windows.pump_messages(on_hotkey=self.dispatch, stop=self._stop.is_set)
 
+    def serve(self, on_ready: Callable[[list[str]], None] | None = None) -> None:
+        """Register, report, then pump — all on the calling thread.
+
+        Windows delivers WM_HOTKEY only to the thread that registered the hotkey, so a UI that
+        wants the main thread runs this on a worker instead. `on_ready` is called once, after
+        registration and before the pump starts, with the names another app already owns.
+        """
+        refused = self.register()
+        if on_ready is not None:
+            on_ready(refused)
+        self.run()
+
     def stop(self) -> None:
         """Release the combinations and wake the pump. Safe from another thread."""
         self._stop.set()

@@ -1,9 +1,10 @@
 """The resident process: hotkeys in, one run at a time out.
 
 Three threads, because Windows requires it. RegisterHotKey delivers WM_HOTKEY only to the thread
-that registered it and only while that thread pumps messages, so the pump owns the main thread and
-does nothing else. Recording, transcription, the overlay and the classifier run on the input
-worker, and the loop itself on the run worker, so a three-second utterance never stalls the pump.
+that registered it and only while that thread pumps messages, so one worker thread registers and
+pumps and does nothing else. Recording, transcription, the overlay and the classifier run on the
+input worker, and the loop itself on the run worker, so a three-second utterance never stalls the
+pump. The main thread is left free for a UI; `Service` is what such a UI starts and stops.
 
 Every collaborator is injected, which is what makes this testable without a microphone.
 """
@@ -133,6 +134,115 @@ class Daemon:
                 self.log("idle")
 
 
+class Service:
+    """The daemon's threads, startable and stoppable from anywhere.
+
+    `start()` returns at once, so the caller's thread stays free — for a Tk `mainloop()`, or for
+    the headless `serve()` below, which simply blocks on `join()`. The hotkeys are registered AND
+    pumped on one worker thread, because Windows delivers WM_HOTKEY nowhere else.
+    """
+
+    HOTKEY_HANDLERS = ("talk", "goal", "pause", "abort", "quit")
+    JOIN_TIMEOUT = 3.0
+
+    def __init__(self, daemon: Daemon, log=print) -> None:
+        self.daemon = daemon
+        self.log = log
+        self.commands: queue.Queue = queue.Queue()
+        self.threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._started = False
+        self._stopping = False
+
+    # ------------------------------------------------------------------ wiring
+
+    def bind_hotkeys(self) -> None:
+        """Give every hotkey a callback that posts and returns: the pump must never block."""
+        keys = self.daemon.keys
+        if keys is None or keys.bindings:
+            return
+        for name in self.HOTKEY_HANDLERS:
+            handler = getattr(self.daemon, f"on_{name}")
+            keys.add(name, config.hotkey(name), (lambda h=handler: self.commands.put(h)))
+
+    def report(self, refused: list[str]) -> None:
+        keys = self.daemon.keys
+        if keys is None:
+            return
+        for name in refused:
+            self.log(f"hotkey for {name} is taken by another app: {config.hotkey(name)}")
+        for binding in keys.bindings.values():
+            if binding.name not in refused:
+                self.log(f"  {binding.spec:<16} {binding.name}")
+
+    # ------------------------------------------------------------------ the threads
+
+    def _pump(self) -> None:
+        keys = self.daemon.keys
+        assert keys is not None
+        try:
+            keys.serve(on_ready=self.report)
+        except Exception:
+            self.log("the hotkey pump failed:\n" + traceback.format_exc())
+
+    def _input_worker(self) -> None:
+        while not self.daemon.stopped.is_set():
+            try:
+                handler = self.commands.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if handler is None:
+                return
+            try:
+                handler()
+            except Exception:
+                self.log("a hotkey handler failed:\n" + traceback.format_exc())
+
+    # ------------------------------------------------------------------ lifecycle
+
+    def start(self) -> None:
+        """Start the threads and return. Never blocks."""
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+        self.bind_hotkeys()
+        self.threads = [
+            threading.Thread(target=self._input_worker, name="input", daemon=True),
+            threading.Thread(target=self.daemon.work, name="runs", daemon=True),
+        ]
+        if self.daemon.keys is not None:
+            self.threads.insert(0, threading.Thread(target=self._pump, name="hotkeys", daemon=True))
+        for thread in self.threads:
+            thread.start()
+
+    def stop(self) -> None:
+        """Quit the daemon, wake every queue, and join. Idempotent, and safe from any thread."""
+        with self._lock:
+            first = not self._stopping
+            self._stopping = True
+        if first and not self.daemon.stopped.is_set():
+            self.daemon.on_quit()
+        self.daemon.stopped.set()
+        self.commands.put(None)
+        self.daemon.jobs.put(None)
+        if self.daemon.keys is not None:
+            self.daemon.keys.stop()
+        current = threading.current_thread()
+        for thread in self.threads:
+            if thread is not current:
+                thread.join(timeout=self.JOIN_TIMEOUT)
+
+    def join(self, timeout: float | None = None) -> None:
+        """Block until the daemon is asked to quit, or until `timeout` runs out."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.daemon.stopped.is_set():
+            # A short wait rather than one long one, so Ctrl-C lands on the main thread.
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            self.daemon.stopped.wait(0.2)
+
+
 def build(log=print) -> Daemon:
     """Wire the real collaborators: hotkeys, the microphone, the model, the loop."""
     control = Control()
@@ -152,7 +262,9 @@ def build(log=print) -> Daemon:
                 history=history,
             )
 
-        run(cfg, ctx_factory, control)
+        # echo=log is what puts the step lines in front of whoever is watching: the terminal for
+        # the headless daemon, the live feed for the panel.
+        run(cfg, ctx_factory, control, echo=log)
 
     def interpret_line(text: str, running: bool, paused: bool):
         from typesafe_sdk import TypeSafeClient
@@ -175,58 +287,15 @@ def build(log=print) -> Daemon:
 
 
 def serve(log=print) -> None:
-    """Start the daemon and block until it is asked to quit."""
+    """Start the daemon headless and block until it is asked to quit."""
     daemon = build(log)
-    keys = daemon.keys
-    commands: queue.Queue = queue.Queue()
-
-    # A hotkey callback must return at once: the pump that delivered it is the same thread that
-    # delivers the next one. So the callbacks post, and the input worker does the work.
-    for name, handler in (
-        ("talk", daemon.on_talk),
-        ("goal", daemon.on_goal),
-        ("pause", daemon.on_pause),
-        ("abort", daemon.on_abort),
-        ("quit", daemon.on_quit),
-    ):
-        keys.add(name, config.hotkey(name), (lambda h=handler: commands.put(h)))
-
-    refused = keys.register()
-    for name in refused:
-        log(f"hotkey for {name} is taken by another app: {config.hotkey(name)}")
-    for binding in keys.bindings.values():
-        if binding.name not in refused:
-            log(f"  {binding.spec:<16} {binding.name}")
-
-    def input_worker() -> None:
-        while not daemon.stopped.is_set():
-            try:
-                handler = commands.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if handler is None:
-                return
-            try:
-                handler()
-            except Exception:
-                log("a hotkey handler failed:\n" + traceback.format_exc())
-
-    threads = [
-        threading.Thread(target=input_worker, name="input", daemon=True),
-        threading.Thread(target=daemon.work, name="runs", daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
+    service = Service(daemon, log)
+    service.start()
     log("listening. hold the talk hotkey and say what you want done.")
     try:
-        keys.run()
+        service.join()
     except KeyboardInterrupt:
-        daemon.on_quit()
+        pass
     finally:
-        daemon.stopped.set()
-        commands.put(None)
-        daemon.jobs.put(None)
-        keys.stop()
-        for thread in threads:
-            thread.join(timeout=3.0)
+        service.stop()
     log("stopped")

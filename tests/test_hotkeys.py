@@ -70,3 +70,61 @@ def test_stop_unregisters_everything_it_registered(monkeypatch):
     keys.register()
     keys.stop()
     assert removed == [keys.id_of("talk")]
+
+
+def test_serve_registers_before_it_pumps(monkeypatch):
+    order = []
+    monkeypatch.setattr(windows, "register_hotkey", lambda i, m, k: order.append("register") or True)
+    monkeypatch.setattr(windows, "current_thread_id", lambda: 1)
+    monkeypatch.setattr(windows, "pump_messages", lambda on_hotkey, stop: order.append("pump"))
+    keys = hotkeys.Hotkeys()
+    keys.add("talk", "ctrl+alt+space", lambda: None)
+    keys.serve(on_ready=lambda refused: order.append("ready"))
+    assert order == ["register", "ready", "pump"], "the pump must start only once every key is claimed"
+
+
+def test_serve_hands_on_ready_the_refused_names(monkeypatch):
+    seen = []
+    monkeypatch.setattr(windows, "register_hotkey", lambda i, m, k: i != 2)
+    monkeypatch.setattr(windows, "current_thread_id", lambda: 1)
+    monkeypatch.setattr(windows, "pump_messages", lambda on_hotkey, stop: None)
+    keys = hotkeys.Hotkeys()
+    keys.add("talk", "ctrl+alt+space", lambda: None)
+    keys.add("taken", "ctrl+alt+p", lambda: None)
+    keys.serve(on_ready=seen.append)
+    assert seen == [["taken"]]
+
+
+def test_serve_without_a_callback_still_registers_and_pumps(monkeypatch):
+    pumped = []
+    monkeypatch.setattr(windows, "register_hotkey", lambda i, m, k: True)
+    monkeypatch.setattr(windows, "current_thread_id", lambda: 1)
+    monkeypatch.setattr(windows, "pump_messages", lambda on_hotkey, stop: pumped.append(True))
+    keys = hotkeys.Hotkeys()
+    keys.add("talk", "ctrl+alt+space", lambda: None)
+    keys.serve()
+    assert pumped == [True]
+
+
+def test_stop_from_another_thread_ends_a_serving_pump(monkeypatch):
+    import threading
+    import time
+
+    def pump(on_hotkey, stop):
+        while not stop():
+            time.sleep(0.01)
+
+    monkeypatch.setattr(windows, "register_hotkey", lambda i, m, k: True)
+    monkeypatch.setattr(windows, "current_thread_id", lambda: 1)
+    monkeypatch.setattr(windows, "unregister_hotkey", lambda i: None)
+    monkeypatch.setattr(windows, "post_quit_message", lambda tid: None)
+    monkeypatch.setattr(windows, "pump_messages", pump)
+    ready = threading.Event()
+    keys = hotkeys.Hotkeys()
+    keys.add("talk", "ctrl+alt+space", lambda: None)
+    worker = threading.Thread(target=lambda: keys.serve(on_ready=lambda r: ready.set()), daemon=True)
+    worker.start()
+    assert ready.wait(2.0)
+    keys.stop()
+    worker.join(2.0)
+    assert not worker.is_alive()
