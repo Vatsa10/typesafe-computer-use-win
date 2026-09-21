@@ -101,6 +101,34 @@ and prints the result: the information the goal asked for, or where things stand
 the next step when the screen does not hold it. A dry run that would have acted, and
 an aborted run, print no answer.
 
+## Voice and hotkeys
+
+```
+uv sync --extra voice        # whisper.cpp and the microphone bindings, prebuilt
+uv run winclicker-daemon     # stays resident and listens for hotkeys
+```
+
+| hotkey | does | variable |
+|---|---|---|
+| `ctrl+alt+space` | hold, speak, release: the line is transcribed locally and classified | `CLICKER_HOTKEY_TALK` |
+| `ctrl+alt+g` | type a goal into an overlay instead of speaking it | `CLICKER_HOTKEY_GOAL` |
+| `ctrl+alt+p` | pause or resume the running loop | `CLICKER_HOTKEY_PAUSE` |
+| `ctrl+alt+x` | abort the run, keeping the run folder | `CLICKER_HOTKEY_ABORT` |
+| `ctrl+alt+q` | quit the daemon | `CLICKER_HOTKEY_QUIT` |
+
+**A transcript is not a goal.** "stop", "pause a second" and "never mind" are instructions about
+the run, not work to carry out, so every line goes to the classifier first: one `Choice` over
+`run_goal`, `stop_run`, `pause_run`, `resume_run`, `quit_daemon` and `ignore`, with whether a run
+is active and whether it is paused in the state, plus a `Noul` scoring whether the line was heard
+cleanly at all. Below `CLICKER_VOICE_MIN_CONFIDENCE` (0.55) the daemon prints what it heard and
+does nothing, because a misheard command clicks a real machine, and there is no undo for a click.
+
+Transcription is whisper.cpp on the CPU (`CLICKER_WHISPER_MODEL`, default `base.en`), so the audio
+never leaves the machine and is never written to disk. The first run downloads the model.
+`pywhispercpp` installs as a prebuilt wheel on Python 3.13 for Windows AMD64, so the extra needs no
+compiler. An utterance is capped at `CLICKER_VOICE_MAX_SECONDS` (30) in case the key is never
+released.
+
 ## How a step works
 
 ```

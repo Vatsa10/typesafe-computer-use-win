@@ -16,6 +16,9 @@ so a stall can be replayed offline with `--image`.
 - Platform calls live in `windows.py` only; everything else imports it as `from . import windows`.
   The tree walk in `axwalk.py` stays platform-free and is tested against a plain dict.
 - Never add a path that types a password.
+- A hotkey callback posts to a queue and returns. The thread that delivers a hotkey is the thread
+  that delivers the next one, so any work done inside a callback stalls every other hotkey.
+- Nothing from the `voice` extra is imported at module scope: CI installs the base set only.
 
 ## Before a pull request
 

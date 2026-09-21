@@ -1,4 +1,4 @@
-"""Command-line entry points: `clicker` and `clicker-inspect`."""
+"""Command-line entry points: `winclicker`, `winclicker-inspect` and `winclicker-daemon`."""
 
 from __future__ import annotations
 
@@ -123,3 +123,15 @@ def inspect(argv: list[str] | None = None) -> None:
     if not args.no_open:
         windows.open_file(str(annotated))
         windows.open_file(str(text), as_text=True)
+
+
+def daemon(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="winclicker-daemon",
+        description="Stay resident: hold the talk hotkey, say what you want done, and it runs.",
+    )
+    parser.parse_args(argv)
+    _prepare()
+    from .daemon import serve
+
+    serve()
