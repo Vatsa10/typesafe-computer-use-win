@@ -38,15 +38,27 @@ def test_a_line_below_the_bar_queues_nothing():
     assert daemon.jobs.empty()
 
 
-def test_a_spoken_stop_aborts_instead_of_queueing():
+def test_a_spoken_stop_aborts_the_run_in_flight():
     daemon, _ = make_daemon(intent=Intent("stop_run", "", 0.95, 0.95, "stop", 0.55))
+    daemon.running = True
     daemon.on_talk()
     assert daemon.control.aborting is True
     assert daemon.jobs.empty()
 
 
+def test_a_spoken_stop_with_nothing_running_leaves_no_flag_for_the_next_job():
+    """An idle abort would be cleared by the next reset anyway, but the log would lie."""
+    logged = []
+    daemon, _ = make_daemon(intent=Intent("stop_run", "", 0.95, 0.95, "stop", 0.55))
+    daemon.log = logged.append
+    daemon.on_talk()
+    assert daemon.control.aborting is False
+    assert any("nothing is running" in line for line in logged)
+
+
 def test_a_spoken_pause_pauses_and_a_spoken_resume_releases():
     daemon, _ = make_daemon(intent=Intent("pause_run", "", 0.95, 0.95, "pause", 0.55))
+    daemon.running = True
     daemon.on_talk()
     assert daemon.control.paused is True
     daemon.interpret_line = lambda text, running, paused: Intent("resume_run", "", 0.95, 0.95, "go on", 0.55)

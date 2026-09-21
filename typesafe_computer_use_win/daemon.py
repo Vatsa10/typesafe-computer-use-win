@@ -94,6 +94,12 @@ class Daemon:
             return
         if decided.command == "run_goal":
             self.queue_goal(decided.goal)
+        elif decided.command == "quit_daemon":
+            self.on_quit()
+        elif not self.running:
+            # stop, pause and resume all talk about a run. Said while idle they are a misread of
+            # something else in the room, and acting on them leaves flags set for the next job.
+            self.log(f"  nothing is running to {decided.command.split('_')[0]}")
         elif decided.command == "stop_run":
             self.control.abort("asked to stop")
             self.log("aborting the run")
@@ -103,8 +109,6 @@ class Daemon:
         elif decided.command == "resume_run":
             self.control.resume()
             self.log("resumed")
-        elif decided.command == "quit_daemon":
-            self.on_quit()
 
     def queue_goal(self, goal: str) -> None:
         self.jobs.put(Job(goal))
