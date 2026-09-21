@@ -1,0 +1,71 @@
+[project]
+name = "typesafe-computer-use-win"
+version = "0.1.0"
+description = "Cheap, fast computer use on Windows: deterministic screen state, a TypeSafe classifier for every decision, a writer model only for free text."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Vatsa Joshi" }]
+maintainers = [{ name = "Vatsa Joshi" }]
+keywords = ["computer-use", "automation", "ocr", "typesafe", "windows", "uiautomation", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "anthropic==1.6.0",
+    "pillow>=10.0",
+    "typesafe-sdk==0.6.0",
+    "uiautomation==2.0.29",
+    "winrt-Windows.Foundation==3.2.1",
+    "winrt-Windows.Foundation.Collections==3.2.1",
+    "winrt-Windows.Globalization==3.2.1",
+    "winrt-Windows.Graphics.Imaging==3.2.1",
+    "winrt-Windows.Media.Ocr==3.2.1",
+    "winrt-Windows.Security.Cryptography==3.2.1",
+    "winrt-Windows.Storage.Streams==3.2.1",
+]
+
+[project.optional-dependencies]
+# Per-line OCR confidence, at about 4 s a screen against 0.06 s for the engine built into Windows.
+# Install with `uv sync --extra rapidocr` and set CLICKER_OCR_ENGINE=rapidocr.
+rapidocr = ["rapidocr-onnxruntime==1.4.4"]
+
+[project.urls]
+Homepage = "https://github.com/Vatsa10/typesafe-computer-use-win"
+Issues = "https://github.com/Vatsa10/typesafe-computer-use-win/issues"
+Upstream = "https://github.com/awlevin/typesafe-computer-use"
+
+[project.scripts]
+winclicker = "typesafe_computer_use_win.cli:main"
+winclicker-inspect = "typesafe_computer_use_win.cli:inspect"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.16.8"]
+
+[build-system]
+requires = ["hatchling==1.32.1"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["typesafe_computer_use_win"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
