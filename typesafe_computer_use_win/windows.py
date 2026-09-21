@@ -14,6 +14,7 @@ import ctypes
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from ctypes import wintypes
 
 from PIL import Image, ImageGrab
@@ -54,10 +55,13 @@ def check_abort() -> None:
         raise Abort("mouse in top-left corner")
 
 
-def sleep_watching(seconds: float) -> None:
+def sleep_watching(seconds: float, check: Callable[[], None] | None = None) -> None:
+    """Wait, polling an interrupt check every 100 ms. The default check is the corner escape hatch;
+    the daemon passes one that also honours pause and abort."""
+    check = check_abort if check is None else check
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        check_abort()
+        check()
         time.sleep(0.1)
 
 
@@ -170,6 +174,57 @@ def scroll(lines: int) -> None:
     if center is not None:
         move_mouse(center)
     _mouse(MOUSEEVENTF_WHEEL, data=ctypes.c_int32(lines * WHEEL_PER_LINE).value)
+
+
+# ------------------------------------------------------------------ global hotkeys
+
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x0001, 0x0002, 0x0004, 0x0008
+MOD_NOREPEAT = 0x4000  # one WM_HOTKEY per press, however long the key is held
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+PM_REMOVE = 0x0001
+PUMP_IDLE_SECONDS = 0.02
+
+
+def current_thread_id() -> int:
+    return int(kernel32.GetCurrentThreadId())
+
+
+def register_hotkey(hotkey_id: int, modifiers: int, vk: int) -> bool:
+    """Claim a system-wide key combination for this thread. False when another process holds it."""
+    return bool(user32.RegisterHotKey(None, hotkey_id, modifiers | MOD_NOREPEAT, vk))
+
+
+def unregister_hotkey(hotkey_id: int) -> None:
+    user32.UnregisterHotKey(None, hotkey_id)
+
+
+def post_quit_message(thread_id: int) -> None:
+    """Ask a pumping thread to return. Safe to call from another thread, which is the point."""
+    user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+
+
+def pump_messages(on_hotkey: Callable[[int], None], stop: Callable[[], bool]) -> None:
+    """Deliver WM_HOTKEY to `on_hotkey` until `stop()` is true or WM_QUIT arrives.
+
+    Windows posts WM_HOTKEY only to the thread that registered the hotkey, and only while that
+    thread pumps. PeekMessage rather than GetMessage, so `stop` is consulted on a timer instead of
+    only when a message happens to arrive.
+    """
+    message = wintypes.MSG()
+    while not stop():
+        if not user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_REMOVE):
+            time.sleep(PUMP_IDLE_SECONDS)
+            continue
+        if message.message == WM_QUIT:
+            return
+        if message.message == WM_HOTKEY:
+            on_hotkey(int(message.wParam))
+
+
+def key_held(vk: int) -> bool:
+    """True while a virtual key is physically down. Push-to-talk needs the release that
+    RegisterHotKey never reports."""
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
 # ------------------------------------------------------------------ apps and windows
