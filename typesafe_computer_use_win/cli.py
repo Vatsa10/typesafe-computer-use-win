@@ -1,4 +1,4 @@
-"""Command-line entry points: `winclicker`, `winclicker-inspect` and `winclicker-daemon`."""
+"""Command-line entry points: `winclicker`, `winclicker-inspect`, `winclicker-daemon` and `winclicker-ui`."""
 
 from __future__ import annotations
 
@@ -135,3 +135,15 @@ def daemon(argv: list[str] | None = None) -> None:
     from .daemon import serve
 
     serve()
+
+
+def ui(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="winclicker-ui",
+        description="A local control panel: type or speak a goal, watch the run, browse what happened.",
+    )
+    parser.parse_args(argv)
+    _prepare()
+    from .ui import launch
+
+    launch()

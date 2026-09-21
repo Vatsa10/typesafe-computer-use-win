@@ -56,6 +56,7 @@ Upstream = "https://github.com/awlevin/typesafe-computer-use"
 winclicker = "typesafe_computer_use_win.cli:main"
 winclicker-inspect = "typesafe_computer_use_win.cli:inspect"
 winclicker-daemon = "typesafe_computer_use_win.cli:daemon"
+winclicker-ui = "typesafe_computer_use_win.cli:ui"
 
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.16.8"]

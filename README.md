@@ -141,6 +141,29 @@ Proper nouns are the weak spot: "TypeSafe" comes back as "Type Save". The goal s
 full confidence, because the classifier reads the intent rather than matching the string, but a
 site whose name the model cannot spell is better reached through the catalog.
 
+## The panel
+
+```
+uv run winclicker-ui
+```
+
+A local control panel, in three tabs. **Run** takes a goal typed or spoken and shows the step feed
+as it happens, with Start, Pause and Abort wired to the same control the hotkeys drive. **History**
+lists the `runs/` folder, and for any step shows the annotated capture that step decided on.
+**Settings** edits the hotkeys, the OCR engine, the whisper model and the confidence floors, and
+writes them back to `.env` in place, keeping your comments and any key it was not asked to change.
+API keys are deliberately absent from it: the panel never displays or writes a secret.
+
+It is Tkinter, which ships with Python, and that is the point rather than a compromise. A browser
+dashboard would live in the browser this program drives, so a run would read its own interface
+through OCR and could click it. A desktop window has a milder version of the same problem, which
+is what **hide this window while a run acts** is for, on by default: the panel iconifies when a run
+starts and comes back, with the history refreshed, when it stops.
+
+Tk owns the main thread, so the hotkey pump cannot. `Service` runs the pump, the input worker and
+the run worker on threads of their own, and everything they say reaches the panel through a queue
+drained on a Tk timer, which is the only safe way to put another thread's words into a widget.
+
 ## How a step works
 
 ```
