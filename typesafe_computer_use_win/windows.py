@@ -442,10 +442,11 @@ def _rapidocr_recognize(image: Image.Image) -> list[Read]:
 
     Boxes come back as four corners of a quadrilateral, because the detector allows rotated text;
     the pipeline wants an upright rectangle, so each one is reduced to its bounding box.
-    """
-    import numpy as np
 
-    result, _elapsed = _rapidocr_engine()(np.array(image.convert("RGB")))
+    RapidOCR loads a PIL image itself, so nothing here needs numpy: the extra stays optional and
+    the tests below run on a bare install.
+    """
+    result, _elapsed = _rapidocr_engine()(image.convert("RGB"))
     lines: list[Read] = []
     for corners, text, score in result or []:
         xs = [float(p[0]) for p in corners]
