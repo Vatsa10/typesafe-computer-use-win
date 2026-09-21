@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from threading import Event
 
 import anthropic
 from typesafe_sdk import TypeSafeClient
@@ -31,6 +33,72 @@ STOPPED = {
     "stalled": "the last actions changed nothing",
     "step limit": "the run used every step it was allowed",
 }
+
+
+class Control:
+    """Pause and abort, shared between the daemon's threads and the loop.
+
+    The loop only ever calls `checkpoint()`. Pause parks the caller there; abort raises the same
+    `Abort` the corner escape hatch raises, so a stopped run lands in the path that already writes
+    the run folder and reports the outcome.
+    """
+
+    def __init__(self) -> None:
+        self._resumed = Event()
+        self._resumed.set()
+        self._aborted = Event()
+        self._reason = ""
+
+    @property
+    def paused(self) -> bool:
+        return not self._resumed.is_set()
+
+    @property
+    def aborting(self) -> bool:
+        return self._aborted.is_set()
+
+    def pause(self) -> None:
+        self._resumed.clear()
+
+    def resume(self) -> None:
+        self._resumed.set()
+
+    def toggle_pause(self) -> bool:
+        """Flip, and report whether the run is now paused."""
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
+        return self.paused
+
+    def abort(self, reason: str = "asked to stop") -> None:
+        self._reason = reason
+        self._aborted.set()
+        self._resumed.set()  # a paused run must still be killable
+
+    def reset(self) -> None:
+        """Clear both flags, so one Control serves the next job too."""
+        self._reason = ""
+        self._aborted.clear()
+        self._resumed.set()
+
+    def checkpoint(self) -> None:
+        """Block while paused; raise once aborted. Called from the run thread only."""
+        while not self._resumed.wait(0.1):
+            if self._aborted.is_set():
+                break
+        if self._aborted.is_set():
+            raise Abort(self._reason)
+
+
+def _watch(control: Control) -> Callable[[], None]:
+    """The interrupt check the wait polls: the corner escape hatch, plus pause and abort."""
+
+    def check() -> None:
+        windows.check_abort()
+        control.checkpoint()
+
+    return check
 
 
 @dataclass
@@ -62,8 +130,12 @@ class RunState:
     answer: Answer | None = None
 
 
-def run(cfg: RunConfig, ctx_factory) -> RunState:
-    """Drive the loop. ctx_factory(typesafe, history) builds the action Context."""
+def run(cfg: RunConfig, ctx_factory, control: Control | None = None) -> RunState:
+    """Drive the loop. ctx_factory(typesafe, history) builds the action Context.
+
+    `control` lets a caller pause or abort between steps; without one the loop runs to its own
+    stop rules and only the corner escape hatch interrupts it.
+    """
     cfg.out.mkdir(parents=True, exist_ok=True)
     log = Log(cfg.out / "run.log")
     log(f"run folder: {cfg.out}")
@@ -76,7 +148,7 @@ def run(cfg: RunConfig, ctx_factory) -> RunState:
         with TypeSafeClient() as typesafe:
             ctx = ctx_factory(typesafe, state.history)
             for step in range(1, cfg.steps + 1):
-                if not run_step(cfg, ctx, state, step, log):
+                if not run_step(cfg, ctx, state, step, log, control):
                     break
             else:
                 log(f"\nstopped after {cfg.steps} steps")
@@ -131,8 +203,10 @@ def conclude(cfg: RunConfig, ctx: Context, state: RunState, log: Log) -> None:
     log(f"\nanswer ({verdict}, {time.perf_counter() - started:.1f}s):\n  {state.answer.text}")
 
 
-def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log) -> bool:
+def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log, control: Control | None = None) -> bool:
     windows.check_abort()
+    if control is not None:
+        control.checkpoint()
     timing: dict[str, float] = {}
     started = time.perf_counter()
     with phase(timing, "capture"):
@@ -179,7 +253,7 @@ def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log)
     log(format_timing(timing))
 
     if state.view is None:  # an action ran: let the screen settle before the next step, or the answer, reads it
-        windows.sleep_watching(cfg.delay)
+        windows.sleep_watching(cfg.delay, check=None if control is None else _watch(control))
     return keep_going
 
 
