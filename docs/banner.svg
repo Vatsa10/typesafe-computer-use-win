@@ -1,42 +1,116 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="typesafe-computer-use">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-label="typesafe-computer-use-win: cheap, fast computer use on Windows">
+  <title>typesafe-computer-use-win</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0f172a"/>
-      <stop offset="1" stop-color="#1e293b"/>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1120"/>
+      <stop offset="0.55" stop-color="#101a2e"/>
+      <stop offset="1" stop-color="#0a1626"/>
     </linearGradient>
     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="0.5" stop-color="#60a5fa"/>
       <stop offset="1" stop-color="#a78bfa"/>
     </linearGradient>
+    <linearGradient id="win" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0078d4"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16233c"/>
+      <stop offset="1" stop-color="#0c1526"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#8ab4ff" stroke-opacity="0.055" stroke-width="1"/>
+    </pattern>
+    <clipPath id="card">
+      <rect width="1200" height="340" rx="26"/>
+    </clipPath>
   </defs>
-  <rect width="1200" height="300" rx="24" fill="url(#bg)"/>
 
-  <!-- a screen with OCR boxes -->
-  <g transform="translate(70,60)">
-    <rect width="300" height="180" rx="10" fill="#0b1220" stroke="#334155" stroke-width="2"/>
-    <rect x="18" y="20" width="120" height="14" rx="3" fill="none" stroke="#38bdf8" stroke-width="2"/>
-    <rect x="18" y="46" width="200" height="14" rx="3" fill="none" stroke="#38bdf8" stroke-width="2"/>
-    <rect x="18" y="72" width="160" height="14" rx="3" fill="none" stroke="#38bdf8" stroke-width="2"/>
-    <rect x="18" y="110" width="92" height="28" rx="6" fill="none" stroke="#f87171" stroke-width="3"/>
-    <text x="64" y="129" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#f87171" text-anchor="middle">click</text>
-    <rect x="130" y="110" width="150" height="28" rx="6" fill="none" stroke="#38bdf8" stroke-width="2"/>
-    <!-- cursor -->
-    <path d="M60 128 l0 26 l7 -6 l5 11 l5 -2 l-5 -11 l9 -1 z" fill="#f8fafc" stroke="#0b1220" stroke-width="1.5"/>
-  </g>
+  <g clip-path="url(#card)">
+    <rect width="1200" height="340" fill="url(#sky)"/>
+    <rect width="1200" height="340" fill="url(#grid)"/>
+    <ellipse cx="250" cy="70" rx="420" ry="260" fill="url(#glow)"/>
+    <ellipse cx="1050" cy="330" rx="360" ry="220" fill="url(#glow)" opacity="0.5"/>
 
-  <!-- arrow -->
-  <path d="M400 150 h60" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
-  <path d="M452 140 l14 10 l-14 10" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- the screen the loop reads: a window with its controls boxed -->
+    <g transform="translate(64,62)">
+      <rect x="6" y="8" width="344" height="216" rx="14" fill="#05080f" opacity="0.55"/>
+      <rect width="344" height="216" rx="14" fill="url(#glass)" stroke="#2b3d5c" stroke-width="1.5"/>
 
-  <!-- title -->
-  <text x="490" y="128" font-family="-apple-system, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="56" font-weight="700" fill="#f8fafc">typesafe-computer-use-win</text>
-  <text x="492" y="172" font-family="-apple-system, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="22" fill="#cbd5e1">Computer use for about $0.0002 a step.</text>
-  <text x="492" y="204" font-family="-apple-system, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="18" fill="#94a3b8">OCR the screen. Classify the next action. Click. Repeat.</text>
+      <!-- title bar -->
+      <path d="M0 14a14 14 0 0 1 14-14h316a14 14 0 0 1 14 14v20H0z" fill="#16233c"/>
+      <circle cx="18" cy="17" r="4" fill="#3f5372"/>
+      <circle cx="32" cy="17" r="4" fill="#3f5372"/>
+      <circle cx="46" cy="17" r="4" fill="#3f5372"/>
+      <rect x="292" y="12" width="38" height="10" rx="3" fill="#22304a"/>
 
-  <!-- probability bar -->
-  <g transform="translate(492,232)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
-    <rect width="420" height="10" rx="5" fill="#1e293b"/>
-    <rect width="290" height="10" rx="5" fill="url(#accent)"/>
-    <text x="0" y="30" fill="#94a3b8">p(click "Register Now") = 0.69</text>
+      <!-- text lines OCR reads -->
+      <g stroke="#38bdf8" stroke-opacity="0.85" fill="none" stroke-width="1.6">
+        <rect x="22" y="52" width="116" height="13" rx="3"/>
+        <rect x="22" y="76" width="198" height="13" rx="3"/>
+        <rect x="22" y="100" width="154" height="13" rx="3"/>
+      </g>
+      <g fill="#7dd3fc" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="9" opacity="0.9">
+        <text x="146" y="62">1</text>
+        <text x="228" y="86">2</text>
+        <text x="184" y="110">3</text>
+      </g>
+
+      <!-- controls the UI Automation tree declares -->
+      <rect x="22" y="134" width="104" height="32" rx="7" fill="#f87171" fill-opacity="0.12" stroke="#f87171" stroke-width="2.2"/>
+      <text x="74" y="155" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="12" fill="#fca5a5" text-anchor="middle">Register</text>
+      <rect x="140" y="134" width="90" height="32" rx="7" fill="none" stroke="#fb923c" stroke-width="1.8" stroke-opacity="0.9"/>
+      <text x="185" y="155" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="12" fill="#fdba74" text-anchor="middle">Cancel</text>
+      <rect x="244" y="134" width="78" height="32" rx="7" fill="none" stroke="#fb923c" stroke-width="1.8" stroke-opacity="0.5" stroke-dasharray="4 4"/>
+
+      <rect x="22" y="180" width="300" height="16" rx="4" fill="#16233c"/>
+      <rect x="22" y="180" width="118" height="16" rx="4" fill="url(#win)" opacity="0.7"/>
+
+      <!-- the cursor, on the control that won -->
+      <path d="M112 158 l0 27 l7.5 -6.5 l5 11.5 l5.5 -2.4 l-5 -11.4 l9.6 -1z" fill="#f8fafc" stroke="#0b1120" stroke-width="1.6" stroke-linejoin="round"/>
+    </g>
+
+    <!-- pipeline arrow -->
+    <g transform="translate(424,170)">
+      <path d="M0 0 h44" stroke="url(#accent)" stroke-width="3.5" stroke-linecap="round"/>
+      <path d="M38 -8 l10 8 l-10 8" fill="none" stroke="url(#accent)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- wordmark -->
+    <g font-family="'Segoe UI Variable Display', 'Segoe UI', Inter, system-ui, sans-serif">
+      <text x="492" y="118" font-size="46" font-weight="700" fill="#f8fafc" letter-spacing="-1">typesafe-computer-use<tspan fill="url(#win)">-win</tspan></text>
+      <text x="494" y="152" font-size="19" fill="#c7d5ea">Computer use on Windows for about $0.0002 a step.</text>
+      <text x="494" y="180" font-size="16" fill="#8ba3c4">Read the screen. Classify the next action. Press it. Repeat.</text>
+    </g>
+
+    <!-- what the classifier answered -->
+    <g transform="translate(494,206)" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+      <rect width="452" height="9" rx="4.5" fill="#1b2941"/>
+      <rect width="312" height="9" rx="4.5" fill="url(#accent)"/>
+      <text x="0" y="30" font-size="13" fill="#94a3b8">p(click <tspan fill="#e2e8f0">"Register"</tspan>) = <tspan fill="#7dd3fc">0.69</tspan></text>
+    </g>
+
+    <!-- the three numbers that matter -->
+    <g transform="translate(494,258)" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="12">
+      <g>
+        <rect width="146" height="30" rx="8" fill="#13203a" stroke="#2b3d5c"/>
+        <text x="14" y="20" fill="#7dd3fc">0.06s<tspan fill="#7f93b3"> screen OCR</tspan></text>
+      </g>
+      <g transform="translate(158,0)">
+        <rect width="162" height="30" rx="8" fill="#13203a" stroke="#2b3d5c"/>
+        <text x="14" y="20" fill="#a78bfa">255<tspan fill="#7f93b3"> options a step</tspan></text>
+      </g>
+      <g transform="translate(332,0)">
+        <rect width="168" height="30" rx="8" fill="#13203a" stroke="#2b3d5c"/>
+        <text x="14" y="20" fill="#86efac">0 px<tspan fill="#7f93b3"> sent to an LLM</tspan></text>
+      </g>
+    </g>
+
+    <rect y="336" width="1200" height="4" fill="url(#accent)" opacity="0.8"/>
   </g>
 </svg>
