@@ -123,11 +123,23 @@ is active and whether it is paused in the state, plus a `Noul` scoring whether t
 cleanly at all. Below `CLICKER_VOICE_MIN_CONFIDENCE` (0.55) the daemon prints what it heard and
 does nothing, because a misheard command clicks a real machine, and there is no undo for a click.
 
+The two gates are not applied alike. Every answer must clear the confidence floor, but only a goal
+must also have been heard cleanly. Measured against the live model, short imperatives score low on
+any question about whether a line is complete, so gating commands on that number would leave a
+running loop impossible to stop by voice, which is the one thing voice must always manage. The
+risks are not symmetric either: a misheard "stop" ends a run that can be started again, while a
+misheard goal sets a machine clicking at something nobody asked for.
+
 Transcription is whisper.cpp on the CPU (`CLICKER_WHISPER_MODEL`, default `base.en`), so the audio
-never leaves the machine and is never written to disk. The first run downloads the model.
-`pywhispercpp` installs as a prebuilt wheel on Python 3.13 for Windows AMD64, so the extra needs no
-compiler. An utterance is capped at `CLICKER_VOICE_MAX_SECONDS` (30) in case the key is never
-released.
+never leaves the machine and is never written to disk. Measured here: four seconds of speech
+transcribes in 0.68 s once the model is loaded, about a fifth of real time, and interpretation adds
+0.3 to 0.4 s. The first use downloads the model, which took about 50 s. `pywhispercpp` installs as
+a prebuilt wheel on Python 3.13 for Windows AMD64, so the extra needs no compiler. An utterance is
+capped at `CLICKER_VOICE_MAX_SECONDS` (30) in case the key is never released.
+
+Proper nouns are the weak spot: "TypeSafe" comes back as "Type Save". The goal still classified at
+full confidence, because the classifier reads the intent rather than matching the string, but a
+site whose name the model cannot spell is better reached through the catalog.
 
 ## How a step works
 
