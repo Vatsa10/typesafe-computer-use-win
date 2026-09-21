@@ -12,7 +12,13 @@ from dataclasses import dataclass
 
 from typesafe_sdk import Choice, Noul
 
-MIN_HEARD = 0.5  # below this the audio was not a clean instruction, whatever it classified as
+# The heard gate gates goals only. Measured against the live model, short imperatives score low on
+# any "is this a complete instruction" question: "stop" read 0.24, "keep going" 0.35, "quit" 0.43.
+# Gating control commands on that number makes a running loop impossible to stop by voice, which is
+# the one thing voice must always manage. The risks are not symmetric either: a misheard "stop"
+# ends a run the user can start again, while a misheard goal sets a machine clicking at something
+# nobody asked for. So a goal must be heard cleanly, and a command only has to be recognised.
+MIN_HEARD = 0.5
 DEFAULT_MIN_CONFIDENCE = 0.55
 IGNORED = "ignore"
 
@@ -43,9 +49,15 @@ class Intent:
 
     @property
     def actionable(self) -> bool:
-        """Whether the daemon should act. A misheard command clicks a real machine, so the bar
-        is a gate, not a hint."""
-        return self.command != IGNORED and self.confidence >= self.min_confidence and self.heard >= MIN_HEARD
+        """Whether the daemon should act.
+
+        Every answer must clear the confidence floor. Only `run_goal` must also clear MIN_HEARD:
+        a goal becomes clicking, so a half-caught one is worth refusing, while refusing a
+        half-caught "stop" would leave the user shouting at a run that will not stop.
+        """
+        if self.command == IGNORED or self.confidence < self.min_confidence:
+            return False
+        return self.heard >= MIN_HEARD if self.command == "run_goal" else True
 
 
 def interpret(client, transcript: str, running: bool, paused: bool, min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> Intent:
@@ -76,8 +88,10 @@ def interpret(client, transcript: str, running: bool, paused: bool, min_confiden
         ),
         "heard": Noul(
             instructions=(
-                "Is this transcript a complete, intelligible instruction, rather than a fragment, "
-                "a false start, or speech that was only half caught?"
+                "Was this transcript caught cleanly enough to act on? Judge the audio, not the "
+                "length: a short command like 'stop' or 'keep going' is complete. Say no only for "
+                "a garbled line, a false start, a sentence that breaks off mid-word, or speech "
+                "that was clearly meant for someone else."
             )
         ),
     }

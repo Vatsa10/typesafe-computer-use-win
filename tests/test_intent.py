@@ -115,3 +115,21 @@ def test_the_transcript_is_whitespace_normalised():
     intent = interpret(client, "  open   the  console \n", running=False, paused=False)
     assert intent.transcript == "open the console"
     assert intent.goal == "open the console"
+
+
+def test_a_short_command_acts_even_though_it_scores_low_on_heard():
+    """Measured: "stop" scores 0.24 on heard, "keep going" 0.35. Gating commands on that number
+    leaves a running loop impossible to stop by voice, which is the one thing voice must manage."""
+    client = FakeClient(command="stop_run", confidence=0.99, heard=0.24)
+    assert interpret(client, "stop stop stop", running=True, paused=False).actionable is True
+
+
+def test_a_half_caught_goal_is_still_refused():
+    """A goal becomes clicking, so this is the one command that must be heard cleanly."""
+    client = FakeClient(command="run_goal", confidence=0.95, heard=0.2)
+    assert interpret(client, "open the uh the", running=False, paused=False).actionable is False
+
+
+def test_a_command_below_the_confidence_floor_is_still_refused():
+    client = FakeClient(command="quit_daemon", confidence=0.3, heard=0.9)
+    assert interpret(client, "mumble", running=False, paused=False).actionable is False
