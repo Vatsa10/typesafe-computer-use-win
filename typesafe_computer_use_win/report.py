@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 from PIL import ImageDraw, ImageFont
@@ -10,21 +12,41 @@ from PIL import ImageDraw, ImageFont
 from .decide import base_state, item_criteria, kind_criteria, offscreen_criteria, site_criteria
 from .models import Item, Screen
 
-FONT_PATH = "/System/Library/Fonts/Helvetica.ttc"
+# Windows ships Segoe UI everywhere; the Consolas fallback covers a trimmed install. The label on
+# an annotated capture is unreadable at the default bitmap font, which is what PIL falls back to.
+FONT_PATHS = ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/arial.ttf")
 RULE = "=" * 78
 
 
 class Log:
-    """Print and append to a file."""
+    """Send each line to a sink and append it to a file.
 
-    def __init__(self, path: Path | None = None):
+    The sink defaults to `print`, so a plain `Log(path)` behaves exactly as it always has. A UI can
+    pass its own callable to mirror the run's lines into a live feed. A sink that raises must not
+    take the run down: the exception is swallowed and the line still reaches the file.
+    """
+
+    def __init__(self, path: Path | None = None, echo: Callable[[str], object] | None = print):
         self.path = path
+        self.echo = echo
 
     def __call__(self, msg: str = "") -> None:
-        print(msg)
+        if self.echo is not None:
+            with contextlib.suppress(Exception):  # a broken sink must not kill the loop
+                self.echo(msg)
         if self.path is not None:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(msg + "\n")
+
+
+def _label_font(size: int):
+    """The first font on this machine that can draw a readable label, else PIL's bitmap default."""
+    for path in FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def top(answer, n: int = 5) -> list[tuple[str, float]]:
@@ -98,10 +120,7 @@ def annotate(screen: Screen, items: list[Item], chosen: str, out: Path) -> None:
     """Blue boxes for OCR blocks, orange for accessibility controls, red for the chosen one, green for the focused field."""
     image = screen.image.copy()
     draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.truetype(FONT_PATH, int(11 * screen.scale))
-    except OSError:
-        font = ImageFont.load_default()
+    font = _label_font(int(11 * screen.scale))
     for it in items:
         hit = str(it.index) == chosen
         color = (255, 0, 0) if hit else (255, 140, 0) if it.from_ax else (0, 160, 255)

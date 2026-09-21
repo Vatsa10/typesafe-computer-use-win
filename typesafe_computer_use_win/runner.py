@@ -130,14 +130,18 @@ class RunState:
     answer: Answer | None = None
 
 
-def run(cfg: RunConfig, ctx_factory, control: Control | None = None) -> RunState:
+def run(cfg: RunConfig, ctx_factory, control: Control | None = None, echo=print) -> RunState:
     """Drive the loop. ctx_factory(typesafe, history) builds the action Context.
 
     `control` lets a caller pause or abort between steps; without one the loop runs to its own
     stop rules and only the corner escape hatch interrupts it.
+
+    `echo` receives every line the loop logs, so a UI can show a live step feed while the same
+    lines still reach stdout and the run folder. It stays a parameter rather than a RunConfig
+    field, because RunConfig is serialised into run.json with `asdict()`.
     """
     cfg.out.mkdir(parents=True, exist_ok=True)
-    log = Log(cfg.out / "run.log")
+    log = Log(cfg.out / "run.log", echo)
     log(f"run folder: {cfg.out}")
     if cfg.act:
         log("driving the machine. abort: Ctrl-C, or slam the mouse into the top-left corner.")
