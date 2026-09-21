@@ -224,7 +224,7 @@ def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log,
     )
 
     with phase(timing, "decide"):
-        decision = decide(ctx.typesafe, cfg.goal, screen, items, state.history, ctx.browser, ctx.email)
+        decision = decide(ctx.typesafe, cfg.goal, screen, items, state.history, ctx.browser, ctx.email, ctx.sites)
     by_index = {str(it.index): it for it in items}
     annotate(screen, items, decision.chosen, prefix.with_suffix(".png"))
 

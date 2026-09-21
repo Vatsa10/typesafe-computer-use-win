@@ -12,6 +12,7 @@ from . import windows
 from .config import SITES
 from .decide import OFFSCREEN_PREFIX, Decision, verify_typed
 from .models import Field, Item, Screen
+from .sitepick import url_for
 from .writer import compose_text, compose_url
 
 VERIFY_THRESHOLD = 0.5
@@ -26,6 +27,23 @@ class Context:
     typesafe: TypeSafeClient
     writer: anthropic.Anthropic | None
     history: list[str]
+    sites: tuple = ()  # the per-goal shortlist; empty falls back to the pinned catalog
+
+
+def remember(url: str) -> None:
+    """Keep a writer-resolved site, so the next run finds it by name instead of paying for a model.
+
+    Best effort on purpose: a catalog that cannot be written must not fail the action that just
+    succeeded.
+    """
+    if not url:
+        return
+    try:
+        from . import catalog
+
+        catalog.remember_site(label="", url=url)
+    except Exception:
+        pass
 
 
 def is_noop(description: str) -> bool:
@@ -106,11 +124,12 @@ def _use_browser(decision: Decision, screen, items, ctx: Context) -> str:
         if windows.activate(ctx.browser):
             return f"activated {ctx.browser}"
         return f"use_browser failed: {ctx.browser} did not come to the front"
-    url = SITES.get(site)
+    url = url_for(ctx.sites, site) if ctx.sites else SITES.get(site)
     if url is None:
         if ctx.writer is None:
             return "use_browser refused: the site is outside the catalog and no writer is available to propose a URL"
         url = compose_url(ctx.writer, ctx.goal, ctx.history)
+        remember(url)  # resolved once by a model, a lookup for every run after this one
     if not url:
         return "use_browser refused: the writer proposed no usable URL for this goal"
     if windows.open_url(ctx.browser, url):

@@ -77,8 +77,17 @@ def offscreen_records(nodes: list[AxNode]) -> list[dict]:
     return [{"k": i, "role": node.role_word, "label": node.label} for i, node in enumerate(nodes)]
 
 
-def site_criteria() -> dict[str, str]:
-    """Which website use_browser opens. The catalog, plus one key for anything else and one for nothing."""
+def site_criteria(sites=None) -> dict[str, str]:
+    """Which website use_browser opens: the offered sites, plus one key for anything else and one
+    for nothing.
+
+    `sites` is the per-goal shortlist from sitepick. Without one this falls back to the pinned
+    catalog, which is how the loop behaved before the browser was ever read.
+    """
+    if sites:
+        from .sitepick import criteria
+
+        return criteria(sites)
     return {
         **SITES,
         "other": "A website is needed to progress the goal, but it is not one of the sites named in this list.",
@@ -150,7 +159,14 @@ class Decision:
 
 
 def decide(
-    client: TypeSafeClient, goal: str, screen: Screen, items: list[Item], history: list[str], browser: str, email: str | None
+    client: TypeSafeClient,
+    goal: str,
+    screen: Screen,
+    items: list[Item],
+    history: list[str],
+    browser: str,
+    email: str | None,
+    sites=None,
 ) -> Decision:
     questions = {
         "kind": Choice(
@@ -167,7 +183,7 @@ def decide(
                 "list when the goal calls for that one, 'other' when the goal calls for a site the list "
                 "does not name, and 'none' to stay on the page that is already open in the browser."
             ),
-            criteria=site_criteria(),
+            criteria=site_criteria(sites),
         ),
     }
     if items:

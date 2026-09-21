@@ -13,6 +13,7 @@ from .actions import Context
 from .perception import capture, perceive
 from .report import annotate, ax_count, render_payload
 from .runner import RunConfig, run
+from .sitepick import sites_for
 from .timing import format_timing
 from .writer import make_writer
 
@@ -70,6 +71,9 @@ def main(argv: list[str] | None = None) -> None:
         url=args.url,
     )
 
+    # The goal does not change during a run, so the shortlist is built once, not once per step.
+    sites = sites_for(args.goal)
+
     def ctx_factory(typesafe, history):
         return Context(
             goal=args.goal,
@@ -78,6 +82,7 @@ def main(argv: list[str] | None = None) -> None:
             typesafe=typesafe,
             writer=writer,
             history=history,
+            sites=sites,
         )
 
     state = run(cfg, ctx_factory)

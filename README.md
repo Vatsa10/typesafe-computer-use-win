@@ -295,6 +295,42 @@ whole node budget on what is already on screen and reports nothing hidden.
 | `wait` | screen still loading |
 | `done`, `none` | stop |
 
+### Which sites it can reach
+
+The catalog is not a list in the source. It is built from the browser itself: bookmarks, history
+aggregated to one entry per origin with visit counts as a prior, the sites the writer has resolved
+before, and a pinned core in `config.SITES` that is always offered. On this machine that is 503
+sites, built in 0.2 s and cached for a day.
+
+The classifier cannot be handed 503 options. A `Choice` tops out at 255, and long before that the
+probability mass spreads thin enough that every answer reads as doubt, which trips the confidence
+floor and stalls the run. So a deterministic shortlist runs first — token overlap on label and
+domain, weighted by how much of the label the match covers, nudged by the visit prior — and hands
+over about 30. It takes 3 to 40 ms and involves no model.
+
+The ranker only needs recall. Asked to "open youtube" against the real profile it offers twelve
+sites, including a bookmark whose title merely contains the word; jev then puts 0.99 on `youtube`
+and 0.00 on the bookmark. Ranking finds candidates, the classifier discriminates, and code owns
+the URL: the model answers with a key, never an address, so a hallucinated URL is not a failure
+mode available to it.
+
+A site outside the catalog still resolves through `other`, which asks the writer for a URL — and
+that answer is then remembered, so the same site is a plain lookup on every later run. The system
+needs the expensive model less the longer you use it.
+
+| variable | does |
+|---|---|
+| `CLICKER_CATALOG=0` | ignore the browser; offer only the pinned sites, as this worked originally |
+| `CLICKER_CATALOG_TITLES=0` | labels become bare domains, so no page title ever leaves the machine |
+| `CLICKER_CATALOG_LIMIT` | how many sites the classifier is offered, default 30 |
+
+Titles are cleaned before they are used as labels: email addresses, parenthesised counts, id-like
+digit runs and trailing site suffixes are stripped, so `Inbox (9,842) - vatsajoshi2@gmail.com -
+Gmail` becomes `Inbox`. Only `Bookmarks` and the `urls` table of `History` are ever read, the
+locked history database is copied before reading, and no password, cookie or autofill store is
+touched. The shortlist does travel to TypeSafe as part of the state, which is what
+`CLICKER_CATALOG_TITLES=0` is there for.
+
 ### Where free text comes from
 
 The classifier never generates text. The writer model runs in three places, each with a

@@ -15,7 +15,8 @@ DEFAULT_WRITER_MODEL = "claude-haiku-4-5"
 DEFAULT_ANSWER_MODEL = "claude-sonnet-5"  # runs once per run, on a screenshot: worth a stronger reader
 DEFAULT_BROWSER = "Google Chrome"
 
-# Sites the classifier can pick by name. Anything else goes through the writer.
+# The curated core of the site catalog. These are always offered, whatever the browser holds, and
+# they outrank anything discovered. Everything else is learned: see catalog.py.
 SITES: dict[str, str] = {
     "github": "https://github.com/",
     "gmail": "https://mail.google.com/",
@@ -84,3 +85,22 @@ def voice_max_seconds() -> float:
 
 def voice_min_confidence() -> float:
     return float(os.environ.get("CLICKER_VOICE_MIN_CONFIDENCE", DEFAULT_VOICE_MIN_CONFIDENCE))
+
+
+# The dynamic site catalog, built from the browser's own bookmarks and history. Off means the
+# classifier sees only the pinned SITES above, which is how this worked before.
+DEFAULT_CATALOG_LIMIT = 30  # options handed to the site question; the cap is 255, but mass thins fast
+
+
+def catalog_enabled() -> bool:
+    return os.environ.get("CLICKER_CATALOG", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def catalog_titles() -> bool:
+    """Whether a page title may become a site's label. Off means labels are bare domains, so no
+    page title ever reaches the model."""
+    return os.environ.get("CLICKER_CATALOG_TITLES", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def catalog_limit() -> int:
+    return int(os.environ.get("CLICKER_CATALOG_LIMIT", DEFAULT_CATALOG_LIMIT))

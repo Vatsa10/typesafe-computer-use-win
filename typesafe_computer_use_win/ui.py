@@ -45,6 +45,9 @@ SETTINGS: list[tuple[str, str, str]] = [
     ("CLICKER_WHISPER_MODEL", "Whisper model", config.DEFAULT_WHISPER_MODEL),
     ("CLICKER_VOICE_MAX_SECONDS", "Longest utterance (s)", str(config.DEFAULT_VOICE_MAX_SECONDS)),
     ("CLICKER_VOICE_MIN_CONFIDENCE", "Voice confidence floor", str(config.DEFAULT_VOICE_MIN_CONFIDENCE)),
+    ("CLICKER_CATALOG", "Site catalog from browser", "1 (0 = only the pinned sites)"),
+    ("CLICKER_CATALOG_TITLES", "Use page titles as labels", "1 (0 = bare domains only)"),
+    ("CLICKER_CATALOG_LIMIT", "Sites offered per goal", str(config.DEFAULT_CATALOG_LIMIT)),
     ("CLICKER_OCR_ENGINE", "OCR engine", "windows"),
     ("CLICKER_OCR_LANGUAGE", "OCR language", "en-US"),
 ]
