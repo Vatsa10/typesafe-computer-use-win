@@ -1,5 +1,5 @@
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -195,3 +195,71 @@ def test_typing_uses_keystrokes_when_there_is_no_element(calls, monkeypatch):
 def test_the_field_record_leaves_the_element_out_so_a_run_can_be_written():
     record = field(ref=object(), value="hello").record()
     assert "ref" not in record and json.loads(json.dumps(record))["value"] == "hello"
+
+
+# ------------------------------------------------------------------ switching and launching
+
+
+@dataclass(frozen=True)
+class FakeWin:
+    hwnd: int = 7
+    title: str = "WhatsApp"
+    app: str = "whatsapp"
+    pid: int = 9
+    rect: tuple = (0, 0, 800, 600)
+    monitor: int = 1
+    minimized: bool = False
+    foreground: bool = False
+
+
+def test_switching_brings_an_open_window_to_the_front(screen, monkeypatch):
+    raised = []
+    monkeypatch.setattr(windows, "activate_window", lambda hwnd: raised.append(hwnd) or True)
+    view = replace(screen, windows=(FakeWin(),))
+    what = actions.switch_window("0", view)
+    assert raised == [7]
+    assert "switched to whatsapp" in what and "monitor 2" in what
+
+
+def test_switching_to_a_window_that_closed_is_a_failure_not_a_crash(screen, monkeypatch):
+    monkeypatch.setattr(windows, "activate_window", lambda hwnd: pytest.fail("nothing to switch to"))
+    assert "failed" in actions.switch_window("4", replace(screen, windows=(FakeWin(),)))
+
+
+def test_a_window_that_refuses_to_come_forward_reports_failure(screen, monkeypatch):
+    monkeypatch.setattr(windows, "activate_window", lambda hwnd: False)
+    assert "did not come to the front" in actions.switch_window("0", replace(screen, windows=(FakeWin(),)))
+
+
+@dataclass(frozen=True)
+class FakeApp:
+    key: str = "notepad"
+    label: str = "Notepad"
+    url: str = r"C:\fake\Notepad.lnk"
+    weight: float = 1.0
+    source: str = "app"
+
+
+def test_launching_an_offered_app_starts_it(monkeypatch):
+    from typesafe_computer_use_win import apps as app_catalog
+
+    started = []
+    monkeypatch.setattr(app_catalog, "launch", lambda app: started.append(app.label) or True)
+    monkeypatch.setattr(actions.time, "sleep", lambda s: None)
+    what = actions.open_app("notepad", replace(context(), apps=(FakeApp(),)))
+    assert started == ["Notepad"] and "launched Notepad" in what
+
+
+def test_a_key_that_was_never_offered_launches_nothing(monkeypatch):
+    """The model names a key and code owns the path, so an unknown key must not become a command."""
+    from typesafe_computer_use_win import apps as app_catalog
+
+    monkeypatch.setattr(app_catalog, "launch", lambda app: pytest.fail("nothing should be launched"))
+    assert "not one of the applications offered" in actions.open_app("format_c_drive", replace(context(), apps=(FakeApp(),)))
+
+
+def test_an_app_that_will_not_start_reports_failure(monkeypatch):
+    from typesafe_computer_use_win import apps as app_catalog
+
+    monkeypatch.setattr(app_catalog, "launch", lambda app: False)
+    assert "did not start" in actions.open_app("notepad", replace(context(), apps=(FakeApp(),)))

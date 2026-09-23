@@ -6,12 +6,25 @@ from dataclasses import dataclass
 
 from typesafe_sdk import Choice, ChoiceAnswer, Noul, TypeSafeClient
 
+from . import worldmodel
 from .config import SITES
 from .dates import date_hints, now_context
 from .models import AxNode, Field, Item, Screen
+from .sitepick import app_criteria
 
 STOP_KINDS = ("done", "none")
 OFFSCREEN_PREFIX = "offscreen:"
+WINDOW_PREFIX = "window:"
+APP_PREFIX = "app:"
+SWITCH_WINDOW = (
+    "Bring a window that is already open to the front, chosen in the window question. Use this "
+    "whenever the goal is about something already running, including on another monitor or "
+    "minimized: switching to it is always better than opening a second copy."
+)
+OPEN_APP = (
+    "Launch an installed application that is not currently open, chosen in the app question. Use "
+    "this only when the window list does not already contain what the goal is about."
+)
 PRESS_OFFSCREEN = (
     "Activate a labelled control that the app exposes but that is not currently visible on screen "
     "(chosen in the offscreen question). Use when the needed control is known to exist but is "
@@ -48,10 +61,16 @@ def fixed_actions(browser: str, email: str | None) -> dict[str, str]:
     return actions
 
 
-def kind_criteria(browser: str, email: str | None, offscreen: bool = False) -> dict[str, str]:
+def kind_criteria(
+    browser: str, email: str | None, offscreen: bool = False, windows_open: bool = False, apps_known: bool = False
+) -> dict[str, str]:
     clicks = {"click_item": "Click one of the on-screen text items (chosen in the item question)."}
     if offscreen:
         clicks["press_offscreen"] = PRESS_OFFSCREEN
+    if windows_open:
+        clicks["switch_window"] = SWITCH_WINDOW
+    if apps_known:
+        clicks["open_app"] = OPEN_APP
     return {**clicks, **fixed_actions(browser, email)}
 
 
@@ -115,6 +134,14 @@ def base_state(goal: str, screen: Screen, items: list[Item], history: list[str])
             for it in items
         ],
         **({"offscreen_controls": offscreen_records(screen.offscreen)} if screen.offscreen else {}),
+        # The capture is one display; the machine is all of them. Without this the loop cannot tell
+        # "not on this screen" from "not running", and answers "nothing helps" to both.
+        **({"open_windows": worldmodel.records(screen.windows)} if screen.windows else {}),
+        **(
+            {"displays": worldmodel.monitor_summary(screen.monitors), "reading_display": screen.monitor + 1}
+            if screen.monitors
+            else {}
+        ),
     }
 
 
@@ -124,6 +151,8 @@ class Decision:
     item: ChoiceAnswer | None
     site: ChoiceAnswer
     offscreen: ChoiceAnswer | None = None
+    window: ChoiceAnswer | None = None
+    app: ChoiceAnswer | None = None
 
     @property
     def clicking(self) -> bool:
@@ -134,11 +163,23 @@ class Decision:
         return self.kind.choice == "press_offscreen" and self.offscreen is not None
 
     @property
+    def switching(self) -> bool:
+        return self.kind.choice == "switch_window" and self.window is not None
+
+    @property
+    def launching(self) -> bool:
+        return self.kind.choice == "open_app" and self.app is not None
+
+    @property
     def chosen(self) -> str:
         if self.clicking:
             return self.item.choice
         if self.pressing_offscreen:
             return f"{OFFSCREEN_PREFIX}{self.offscreen.choice}"
+        if self.switching:
+            return f"{WINDOW_PREFIX}{self.window.choice}"
+        if self.launching:
+            return f"{APP_PREFIX}{self.app.choice}"
         return self.kind.choice
 
     @property
@@ -151,6 +192,12 @@ class Decision:
             return min(self.kind.confidence, self.item.confidence)
         if self.pressing_offscreen:
             return min(self.kind.confidence, self.offscreen.confidence)
+        # Switching and launching both name a target, and the wrong one takes over the screen or
+        # starts a program nobody asked for, so a split there must stop the run like a click does.
+        if self.switching:
+            return min(self.kind.confidence, self.window.confidence)
+        if self.launching:
+            return min(self.kind.confidence, self.app.confidence)
         return self.kind.confidence
 
     @property
@@ -167,6 +214,7 @@ def decide(
     browser: str,
     email: str | None,
     sites=None,
+    apps=(),
 ) -> Decision:
     questions = {
         "kind": Choice(
@@ -175,7 +223,7 @@ def decide(
                 "makes the most progress toward the goal right now? Do not repeat an action "
                 "that was just taken unless the screen changed."
             ),
-            criteria=kind_criteria(browser, email, bool(screen.offscreen)),
+            criteria=kind_criteria(browser, email, bool(screen.offscreen), bool(screen.windows), bool(apps)),
         ),
         "site": Choice(
             instructions=(
@@ -204,8 +252,32 @@ def decide(
             ),
             criteria=offscreen_criteria(screen.offscreen),
         )
+    if screen.windows:
+        questions["window"] = Choice(
+            instructions=(
+                "If switching to a window that is already open is the right move, which window? "
+                "These are real windows on this machine, including ones on other monitors and "
+                "minimized ones, and switching to one is always better than opening it again."
+            ),
+            criteria=worldmodel.criteria(screen.windows),
+        )
+    if apps:
+        questions["app"] = Choice(
+            instructions=(
+                "If launching an application is the right move, which one? These are installed on "
+                "this machine. Prefer switching to an open window over launching a second copy."
+            ),
+            criteria=app_criteria(apps),
+        )
     answers = client.system_one(state=base_state(goal, screen, items, history), questions=questions).answers
-    return Decision(kind=answers["kind"], item=answers.get("item"), site=answers["site"], offscreen=answers.get("offscreen"))
+    return Decision(
+        kind=answers["kind"],
+        item=answers.get("item"),
+        site=answers["site"],
+        offscreen=answers.get("offscreen"),
+        window=answers.get("window"),
+        app=answers.get("app"),
+    )
 
 
 def verify_typed(client: TypeSafeClient, goal: str, field_before: Field, typed: str, field_after: Field | None) -> float:

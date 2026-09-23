@@ -57,3 +57,34 @@ def url_for(sites, key: str) -> str | None:
         if site.key == key:
             return site.url
     return None
+
+
+def apps_for(goal: str, limit: int | None = None) -> tuple:
+    """The installed applications worth offering for this goal, best first.
+
+    Same shape as the sites: a deterministic shortlist first, so the classifier is handed a few
+    names rather than everything installed. An app catalog that cannot be read is simply no apps —
+    the loop then has no open_app option, which is how it behaved before.
+    """
+    try:
+        from . import apps, shortlist
+
+        limit = config.catalog_limit() if limit is None else limit
+        return tuple(shortlist.shortlist(goal, apps.list_apps(), limit=max(1, limit // 2)))
+    except Exception:
+        return ()
+
+
+def app_criteria(found) -> dict[str, str]:
+    """The app question's options. The label is the shortcut's own name, which is what a person
+    calls it."""
+    return {app.key: app.label for app in found}
+
+
+def app_for(found, key: str):
+    """The app behind an answered key. The model names a key; code owns the path, so it can never
+    launch something that is not installed."""
+    for app in found:
+        if app.key == key:
+            return app
+    return None

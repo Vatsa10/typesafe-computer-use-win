@@ -21,7 +21,7 @@ from pathlib import Path
 from . import config, hotkeys, intent, overlay, voice
 from .actions import Context
 from .runner import Control, RunConfig, run
-from .sitepick import sites_for
+from .sitepick import apps_for, sites_for
 from .voice import VoiceUnavailable
 from .writer import make_writer
 
@@ -287,6 +287,7 @@ def build(log=print) -> Daemon:
         cfg = RunConfig(goal=job.goal, out=Path("runs") / time.strftime("%Y%m%d-%H%M%S"), act=job.act)
 
         sites = sites_for(job.goal)  # once per job: the goal is fixed for the whole run
+        installed = apps_for(job.goal)
 
         def ctx_factory(typesafe, history):
             return Context(
@@ -297,6 +298,7 @@ def build(log=print) -> Daemon:
                 writer=writer,
                 history=history,
                 sites=sites,
+                apps=installed,
             )
 
         # echo=log is what puts the step lines in front of whoever is watching: the terminal for

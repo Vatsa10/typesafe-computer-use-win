@@ -290,10 +290,41 @@ whole node budget on what is already on screen and reports nothing hidden.
 | `use_browser` | go to the browser, showing the website the `site` answer names: `none` brings it forward on the page already open there, a `SITES` catalog key launches the browser on that URL, and `other` opens a URL the writer proposes |
 | `type_text` | the writer composes the string; it is set on the focused element through the UI Automation value pattern, with Unicode keystrokes as the fallback when the value does not read back, and a TypeSafe Noul then checks the field's value |
 | `type_email` | fills in `$CLICKER_EMAIL` the same way; refused unless a text field is focused |
+| `switch_window` | bring a window that is already open to the front, chosen from the window question: any monitor, minimized or not, which is always better than opening a second copy |
+| `open_app` | launch an installed application, chosen from the app question; the key indexes the Start Menu catalog, so the path never comes from model text |
 | `press_enter`, `press_escape` | keyboard |
 | `scroll_down`, `scroll_up` | 10 lines of wheel, after parking the cursor over the foreground window |
 | `wait` | screen still loading |
 | `done`, `none` | stop |
+
+### What else is running
+
+A capture is one display. The machine is all of them, and this one has three. Before the window
+inventory existed, a goal about something on another monitor read as "nothing on this screen
+helps" — which, from the loop's side, was true and useless.
+
+Each step now reports every open window: its app, its title, which monitor it is on, whether it is
+minimized, and which one is in front. Two actions act on that. `switch_window` brings one forward,
+`open_app` launches something that is not running at all, from the Start Menu catalog — 113
+shortcuts on this machine, 71 after the junk is dropped.
+
+The display that gets read is the one holding the foreground window, not always the primary. That
+also means every click has to be offset by where that display sits on the virtual desktop: the
+third monitor here starts at x=5120, so a capture-relative click would otherwise land on the first
+screen. `Screen.origin` carries it, and the accessibility walk takes the same offset when deciding
+what counts as on screen.
+
+Measured on this machine, with WhatsApp open on monitor 1 while monitor 3 was in front:
+`switch_window` at 1.00, and the window question put 0.98 on the real WhatsApp against 0.02 on a
+browser window whose title also said WhatsApp. Asked for Excel, which was not running at all:
+`open_app` at 0.99 and `excel` at 1.00.
+
+Two filters matter and are there for a reason. A packaged app appears twice, once as itself and
+once as the `ApplicationFrameHost` frame around it, and offering both splits the probability
+between two answers that do the same thing. And the app catalog drops the accessibility tools —
+Narrator, Magnifier, On-Screen Keyboard, Voice Access — because a program that drives the machine
+must never launch something else that also seizes the keyboard, focus or screen; the run could not
+recover from it.
 
 ### Which sites it can reach
 
@@ -418,8 +449,8 @@ loop, the decision design, the OCR cache and the run folder are its work; `windo
 - OCR only sees text, and UI Automation only covers apps that publish a tree. In a terminal,
   a canvas, or a game, an icon-only button reaches neither source.
 - Two identical labels get only a coarse region hint and split the vote.
-- Only the primary display is captured. A window dragged to a second monitor is still listed
-  by UI Automation and still pressable, but it is not in the capture, so its text is unread.
+- One display is captured per step: the one holding the foreground window. Windows on the others
+  are listed, switchable and pressable, but their text is unread until the loop switches to them.
 - The default OCR engine reports no per-line confidence, so every line it returns scores 1.0.
   `CLICKER_OCR_ENGINE=rapidocr` scores each line honestly, at about 4 s a screen against 0.06 s;
   install it with `uv sync --extra rapidocr`. Pick one engine per process: initialising both

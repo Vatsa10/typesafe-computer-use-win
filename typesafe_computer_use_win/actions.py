@@ -10,9 +10,9 @@ from typesafe_sdk import TypeSafeClient
 
 from . import windows
 from .config import SITES
-from .decide import OFFSCREEN_PREFIX, Decision, verify_typed
+from .decide import APP_PREFIX, OFFSCREEN_PREFIX, WINDOW_PREFIX, Decision, verify_typed
 from .models import Field, Item, Screen
-from .sitepick import url_for
+from .sitepick import app_for, url_for
 from .writer import compose_text, compose_url
 
 VERIFY_THRESHOLD = 0.5
@@ -28,6 +28,7 @@ class Context:
     writer: anthropic.Anthropic | None
     history: list[str]
     sites: tuple = ()  # the per-goal shortlist; empty falls back to the pinned catalog
+    apps: tuple = ()  # the installed applications worth offering for this goal
 
 
 def remember(url: str) -> None:
@@ -46,6 +47,39 @@ def remember(url: str) -> None:
         pass
 
 
+def switch_window(key: str, screen: Screen) -> str:
+    """Bring an already-open window to the front, wherever it is.
+
+    This is the action that makes a second monitor useful. Before it existed, a goal about a
+    window the capture could not see read as "nothing on this screen helps", because from the
+    loop's side of things it was true.
+    """
+    try:
+        window = screen.windows[int(key)]
+    except (ValueError, IndexError):
+        return f"switch_window failed: no window {key!r} is open any more"
+    if windows.activate_window(window.hwnd):
+        return f"switched to {window.app} {window.title[:60]!r} on monitor {window.monitor + 1}"
+    return f"switch_window failed: {window.app} did not come to the front"
+
+
+def open_app(key: str, ctx: Context) -> str:
+    """Launch an installed application by the key the classifier answered with.
+
+    The key indexes the catalog, so the path comes from the Start Menu and never from model text:
+    there is no way for this to run something that is not installed.
+    """
+    from . import apps as app_catalog
+
+    app = app_for(ctx.apps, key)
+    if app is None:
+        return f"open_app failed: {key!r} is not one of the applications offered"
+    if app_catalog.launch(app):
+        time.sleep(1.0)  # a launch is not instant, and the next step reads the screen
+        return f"launched {app.label}"
+    return f"open_app failed: {app.label} did not start"
+
+
 def is_noop(description: str) -> bool:
     return any(marker in description for marker in NOOP_MARKERS)
 
@@ -57,6 +91,10 @@ def perform(decision: Decision, screen: Screen, items: list[Item], ctx: Context)
         return click_item(by_index[key], screen)
     if key.startswith(OFFSCREEN_PREFIX):
         return press_offscreen(key[len(OFFSCREEN_PREFIX) :], screen)
+    if key.startswith(WINDOW_PREFIX):
+        return switch_window(key[len(WINDOW_PREFIX) :], screen)
+    if key.startswith(APP_PREFIX):
+        return open_app(key[len(APP_PREFIX) :], ctx)
     handler = _HANDLERS.get(key)
     if handler is None:
         raise ValueError(f"unknown action {key!r}")

@@ -224,7 +224,7 @@ def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log,
     )
 
     with phase(timing, "decide"):
-        decision = decide(ctx.typesafe, cfg.goal, screen, items, state.history, ctx.browser, ctx.email, ctx.sites)
+        decision = decide(ctx.typesafe, cfg.goal, screen, items, state.history, ctx.browser, ctx.email, ctx.sites, ctx.apps)
     by_index = {str(it.index): it for it in items}
     annotate(screen, items, decision.chosen, prefix.with_suffix(".png"))
 
@@ -316,6 +316,15 @@ def answers(decision: Decision, screen: Screen, items: list[Item], timing: dict[
         "site_probabilities": decision.site.probabilities,
         "offscreen": decision.offscreen.choice if decision.offscreen else None,
         "offscreen_probabilities": decision.offscreen.probabilities if decision.offscreen else None,
+        "window": decision.window.choice if decision.window else None,
+        "window_probabilities": decision.window.probabilities if decision.window else None,
+        # Named app_choice, not app: the frontmost process is already recorded as "app" below, and
+        # one key silently overwriting the other would lose whichever was written first.
+        "app_choice": decision.app.choice if decision.app else None,
+        "app_probabilities": decision.app.probabilities if decision.app else None,
+        "open_windows": [
+            {"k": i, "app": w.app, "title": w.title[:70], "monitor": w.monitor + 1} for i, w in enumerate(screen.windows)
+        ],
         "offscreen_controls": offscreen_records(screen.offscreen),
         "chosen": decision.chosen,
         "confidence": decision.confidence,
