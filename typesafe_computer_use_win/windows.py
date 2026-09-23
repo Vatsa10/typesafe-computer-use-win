@@ -16,6 +16,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from ctypes import wintypes
+from dataclasses import dataclass
 
 from PIL import Image, ImageGrab
 
@@ -416,8 +417,13 @@ def frontmost_window_center(pid: int | None = None) -> tuple[float, float] | Non
 # ------------------------------------------------------------------ capture and OCR
 
 
-def screenshot() -> Image.Image:
-    return ImageGrab.grab(all_screens=False).convert("RGB")
+def screenshot(bounds: tuple[int, int, int, int] | None = None) -> Image.Image:
+    """The primary display, or, given (left, top, right, bottom), that rectangle of the virtual
+    desktop. The bounds are physical pixels and may be negative, so the grab has to see every
+    screen; with no bounds this is the primary display exactly as it always was."""
+    if bounds is None:
+        return ImageGrab.grab(all_screens=False).convert("RGB")
+    return ImageGrab.grab(bbox=bounds, all_screens=True).convert("RGB")
 
 
 def display_scale(image: Image.Image) -> float:
@@ -714,3 +720,184 @@ def open_file(path: str, as_text: bool = False) -> None:
         subprocess.Popen(["notepad.exe", path])
         return
     os.startfile(path)
+
+
+# ------------------------------------------------------------------ monitors and the window inventory
+#
+# Everything below reads the desktop as it actually is: several monitors, any of which may sit left
+# of or above the primary and so carry negative coordinates. Nothing here may assume the desktop
+# starts at (0, 0), and nothing may assume there is only one screen.
+
+MONITORINFOF_PRIMARY = 0x00000001
+MONITOR_DEFAULTTONEAREST = 0x00000002
+ICONIC_RECT_EDGE = -30000  # a minimized window parks at about (-32000, -32000); that is not a place
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+_MONITOR_ENUM_PROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM
+)
+
+
+@dataclass(frozen=True)
+class Monitor:
+    """One physical display, in the virtual desktop's physical pixels."""
+
+    index: int
+    left: int
+    top: int
+    right: int
+    bottom: int
+    primary: bool
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+    @property
+    def bounds(self) -> tuple[int, int, int, int]:
+        return self.left, self.top, self.right, self.bottom
+
+
+@dataclass(frozen=True)
+class WindowInfo:
+    """One switchable top-level window, and which screen it is on."""
+
+    hwnd: int
+    title: str
+    app: str
+    pid: int
+    rect: tuple[int, int, int, int]
+    monitor: int
+    minimized: bool
+    foreground: bool
+
+
+def _monitor_handles() -> list[int]:
+    """Every display device handle, in whatever order Windows enumerates them."""
+    found: list[int] = []
+    proc = _MONITOR_ENUM_PROC(lambda handle, _dc, _rect, _param: found.append(int(handle)) or True)
+    user32.EnumDisplayMonitors(None, None, proc, 0)
+    return found
+
+
+def _monitor_info(handle: int) -> tuple[int, int, int, int, bool] | None:
+    """A monitor handle as (left, top, right, bottom, primary). Any of the four may be negative."""
+    info = _MonitorInfo()
+    info.cbSize = ctypes.sizeof(_MonitorInfo)
+    if not user32.GetMonitorInfoW(wintypes.HMONITOR(handle), ctypes.byref(info)):
+        return None
+    rect = info.rcMonitor
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom), bool(info.dwFlags & MONITORINFOF_PRIMARY)
+
+
+def monitors() -> list[Monitor]:
+    """Every display, primary first and then left to right, so an index means the same thing twice."""
+    raw = [info for info in (_monitor_info(h) for h in _monitor_handles()) if info is not None]
+    raw.sort(key=lambda m: (0 if m[4] else 1, m[0], m[1]))
+    return [Monitor(i, left, top, right, bottom, primary) for i, (left, top, right, bottom, primary) in enumerate(raw)]
+
+
+def _index_of_bounds(bounds: tuple[int, int, int, int]) -> int:
+    for monitor in monitors():
+        if monitor.bounds == bounds:
+            return monitor.index
+    return 0
+
+
+def monitor_of(hwnd: int) -> int:
+    """The screen a window lives on, asked of Windows rather than derived from its rectangle: a
+    minimized window's rectangle is off in the far negative corner and names no real screen."""
+    handle = user32.MonitorFromWindow(wintypes.HWND(hwnd), MONITOR_DEFAULTTONEAREST)
+    if not handle:
+        return 0
+    info = _monitor_info(int(handle))
+    if info is None:
+        return 0
+    return _index_of_bounds(info[:4])
+
+
+def monitor_at(x: float, y: float) -> int:
+    """The screen containing a point, or 0 when the point falls in no screen at all."""
+    for monitor in monitors():
+        if monitor.left <= x < monitor.right and monitor.top <= y < monitor.bottom:
+            return monitor.index
+    return 0
+
+
+def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def open_windows(min_side: int = MIN_WINDOW_SIDE_PX) -> list[WindowInfo]:
+    """Every real, switchable window on every monitor.
+
+    Filtered the way `_find_window` filters: visible, titled, and bigger than `min_side` on both
+    sides. This process's own windows are dropped too, or the control panel and the overlay would
+    offer themselves as things to switch to. A minimized window keeps its place in the list, with
+    its monitor asked of `monitor_of` rather than read off its parked rectangle.
+
+    The order is deterministic: the foreground window, then by monitor, then z-order.
+    """
+    own_pid = int(kernel32.GetCurrentProcessId())
+    foreground = int(_foreground_hwnd())
+    found: list[tuple[int, WindowInfo]] = []
+    for z, hwnd in enumerate(_top_level_windows()):
+        if not user32.IsWindowVisible(hwnd):
+            continue
+        title = _window_title(hwnd)
+        if not title:
+            continue
+        pid = _pid_of(hwnd)
+        if pid == own_pid:
+            continue
+        rect = _window_rect(hwnd)
+        if rect is None:
+            continue
+        minimized = bool(user32.IsIconic(hwnd)) or rect[0] <= ICONIC_RECT_EDGE
+        if not minimized and (rect[2] - rect[0] <= min_side or rect[3] - rect[1] <= min_side):
+            continue
+        found.append(
+            (
+                z,
+                WindowInfo(
+                    hwnd=int(hwnd),
+                    title=title,
+                    app=_process_name(pid),
+                    pid=pid,
+                    rect=rect,
+                    monitor=monitor_of(hwnd),
+                    minimized=minimized,
+                    foreground=int(hwnd) == foreground,
+                ),
+            )
+        )
+    found.sort(key=lambda pair: (0 if pair[1].foreground else 1, pair[1].monitor, pair[0]))
+    return [info for _z, info in found]
+
+
+def activate_window(hwnd: int, timeout: float = 3.0) -> bool:
+    """Switch to one specific window and confirm the foreground actually moved there."""
+    _raise(hwnd)
+    end = time.monotonic() + timeout
+    while True:
+        if int(_foreground_hwnd()) == int(hwnd):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.1)
