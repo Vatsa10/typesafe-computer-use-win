@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageStat
 
-from . import windows
+from . import windows, worldmodel
 from .config import MAX_OPTIONS, MIN_OCR_CONFIDENCE
 from .models import AxNode, Box, Item, Screen
 from .timing import OCR_RECTS, OCR_REGION_PCT, phase
@@ -43,8 +43,18 @@ def capture(
     record the seconds each one costs under "screenshot", "app", "window", "field", and "url".
     """
     replay = image_path is not None and app is not None
+    with phase(timing, "world"):
+        # The display to read is the one being worked on, not always the primary. Capturing the
+        # wrong monitor is worse than capturing nothing: every decision would be about a screen
+        # nobody is looking at.
+        screens, inventory, which, origin = (), (), 0, (0.0, 0.0)
+        if not replay:
+            screens, inventory, which, origin = survey()
     with phase(timing, "screenshot"):
-        image = Image.open(image_path).convert("RGB") if image_path else windows.screenshot()
+        if image_path:
+            image = Image.open(image_path).convert("RGB")
+        else:
+            image = windows.screenshot(screens[which].bounds if screens else None)
     with phase(timing, "app"):
         if replay:
             frontmost, pid = app, None
@@ -58,8 +68,37 @@ def capture(
     with phase(timing, "url"):
         page_url = url if url is not None else (None if replay else windows.browser_url(browser))
     return Screen(
-        image=image, scale=windows.display_scale(image), app=frontmost, field=field, url=page_url, pid=pid, window=window
+        image=image,
+        scale=windows.display_scale(image),
+        app=frontmost,
+        field=field,
+        url=page_url,
+        pid=pid,
+        window=window,
+        windows=inventory,
+        monitors=screens,
+        monitor=which,
+        origin=origin,
     )
+
+
+def survey() -> tuple[tuple, tuple, int, tuple[float, float]]:
+    """The monitors, what is open on them, and which display to read this step.
+
+    The one being read is the one holding the foreground window, because that is where the work
+    is. Everything else is still reported, so a goal about a window on another monitor is
+    answerable rather than invisible.
+    """
+    try:
+        screens = tuple(windows.monitors())
+        inventory = tuple(worldmodel.rank(windows.open_windows()))
+    except Exception:  # a desktop that refuses to enumerate must not stop a run
+        return (), (), 0, (0.0, 0.0)
+    if not screens:
+        return (), inventory, 0, (0.0, 0.0)
+    front = next((w for w in inventory if w.foreground), None)
+    which = front.monitor if front is not None and 0 <= front.monitor < len(screens) else 0
+    return screens, inventory, which, (float(screens[which].left), float(screens[which].top))
 
 
 def goal_echoes(goal: str) -> set[str]:

@@ -67,17 +67,25 @@ class AxAttrs(NamedTuple):
     frame: Frame | None
 
 
-def off_display(frame: Frame | None, display_w_pt: float, display_h_pt: float) -> bool:
-    """True when a real frame lies wholly outside the display: a note list thousands of screens down,
-    or a web node the browser parked above the viewport. A zero-size frame claims nothing, which is
-    what an application element and a closed menu report, so their subtrees are still worth a look.
+def off_display(frame: Frame | None, display_w_pt: float, display_h_pt: float, origin: tuple[float, float] = (0.0, 0.0)) -> bool:
+    """True when a real frame lies wholly outside the captured display: a note list thousands of
+    screens down, or a web node the browser parked above the viewport. A zero-size frame claims
+    nothing, which is what an application element and a closed menu report, so their subtrees are
+    still worth a look.
+
+    A frame is in virtual-desktop coordinates, which do not start at zero on a second monitor and
+    go negative on one placed left of the primary. `origin` is where the captured display sits, so
+    that a window at x=5112 counts as on screen when that is the display being read, and off it
+    when it is not.
     """
     if frame is None:
         return False
     x, y, w, h = frame
     if w <= 0 or h <= 0:
         return False
-    return x >= display_w_pt or y >= display_h_pt or x + w <= 0 or y + h <= 0
+    left, top = origin
+    right, bottom = left + display_w_pt, top + display_h_pt
+    return x >= right or y >= bottom or x + w <= left or y + h <= top
 
 
 def node_identity(node) -> object:
@@ -123,6 +131,7 @@ def walk_actionable(
     actions: Callable[..., Iterable[str]],
     display_w_pt: float,
     display_h_pt: float,
+    origin: tuple[float, float] = (0.0, 0.0),
     node_cap: int = AX_NODE_CAP,
     time_cap: float = AX_TIME_CAP,
     offscreen_cap: int = AX_OFFSCREEN_CAP,
@@ -166,7 +175,7 @@ def walk_actionable(
         repeat = key is not None and key in visited_keys  # same control handed over again, or a wrapper
         if key is not None:
             visited_keys.add(key)
-        hidden = hidden or off_display(frame, display_w_pt, display_h_pt)
+        hidden = hidden or off_display(frame, display_w_pt, display_h_pt, origin)
         if hidden and len(offscreen) >= offscreen_cap:
             continue  # nothing left to collect down there, and it never counted on screen
         kids = list(children(node))

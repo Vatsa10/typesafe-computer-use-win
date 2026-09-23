@@ -130,8 +130,17 @@ class Screen:
     url: str | None
     pid: int | None = None  # frontmost process, for the accessibility walk; None in replay
     window: tuple[float, float, float, float] | None = None  # frontmost window, x/y/w/h in points; None in replay
+    # Where the captured display sits on the virtual desktop. A second monitor starts somewhere
+    # other than zero, and can start left of or above the primary, which makes this negative. Every
+    # click is posted in virtual-desktop coordinates, so the offset has to come back before acting.
+    origin: tuple[float, float] = (0.0, 0.0)
     ax_refs: dict[int, object] = field(default_factory=dict)  # item index -> accessibility element, when it has one
     offscreen: list[AxNode] = field(default_factory=list)  # labelled controls the app exposes but does not show
+    # What else is running. A capture is one display, but the machine is all of them, and a goal
+    # about something on another monitor is answerable only if the loop is told it is open.
+    windows: tuple = ()
+    monitors: tuple = ()
+    monitor: int = 0  # which display this capture came from
 
     @property
     def size_pt(self) -> tuple[float, float]:
@@ -144,5 +153,16 @@ class Screen:
         return f"{row}-{col}"
 
     def to_points(self, item: Item) -> tuple[float, float]:
+        """Where to click, in the virtual-desktop coordinates synthetic input speaks.
+
+        The capture is one display, so an item's pixels are relative to that display's top-left.
+        Adding the origin is what keeps a click on the third monitor from landing on the first.
+        """
         cx, cy = item.center
-        return cx / self.scale, cy / self.scale
+        return self.origin[0] + cx / self.scale, self.origin[1] + cy / self.scale
+
+    @property
+    def bounds_pt(self) -> tuple[float, float, float, float]:
+        """The captured display as left, top, right, bottom in points, on the virtual desktop."""
+        width, height = self.size_pt
+        return self.origin[0], self.origin[1], self.origin[0] + width, self.origin[1] + height

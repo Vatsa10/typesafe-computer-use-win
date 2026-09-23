@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from typesafe_computer_use_win import axwalk as walkmod
 from typesafe_computer_use_win import perception, windows
 from typesafe_computer_use_win.axwalk import AxAttrs, walk_actionable
 from typesafe_computer_use_win.models import AxNode, Item
@@ -295,3 +296,41 @@ def test_an_app_that_lists_itself_as_a_child_terminates():
     found, _, cap_hit = walk_actionable("app", lambda n: tree[n], attrs, lambda n: ["AXPress"], 1000, 800)
     assert [n.label for n in found] == ["File"]
     assert not cap_hit
+
+
+# ------------------------------------------------------------------ more than one monitor
+
+
+def test_a_window_on_a_second_monitor_is_on_screen_when_that_monitor_is_the_one_captured():
+    """The frames the tree reports are virtual-desktop coordinates, so a window at x=5112 is only
+    off screen relative to the primary display. Reading its own monitor, it is right there."""
+    frame = (5112.0, 138.0, 1936.0, 1096.0)
+    assert walkmod.off_display(frame, 2560, 1440) is True  # against the primary at the origin
+    assert walkmod.off_display(frame, 1920, 1080, origin=(5120.0, 0.0)) is False
+
+
+def test_a_monitor_left_of_the_primary_has_negative_coordinates():
+    """Windows places a screen to the left at a negative origin. Treating 0 as the left edge would
+    make every window on it invisible to the walk."""
+    frame = (-1800.0, 100.0, 600.0, 400.0)
+    assert walkmod.off_display(frame, 2560, 1440) is True
+    assert walkmod.off_display(frame, 1920, 1080, origin=(-1920.0, 0.0)) is False
+
+
+def test_a_frame_straddling_the_edge_of_the_captured_display_still_counts_as_on_it():
+    assert walkmod.off_display((2500.0, 10.0, 200.0, 50.0), 2560, 1440) is False
+
+
+def test_the_walk_passes_its_origin_down_to_the_on_screen_test():
+    """A control sitting on the second monitor must be found when that monitor is being walked."""
+    tree = {"app": ["button"], "button": []}
+    frames = {"app": None, "button": (5200.0, 200.0, 120.0, 40.0)}
+
+    def attrs(node):
+        return AxAttrs("AXApplication" if node == "app" else "AXButton", "" if node == "app" else "Send", frames[node])
+
+    found, _, _ = walk_actionable("app", lambda n: tree[n], attrs, lambda n: ["AXPress"], 1920, 1080)
+    assert [n.label for n in found] == [], "against the primary display it is nowhere near the screen"
+
+    found, _, _ = walk_actionable("app", lambda n: tree[n], attrs, lambda n: ["AXPress"], 1920, 1080, origin=(5120.0, 0.0))
+    assert [n.label for n in found] == ["Send"]
