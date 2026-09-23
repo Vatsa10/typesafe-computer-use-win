@@ -68,6 +68,9 @@ copy .env.example .env   :: fill in the keys
 |---|---|---|
 | `TYPESAFE_API_KEY` | yes | every decision |
 | `ANTHROPIC_API_KEY` | no | `type_text`, writer-proposed URLs, and the final answer |
+| `OPENAI_API_KEY` | no | the same three, from OpenAI instead; install with `uv sync --extra openai` |
+| `OPENAI_BASE_URL` | no | point the OpenAI path at Groq, OpenRouter or a local server |
+| `CLICKER_WRITER_PROVIDER` | no | `anthropic` or `openai`; otherwise whichever key is present wins |
 | `CLICKER_EMAIL` | no | enables the `type_email` action |
 | `CLICKER_BROWSER` | no | defaults to `Google Chrome` |
 | `CLICKER_OCR_LANGUAGE` | no | OCR language pack, defaults to `en-US`; add packs in Settings > Language |
@@ -379,6 +382,21 @@ small packet and a structured reply:
   `{achieved, answer}`, and is told to take the answer from the screen alone. When an
   action ran after the last capture, the screen is captured again first. This one
   call uses `CLICKER_ANSWER_MODEL`, a stronger reader than the per-step writer.
+
+**Which service writes it** is a key, not a code change. With only `ANTHROPIC_API_KEY` set it is
+Claude; with only `OPENAI_API_KEY` it is OpenAI; with both, `CLICKER_WRITER_PROVIDER` decides.
+Defaults follow the provider — `claude-haiku-4-5` and `claude-sonnet-5`, or `gpt-4.1-mini` and
+`gpt-4.1` — and `CLICKER_WRITER_MODEL` and `CLICKER_ANSWER_MODEL` override either. Both must be
+vision models, because the final answer reads the capture.
+
+The OpenAI path speaks the ordinary chat-completions API with a strict JSON schema, so
+`OPENAI_BASE_URL` points it at anything that speaks the same shape: Groq, OpenRouter, or a llama
+server on this machine. That is the cheap way to keep free text working — Groq's hosted small
+models cost a fraction of a frontier model for what is, in this program, three short calls a run.
+
+Whatever the provider, a failure is a refused step and not a crashed run. An empty balance, a
+rejected key, a rate limit or a model the account cannot see all come back as one line in the log
+and a step that achieved nothing, which the loop already knows how to carry.
 
 Passwords are never typed. Rely on the browser's password manager or an SSO button
 the OCR can read.

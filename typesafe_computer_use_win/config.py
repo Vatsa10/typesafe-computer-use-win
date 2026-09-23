@@ -13,6 +13,10 @@ DEFAULT_STEPS = 100
 DEFAULT_DELAY = 2.0
 DEFAULT_WRITER_MODEL = "claude-haiku-4-5"
 DEFAULT_ANSWER_MODEL = "claude-sonnet-5"  # runs once per run, on a screenshot: worth a stronger reader
+# The same two jobs on an OpenAI-compatible endpoint. Both read a screenshot for the answer, so both
+# have to be vision models. Override them when an account or a gateway offers something better.
+DEFAULT_OPENAI_WRITER_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_ANSWER_MODEL = "gpt-4.1"
 DEFAULT_BROWSER = "Google Chrome"
 
 # The curated core of the site catalog. These are always offered, whatever the browser holds, and
@@ -45,12 +49,36 @@ def browser() -> str:
     return os.environ.get("CLICKER_BROWSER", DEFAULT_BROWSER)
 
 
+def writer_provider() -> str:
+    """Which service writes free text: "anthropic" or "openai".
+
+    Set CLICKER_WRITER_PROVIDER to force one. Otherwise an OpenAI key wins when it is the only one
+    present, which is what makes swapping providers a matter of changing a key rather than code.
+    """
+    explicit = os.environ.get("CLICKER_WRITER_PROVIDER", "").strip().lower()
+    if explicit in {"anthropic", "openai"}:
+        return explicit
+    if os.environ.get("OPENAI_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+        return "openai"
+    return "anthropic"
+
+
+def openai_base_url() -> str | None:
+    """An OpenAI-compatible endpoint other than OpenAI's own: Groq, OpenRouter, or a local server.
+
+    The API shape is the same, so pointing this somewhere else is the whole configuration.
+    """
+    return os.environ.get("OPENAI_BASE_URL", "").strip() or None
+
+
 def writer_model() -> str:
-    return os.environ.get("CLICKER_WRITER_MODEL", DEFAULT_WRITER_MODEL)
+    default = DEFAULT_OPENAI_WRITER_MODEL if writer_provider() == "openai" else DEFAULT_WRITER_MODEL
+    return os.environ.get("CLICKER_WRITER_MODEL", default)
 
 
 def answer_model() -> str:
-    return os.environ.get("CLICKER_ANSWER_MODEL", DEFAULT_ANSWER_MODEL)
+    default = DEFAULT_OPENAI_ANSWER_MODEL if writer_provider() == "openai" else DEFAULT_ANSWER_MODEL
+    return os.environ.get("CLICKER_ANSWER_MODEL", default)
 
 
 def email() -> str | None:

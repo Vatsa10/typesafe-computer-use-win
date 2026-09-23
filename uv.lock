@@ -609,6 +609,23 @@ wheels = [
 ]
 
 [[package]]
+name = "openai"
+version = "3.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/87/563fce6df3a12bbb5274b1432559c7cf267d1603d85d8a959b5c286d0d22/openai-3.19.0.tar.gz", hash = "sha256:890174cae80a47357035477532b6eabbc3d31220f021896dcc2640943e87b78d", size = 1714573, upload-time = "2026-09-23T00:08:48.075Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/78/0a/45e7073e637f3586eaa5af23a3de58776d5c322d12b77bdba7e2be09ca7a/openai-3.19.0-py3-none-any.whl", hash = "sha256:eaa59585332e54abf71c8011d9bfdb3b4aecead73a0aad977e979756756d42df", size = 2070187, upload-time = "2026-09-23T00:08:45.884Z" },
+]
+
+[[package]]
 name = "opencv-python"
 version = "5.0.0.93"
 source = { registry = "https://pypi.org/simple" }
@@ -1189,6 +1206,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+openai = [
+    { name = "openai" },
+]
 rapidocr = [
     { name = "rapidocr-onnxruntime" },
 ]
@@ -1208,6 +1228,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = "==1.6.0" },
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=2.0" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.60" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pywhispercpp", marker = "extra == 'voice'", specifier = "==1.5.1" },
     { name = "rapidocr-onnxruntime", marker = "extra == 'rapidocr'", specifier = "==1.4.4" },
@@ -1222,7 +1243,7 @@ requires-dist = [
     { name = "winrt-windows-security-cryptography", specifier = "==3.2.1" },
     { name = "winrt-windows-storage-streams", specifier = "==3.2.1" },
 ]
-provides-extras = ["rapidocr", "voice"]
+provides-extras = ["rapidocr", "openai", "voice"]
 
 [package.metadata.requires-dev]
 dev = [

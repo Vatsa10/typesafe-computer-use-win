@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Event
 
-import anthropic
 from typesafe_sdk import TypeSafeClient
 
 from . import windows
@@ -20,7 +19,7 @@ from .models import Abort, Item, Screen
 from .perception import OcrCache, capture, perceive
 from .report import Log, annotate, ax_count, render_payload, top
 from .timing import format_timing, phase, summarize
-from .writer import Answer, compose_answer
+from .writer import Answer, WriterUnavailable, compose_answer
 
 MAX_CONSECUTIVE_NOOPS = 2
 
@@ -189,7 +188,7 @@ def conclude(cfg: RunConfig, ctx: Context, state: RunState, log: Log) -> None:
     if stopped is None:
         return
     if ctx.writer is None:
-        log("\nno answer: the writer is disabled (set ANTHROPIC_API_KEY)")
+        log("\nno answer: no writer is configured (set ANTHROPIC_API_KEY or OPENAI_API_KEY)")
         return
     started = time.perf_counter()
     if state.view is None:
@@ -200,8 +199,8 @@ def conclude(cfg: RunConfig, ctx: Context, state: RunState, log: Log) -> None:
     screen, items = state.view
     try:
         state.answer = compose_answer(ctx.writer, cfg.goal, screen, items, state.history, stopped)
-    except anthropic.APIError as e:
-        log(f"\nno answer: the writer failed ({e})")
+    except WriterUnavailable as e:
+        log(f"\nno answer: the writer is unavailable ({e})")
         return
     verdict = "goal achieved" if state.answer.achieved else "goal not achieved"
     log(f"\nanswer ({verdict}, {time.perf_counter() - started:.1f}s):\n  {state.answer.text}")

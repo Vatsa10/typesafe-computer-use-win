@@ -15,7 +15,7 @@ from typesafe_computer_use_win.writer import ANSWER_IMAGE_EDGE, Answer, compose_
 GOAL = "find the next upcoming bruno mars concert"
 
 
-class FakeWriter:
+class FakeClient:
     """Stands in for the Anthropic client: records each request and replies with one JSON text block."""
 
     def __init__(self, reply: dict):
@@ -26,6 +26,11 @@ class FakeWriter:
     def _create(self, **request):
         self.requests.append(request)
         return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(self._reply))])
+
+
+def FakeWriter(reply: dict) -> writer.Writer:
+    """A writer backed by the fake client, which is what the composers now take."""
+    return writer.Writer("anthropic", FakeClient(reply))
 
 
 def context(writer=None) -> Context:
@@ -44,7 +49,7 @@ def test_the_answer_request_carries_the_capture_and_the_run(screen, make_item, m
     answer = compose_answer(fake, GOAL, screen, [make_item(0, "SEP 19, 2026")], ["clicked 'TOUR'"], "the goal is achieved")
 
     assert answer == Answer(text="Sep 19, 2026 in Miami.", achieved=True)
-    request = fake.requests[0]
+    request = fake.client.requests[0]
     assert request["model"] == "answer-model"
     image, text = request["messages"][0]["content"]
     assert image["type"] == "image" and image["source"]["media_type"] == "image/png"
@@ -72,7 +77,7 @@ def test_requests_without_a_capture_stay_text_only_on_the_writer_model(monkeypat
 
     assert writer.compose_url(fake, GOAL, []) == "https://www.brunomars.com"
 
-    request = fake.requests[0]
+    request = fake.client.requests[0]
     assert request["model"] == "writer-model"
     assert [block["type"] for block in request["messages"][0]["content"]] == ["text"]
 
@@ -85,7 +90,7 @@ def test_a_run_that_has_nothing_to_report_asks_for_no_answer(outcome, tmp_path, 
 
     conclude(RunConfig(goal=GOAL, out=tmp_path), context(fake), state, log)
 
-    assert state.answer is None and not fake.requests and not lines
+    assert state.answer is None and not fake.client.requests and not lines
 
 
 def test_without_a_writer_the_run_says_why_there_is_no_answer(tmp_path, screen):
@@ -109,7 +114,7 @@ def test_the_last_capture_is_answered_from_when_nothing_acted_after_it(tmp_path,
     assert state.answer == Answer(text="Sep 19, 2026 in Miami.", achieved=True)
     assert "goal achieved" in lines[0] and "Sep 19, 2026 in Miami." in lines[0]
     assert not (tmp_path / "answer-raw.png").exists()
-    assert "already achieved" in json.loads(fake.requests[0]["messages"][0]["content"][1]["text"])["why_the_run_stopped"]
+    assert "already achieved" in json.loads(fake.client.requests[0]["messages"][0]["content"][1]["text"])["why_the_run_stopped"]
 
 
 def test_the_screen_is_captured_again_when_an_action_made_the_last_capture_stale(tmp_path, screen, make_item, monkeypatch):
@@ -125,7 +130,7 @@ def test_the_screen_is_captured_again_when_an_action_made_the_last_capture_stale
     assert state.answer == Answer(text="No dates on screen.", achieved=False)
     assert "goal not achieved" in lines[0]
     assert (tmp_path / "answer-raw.png").exists()
-    assert json.loads(fake.requests[0]["messages"][0]["content"][1]["text"])["screen_text_in_reading_order"] == ["TICKETS"]
+    assert json.loads(fake.client.requests[0]["messages"][0]["content"][1]["text"])["screen_text_in_reading_order"] == ["TICKETS"]
 
 
 def test_a_writer_that_fails_costs_the_answer_and_not_the_run(tmp_path, screen):
@@ -133,14 +138,14 @@ def test_a_writer_that_fails_costs_the_answer_and_not_the_run(tmp_path, screen):
         raise anthropic.APIConnectionError(request=SimpleNamespace())  # the error only carries the request along
 
     fake = FakeWriter({})
-    fake.messages.create = refuse
+    fake.client.messages.create = refuse
     state = RunState(outcome="done", view=(screen, []))
     lines, log = logged()
 
     conclude(RunConfig(goal=GOAL, out=tmp_path), context(fake), state, log)
 
     assert state.answer is None
-    assert "no answer: the writer failed" in lines[0]
+    assert "no answer: the writer is unavailable" in lines[0]
 
 
 def decision(kind: str, confidence: float = 0.9) -> SimpleNamespace:

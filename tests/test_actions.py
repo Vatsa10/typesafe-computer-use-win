@@ -2,12 +2,12 @@ import json
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
-import anthropic
 import pytest
 
 from typesafe_computer_use_win import actions, windows
 from typesafe_computer_use_win.actions import click_item, fill_field, press_offscreen
 from typesafe_computer_use_win.models import AxNode, Field, Item
+from typesafe_computer_use_win.writer import WriterUnavailable
 
 
 @pytest.fixture
@@ -269,31 +269,37 @@ def test_an_app_that_will_not_start_reports_failure(monkeypatch):
 # ------------------------------------------------------------------ when the writer is unavailable
 
 
-class Boom(anthropic.APIError):
-    """An APIError as the SDK raises it, without needing a real request object."""
-
-    def __init__(self, message: str):
-        self.message = message
-        Exception.__init__(self, message)
+def Boom(message: str) -> WriterUnavailable:
+    """What a composer raises once a provider has failed: one type, whichever SDK it came from."""
+    return WriterUnavailable(message)
 
 
 def test_a_site_outside_the_catalog_refuses_rather_than_crashing_when_the_account_is_empty(monkeypatch, browser):
     """An empty balance must not take a run down: the loop already handles a step that achieved
     nothing, and a traceback in the middle of driving a machine helps nobody."""
-    monkeypatch.setattr(
-        actions, "compose_url", lambda *a: (_ for _ in ()).throw(Boom("Your credit balance is too low to access the API"))
-    )
+    monkeypatch.setattr(actions, "compose_url", lambda *a: (_ for _ in ()).throw(Boom("the account is out of credit")))
     what = actions.perform(browsing("other"), None, [], context(writer=object()))
     assert "refused" in what and "out of credit" in what
     assert browser == [], "nothing should have been opened"
 
 
 def test_typing_refuses_when_the_writer_is_unavailable(screen, monkeypatch):
-    monkeypatch.setattr(actions, "compose_text", lambda *a: (_ for _ in ()).throw(Boom("authentication_error: bad key")))
+    monkeypatch.setattr(actions, "compose_text", lambda *a: (_ for _ in ()).throw(Boom("the key was rejected")))
     field = Field(role="AXTextField", label="Search", placeholder="", value="", x=0, y=0, w=10, h=10, ref=object())
     what = actions._type_text(None, replace(screen, field=field), [], context(writer=object()))
     assert "refused" in what and "key was rejected" in what
 
 
-def test_an_unknown_writer_failure_still_reports_something_short():
-    assert len(actions.writer_problem(Boom("A" * 400))) <= 120
+def test_an_unknown_provider_failure_is_shortened_before_it_reaches_a_run_log():
+    from typesafe_computer_use_win.writer import problem
+
+    assert len(problem(Exception("A" * 400))) <= 120
+
+
+def test_a_provider_failure_is_named_in_words_whichever_sdk_raised_it():
+    from typesafe_computer_use_win.writer import problem
+
+    assert problem(Exception("Your credit balance is too low")) == "the account is out of credit"
+    assert problem(Exception("insufficient_quota: you exceeded your current quota")) == "the account is out of credit"
+    assert problem(Exception("Incorrect API key provided")) == "the key was rejected"
+    assert "CLICKER_WRITER_MODEL" in problem(Exception("The model `gpt-9` does not exist"))

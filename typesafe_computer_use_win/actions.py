@@ -13,7 +13,7 @@ from .config import SITES
 from .decide import APP_PREFIX, OFFSCREEN_PREFIX, WINDOW_PREFIX, Decision, verify_typed
 from .models import Field, Item, Screen
 from .sitepick import app_for, url_for
-from .writer import compose_text, compose_url
+from .writer import WriterUnavailable, compose_text, compose_url
 
 VERIFY_THRESHOLD = 0.5
 NOOP_MARKERS = ("refused", "failed", "waited")
@@ -29,17 +29,6 @@ class Context:
     history: list[str]
     sites: tuple = ()  # the per-goal shortlist; empty falls back to the pinned catalog
     apps: tuple = ()  # the installed applications worth offering for this goal
-
-
-def writer_problem(error: anthropic.APIError) -> str:
-    """A short reason a run log can carry. The full body is long and mostly JSON, and the useful
-    part is almost always the first sentence: no credit, bad key, rate limited."""
-    message = str(getattr(error, "message", "") or error)
-    if "credit balance is too low" in message:
-        return "the Anthropic account is out of credit"
-    if "authentication" in message.lower() or "invalid x-api-key" in message.lower():
-        return "the Anthropic key was rejected"
-    return message.split(".")[0][:120]
 
 
 def remember(url: str) -> None:
@@ -179,10 +168,10 @@ def _use_browser(decision: Decision, screen, items, ctx: Context) -> str:
             return "use_browser refused: the site is outside the catalog and no writer is available to propose a URL"
         try:
             url = compose_url(ctx.writer, ctx.goal, ctx.history)
-        except anthropic.APIError as e:
+        except WriterUnavailable as e:
             # An expired key, a rate limit or an empty balance must read as a refusal, not a
             # crash: the loop already knows what to do with a step that achieved nothing.
-            return f"use_browser refused: the writer could not propose a URL ({writer_problem(e)})"
+            return f"use_browser refused: the writer could not propose a URL ({e})"
         remember(url)  # resolved once by a model, a lookup for every run after this one
     if not url:
         return "use_browser refused: the writer proposed no usable URL for this goal"
@@ -205,8 +194,8 @@ def _type_text(decision, screen: Screen, items, ctx: Context) -> str:
         return "type_text refused: no writer available"
     try:
         text = compose_text(ctx.writer, ctx.goal, screen, items, ctx.history)
-    except anthropic.APIError as e:
-        return f"type_text refused: the writer is unavailable ({writer_problem(e)})"
+    except WriterUnavailable as e:
+        return f"type_text refused: the writer is unavailable ({e})"
     if not text:
         return "type_text refused: writer declined to fill this field"
     how = fill_field(screen.field, text)

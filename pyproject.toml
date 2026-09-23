@@ -40,6 +40,10 @@ dependencies = [
 # Install with `uv sync --extra rapidocr` and set CLICKER_OCR_ENGINE=rapidocr.
 rapidocr = ["rapidocr-onnxruntime==1.4.4"]
 
+# Free text from an OpenAI-compatible endpoint instead of Anthropic: OpenAI itself, or Groq,
+# OpenRouter or a local server through OPENAI_BASE_URL.
+openai = ["openai>=1.60"]
+
 # Push-to-talk. whisper.cpp ships a prebuilt wheel for Windows AMD64, so this needs no compiler.
 voice = [
     "pywhispercpp==1.5.1",
