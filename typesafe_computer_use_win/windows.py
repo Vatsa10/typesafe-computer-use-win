@@ -701,14 +701,21 @@ def _root_children(node) -> list:
     return node.windows if isinstance(node, _ProcessRoot) else _children(node)
 
 
-def actionable_elements(pid: int, display_w_pt: float, display_h_pt: float) -> tuple[list[AxNode], list[AxNode], bool]:
+def actionable_elements(
+    pid: int, display_w_pt: float, display_h_pt: float, origin: tuple[float, float] = (0.0, 0.0)
+) -> tuple[list[AxNode], list[AxNode], bool]:
     """Labelled controls of one process: the on-screen ones, the pressable off-screen ones, and
-    whether a cap cut the walk short."""
+    whether a cap cut the walk short.
+
+    `origin` is where the display being read sits on the virtual desktop. UI Automation reports
+    every frame in virtual-desktop coordinates, so without it a window on the second monitor looks
+    like it is thousands of pixels off the right edge and the whole app is pruned as invisible.
+    """
     uia = _uia()
     desktop = uia.GetRootControl()
     windows = [w for w in _children(desktop) if getattr(w, "ProcessId", None) == pid]
     root = _ProcessRoot(windows)
-    return walk_actionable(root, _root_children, _attrs, _actions, display_w_pt, display_h_pt)
+    return walk_actionable(root, _root_children, _attrs, _actions, display_w_pt, display_h_pt, origin)
 
 
 # ------------------------------------------------------------------ files

@@ -68,7 +68,7 @@ copy .env.example .env   :: fill in the keys
 |---|---|---|
 | `TYPESAFE_API_KEY` | yes | every decision |
 | `ANTHROPIC_API_KEY` | no | `type_text`, writer-proposed URLs, and the final answer |
-| `OPENAI_API_KEY` | no | the same three, from OpenAI instead; install with `uv sync --extra openai` |
+| `OPENAI_API_KEY` | no | the same three, from OpenAI; set this and it is the provider |
 | `OPENAI_BASE_URL` | no | point the OpenAI path at Groq, OpenRouter or a local server |
 | `CLICKER_WRITER_PROVIDER` | no | `anthropic` or `openai`; otherwise whichever key is present wins |
 | `CLICKER_EMAIL` | no | enables the `type_email` action |
@@ -383,8 +383,9 @@ small packet and a structured reply:
   action ran after the last capture, the screen is captured again first. This one
   call uses `CLICKER_ANSWER_MODEL`, a stronger reader than the per-step writer.
 
-**Which service writes it** is a key, not a code change. With only `ANTHROPIC_API_KEY` set it is
-Claude; with only `OPENAI_API_KEY` it is OpenAI; with both, `CLICKER_WRITER_PROVIDER` decides.
+**Which service writes it** is a key, not a code change. `OPENAI_API_KEY` makes it OpenAI, which
+is the default when both keys are present; with only `ANTHROPIC_API_KEY` it is Claude; and
+`CLICKER_WRITER_PROVIDER` forces either.
 Defaults follow the provider — `claude-haiku-4-5` and `claude-sonnet-5`, or `gpt-4.1-mini` and
 `gpt-4.1` — and `CLICKER_WRITER_MODEL` and `CLICKER_ANSWER_MODEL` override either. Both must be
 vision models, because the final answer reads the capture.
@@ -393,6 +394,9 @@ The OpenAI path speaks the ordinary chat-completions API with a strict JSON sche
 `OPENAI_BASE_URL` points it at anything that speaks the same shape: Groq, OpenRouter, or a llama
 server on this machine. That is the cheap way to keep free text working — Groq's hosted small
 models cost a fraction of a frontier model for what is, in this program, three short calls a run.
+
+Measured on this machine against OpenAI: a URL proposed in 2.4 s by `gpt-4.1-mini`, and the final
+answer read off a real 2560x1440 capture in 2.9 s by `gpt-4.1`.
 
 Whatever the provider, a failure is a refused step and not a crashed run. An empty balance, a
 rejected key, a rate limit or a model the account cannot see all come back as one line in the log

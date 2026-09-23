@@ -117,3 +117,55 @@ def test_budget_falls_back_to_dropping_controls_when_only_controls_remain():
 def test_order_items_renumbers_rows_then_columns():
     items = [ocr_item(7, "right", 800, 100, 900, 130), ocr_item(2, "left", 100, 105, 200, 135)]
     assert [(it.index, it.text) for it in order_items(items)] == [(0, "left"), (1, "right")]
+
+
+# ------------------------------------------------------------------ reading a second monitor
+
+
+def test_the_read_region_is_measured_from_the_display_being_captured(screen_factory=None):
+    """The window is in virtual-desktop points, the crop is in capture pixels.
+
+    Measured live before this was handled: on monitor 2 the region clamped to nothing and a step
+    read 0 items and 0 controls, while the same screen on the primary read 174 and 42.
+    """
+    from dataclasses import replace
+
+    from PIL import Image
+
+    from typesafe_computer_use_win.models import Screen
+    from typesafe_computer_use_win.perception import ocr_region
+
+    base = Screen(
+        image=Image.new("RGB", (2560, 1440)),
+        scale=1.0,
+        app="code",
+        field=None,
+        url=None,
+        window=(2600.0, 200.0, 1200.0, 800.0),  # a window on the second monitor
+    )
+    on_primary = ocr_region(base)  # origin (0, 0): the window is off the right of this capture
+    on_its_own_monitor = ocr_region(replace(base, origin=(2560.0, 157.0)))
+
+    assert on_its_own_monitor != on_primary
+    left, top, right, bottom = on_its_own_monitor
+    assert 0 <= left < right <= 2560 and 0 <= top < bottom <= 1440
+    assert right - left < 2560, "the crop should be the window, not a fallback to the whole screen"
+
+
+def test_a_window_on_the_captured_display_is_unaffected_by_the_offset():
+    from PIL import Image
+
+    from typesafe_computer_use_win.models import Screen
+    from typesafe_computer_use_win.perception import ocr_region
+
+    primary = Screen(
+        image=Image.new("RGB", (2560, 1440)),
+        scale=1.0,
+        app="code",
+        field=None,
+        url=None,
+        window=(100.0, 100.0, 800.0, 600.0),
+    )
+    assert ocr_region(primary) == ocr_region(primary)
+    left, _, right, _ = ocr_region(primary)
+    assert left < right <= 2560

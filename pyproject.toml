@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "anthropic==1.6.0",
+    "openai>=1.60",
     "pillow>=10.0",
     "typesafe-sdk==0.6.0",
     "uiautomation==2.0.29",
@@ -39,10 +40,6 @@ dependencies = [
 # Per-line OCR confidence, at about 4 s a screen against 0.06 s for the engine built into Windows.
 # Install with `uv sync --extra rapidocr` and set CLICKER_OCR_ENGINE=rapidocr.
 rapidocr = ["rapidocr-onnxruntime==1.4.4"]
-
-# Free text from an OpenAI-compatible endpoint instead of Anthropic: OpenAI itself, or Groq,
-# OpenRouter or a local server through OPENAI_BASE_URL.
-openai = ["openai>=1.60"]
 
 # Push-to-talk. whisper.cpp ships a prebuilt wheel for Windows AMD64, so this needs no compiler.
 voice = [

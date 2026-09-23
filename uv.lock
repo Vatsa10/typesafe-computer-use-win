@@ -1193,6 +1193,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "openai" },
     { name = "pillow" },
     { name = "typesafe-sdk" },
     { name = "uiautomation" },
@@ -1206,9 +1207,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-openai = [
-    { name = "openai" },
-]
 rapidocr = [
     { name = "rapidocr-onnxruntime" },
 ]
@@ -1228,7 +1226,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = "==1.6.0" },
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=2.0" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.60" },
+    { name = "openai", specifier = ">=1.60" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pywhispercpp", marker = "extra == 'voice'", specifier = "==1.5.1" },
     { name = "rapidocr-onnxruntime", marker = "extra == 'rapidocr'", specifier = "==1.4.4" },
@@ -1243,7 +1241,7 @@ requires-dist = [
     { name = "winrt-windows-security-cryptography", specifier = "==3.2.1" },
     { name = "winrt-windows-storage-streams", specifier = "==3.2.1" },
 ]
-provides-extras = ["rapidocr", "openai", "voice"]
+provides-extras = ["rapidocr", "voice"]
 
 [package.metadata.requires-dev]
 dev = [

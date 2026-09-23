@@ -256,6 +256,10 @@ def ocr_region(screen: Screen) -> Box:
     if screen.window is None:
         return (0.0, 0.0, width, height)
     x, y, w, h = screen.window
+    # The window is in virtual-desktop points and the crop is in capture pixels, so the display's
+    # own origin comes off first. Without it, a window on the second monitor lands outside the
+    # capture entirely, the region clamps to nothing, and the step reads no text at all.
+    x, y = x - screen.origin[0], y - screen.origin[1]
     scale, margin = screen.scale, REGION_MARGIN_PT
     window = ((x - margin) * scale, (y - margin) * scale, (x + w + margin) * scale, (y + h + margin) * scale)
     joined = (window[0], min(window[1], 0.0), window[2], max(window[3], MENU_BAR_PT * scale))
@@ -478,7 +482,7 @@ def ax_nodes(screen: Screen, budget: int) -> tuple[list[AxNode], list[AxNode]]:
         return [], []
     width_pt, height_pt = screen.size_pt
     try:
-        nodes, hidden, _capped = windows.actionable_elements(screen.pid, width_pt, height_pt)
+        nodes, hidden, _capped = windows.actionable_elements(screen.pid, width_pt, height_pt, screen.origin)
     except Exception:
         return [], []
     return [node for node in nodes[:budget] if node.label], [node for node in hidden if node.label]

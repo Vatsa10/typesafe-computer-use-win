@@ -52,13 +52,14 @@ def browser() -> str:
 def writer_provider() -> str:
     """Which service writes free text: "anthropic" or "openai".
 
-    Set CLICKER_WRITER_PROVIDER to force one. Otherwise an OpenAI key wins when it is the only one
-    present, which is what makes swapping providers a matter of changing a key rather than code.
+    Set CLICKER_WRITER_PROVIDER to force one. Otherwise an OpenAI key wins, including when both
+    are present, so swapping provider is a matter of which key is in .env rather than a code
+    change. Anthropic remains fully supported and is used whenever it is the only key set.
     """
     explicit = os.environ.get("CLICKER_WRITER_PROVIDER", "").strip().lower()
     if explicit in {"anthropic", "openai"}:
         return explicit
-    if os.environ.get("OPENAI_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
+    if os.environ.get("OPENAI_API_KEY"):
         return "openai"
     return "anthropic"
 
