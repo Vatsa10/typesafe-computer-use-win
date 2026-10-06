@@ -7,12 +7,13 @@
 // already running its own loop. Separate processes mean neither has to give up its loop — and a
 // crash in the UI leaves a run that is already driving the machine able to finish or be aborted.
 
-const { app, BrowserWindow, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeTheme, screen } = require("electron");
 const { spawn } = require("node:child_process");
+const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 
-const DEV_CORE = path.join(__dirname, "..", "..", "rust", "target", "debug", "winclicker-core.exe");
+const DEV_CORE = path.join(__dirname, "..", "..", "rust", "target", "debug", "pointer-core.exe");
 const PACKED_CORE = path.join(process.resourcesPath || "", "core.exe");
 const BAR = { width: 680, height: 96 };
 const MARGIN = 24;
@@ -32,7 +33,10 @@ function corePath() {
 }
 
 function startCore() {
-  core = spawn(corePath(), ["--ipc"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  // In a checkout the core runs from the repo root, where .env and runs/ already are; installed, it
+  // keeps them under %LOCALAPPDATA%\pointer on its own.
+  const cwd = app.isPackaged ? undefined : path.join(__dirname, "..", "..");
+  core = spawn(corePath(), ["--ipc"], { cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
 
   readline.createInterface({ input: core.stdout }).on("line", (line) => {
     let message;
@@ -69,6 +73,7 @@ function call(method, params) {
 
 function onEvent(message) {
   if (message.event === "hotkey" && message.name === "bar") return openBar();
+  if (message.event === "hotkey" && message.name === "goal") showPanel();
   if (message.event === "highlight") return draw(message.marks || [], message.seconds || 5);
   if (message.event === "state" && message.running && panelHidesWhileActing) hidePanelForRun();
   if (message.event === "state" && !message.running) showPanelAfterRun();
@@ -89,21 +94,63 @@ ipcMain.handle("call", (_event, method, params) => {
 let panelHidesWhileActing = true;
 let panelHiddenForRun = false;
 
+// Mica is a Windows 11 material (build 22000 and later). It is opt-in (POINTER_MICA=1): on Electron
+// 33 with a hidden title bar, a Mica window showed only the material and never presented the page.
+// Without it the page paints its own solid surface; the panel learns which through its URL.
+const MICA = process.env.POINTER_MICA === "1" && process.platform === "win32" && Number(os.release().split(".")[2] || 0) >= 22000;
+// The custom title bar (titleBarStyle: hidden + titleBarOverlay) is opt-in too
+// (POINTER_CUSTOM_TITLEBAR=1, implied by POINTER_MICA=1): on Electron 33 and this Windows build such
+// a window was never presented on screen until something forced a repaint. The native frame
+// follows nativeTheme by itself.
+const CUSTOM_TITLEBAR = MICA || process.env.POINTER_CUSTOM_TITLEBAR === "1";
+const TITLEBAR_HEIGHT = 40; // matches --titlebar-height in styles/tokens.css
+
+// Solid fallbacks, and the caption-button colours, for each theme. These mirror the surface and
+// text tokens in styles/tokens.css; the shell cannot read CSS, so they are repeated here once.
+const THEME = {
+  light: { surface: "#f3f3f3", symbol: "#1a1a1a" },
+  dark: { surface: "#202020", symbol: "#ffffff" },
+};
+
+function theme() {
+  return nativeTheme.shouldUseDarkColors ? THEME.dark : THEME.light;
+}
+
+function titleBarOverlay() {
+  // Over Mica the caption buttons sit on the material itself; without it they match the surface.
+  return { color: MICA ? "#00000000" : theme().surface, symbolColor: theme().symbol, height: TITLEBAR_HEIGHT };
+}
+
 function createPanel() {
   panel = new BrowserWindow({
     width: 1120,
     height: 780,
     minWidth: 900,
     minHeight: 600,
-    backgroundColor: "#0b1120",
-    title: "winclicker",
+    backgroundColor: MICA ? "#00000000" : theme().surface,
+    backgroundMaterial: MICA ? "mica" : "none",
+    ...(CUSTOM_TITLEBAR ? { titleBarStyle: "hidden", titleBarOverlay: titleBarOverlay() } : {}),
+    title: "Pointer",
     show: false,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true },
   });
   panel.removeMenu();
-  panel.loadFile(path.join(__dirname, "index.html"));
+  panel.loadFile(path.join(__dirname, "index.html"), { query: { mica: MICA ? "1" : "0", titlebar: CUSTOM_TITLEBAR ? "custom" : "native" } });
   panel.once("ready-to-show", () => panel.show());
   panel.on("closed", () => app.quit());
+}
+
+nativeTheme.on("updated", () => {
+  if (!panel || panel.isDestroyed()) return;
+  if (CUSTOM_TITLEBAR) panel.setTitleBarOverlay(titleBarOverlay());
+  if (!MICA) panel.setBackgroundColor(theme().surface);
+});
+
+function showPanel() {
+  if (!panel || panel.isDestroyed()) return;
+  if (panel.isMinimized()) panel.restore();
+  panel.show();
+  panel.focus();
 }
 
 // The panel is on screen, so a run would read its buttons as things to click. The Python version

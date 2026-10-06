@@ -1,7 +1,7 @@
 {
-  "name": "winclicker",
+  "name": "pointer",
   "version": "0.1.0",
-  "description": "Cheap, fast computer use on Windows",
+  "description": "Pointer: cheap, fast computer use on Windows",
   "main": "src/main.js",
   "private": true,
   "scripts": {
@@ -13,10 +13,10 @@
     "electron-builder": "^25.0.0"
   },
   "build": {
-    "appId": "ai.typesafe.winclicker",
-    "productName": "winclicker",
+    "appId": "ai.typesafe.pointer",
+    "productName": "Pointer",
     "files": ["src/**/*"],
-    "extraResources": [{ "from": "../rust/target/release/winclicker-core.exe", "to": "core.exe" }],
+    "extraResources": [{ "from": "../rust/target/release/pointer-core.exe", "to": "core.exe" }],
     "win": { "target": "nsis" },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
   }

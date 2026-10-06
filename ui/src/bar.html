@@ -2,124 +2,176 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>goal</title>
-    <link rel="stylesheet" href="panel.css" />
+    <title>Pointer</title>
+    <link rel="stylesheet" href="styles/tokens.css" />
     <style>
-      /* A command bar, not a window: no chrome, one line, gone as soon as it has an answer.
-         Its height comes from the window it is given, because a window sized in CSS pixels is a
+      /* A Fluent flyout, not a window: no chrome, one line, gone as soon as it has an answer. Its
+         height comes from the window it is given, because a window sized in CSS pixels is a
          different height on a scaled display. */
-      body {
-        background: transparent;
-        overflow: hidden;
-        padding: 8px;
-        height: 100%;
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
       }
 
-      .bar {
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+
+      body {
+        padding: var(--space-3) var(--space-4) var(--space-5);
+        font: 400 var(--type-body) / 20px var(--font-text);
+        color: var(--text-primary);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .flyout {
         height: 100%;
         display: flex;
         align-items: center;
-        gap: 12px;
-        padding: 0 10px 0 16px;
-        border-radius: var(--r-lg);
-        background: rgba(17, 28, 48, 0.97);
-        border: 1px solid #2b3d5c;
-        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
-        animation: rise 140ms cubic-bezier(0.2, 0, 0, 1);
+        gap: var(--space-3);
+        padding: 0 var(--space-2) 0 var(--space-3);
+        border-radius: var(--radius-card);
+        background: var(--surface-flyout);
+        backdrop-filter: blur(40px) saturate(1.4);
+        box-shadow: var(--elevation-flyout);
+        animation: rise var(--dur-normal) var(--ease-out);
       }
 
       @keyframes rise {
         from {
           opacity: 0;
-          transform: translateY(6px);
+          transform: translateY(-6px);
         }
       }
 
-      .arrow {
-        width: 18px;
-        height: 18px;
+      .logo {
+        width: 22px;
+        height: 22px;
         flex: 0 0 auto;
+      }
+
+      .icon {
+        width: 16px;
+        height: 16px;
         fill: none;
-        stroke: var(--accent);
-        stroke-width: 1.8;
-        stroke-linecap: round;
-      }
-
-      /* The bar is the focus indicator: one control, focused on open, so a ring inside it would
-         read as a second box rather than as focus. */
-      #barGoal:focus-visible {
-        outline: none;
-      }
-
-      .bar:focus-within {
-        border-color: var(--accent-deep);
-        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(56, 189, 248, 0.35);
-      }
-
-      #barGoal {
-        flex: 1;
-        min-width: 0;
-        background: transparent;
-        border: 0;
-        outline: none;
-        color: var(--ink);
-        font: 400 16px/1.4 var(--sans);
-        user-select: text;
-      }
-
-      #barGoal::placeholder {
-        color: var(--ink-faint);
-      }
-
-      .mic {
-        flex: 0 0 auto;
-        width: 42px;
-        height: 42px;
-        display: grid;
-        place-items: center;
-        border: 1px solid var(--line);
-        border-radius: 50%;
-        background: var(--surface-2);
-        cursor: pointer;
-        transition: background var(--fast), border-color var(--fast), transform var(--fast);
-      }
-
-      .mic svg {
-        width: 19px;
-        height: 19px;
-        fill: none;
-        stroke: var(--ink-dim);
-        stroke-width: 1.8;
+        stroke: currentColor;
+        stroke-width: 1.5;
         stroke-linecap: round;
         stroke-linejoin: round;
       }
 
+      /* The flyout is the focus indicator: one control, focused on open, so the accent underline
+         below the field is the ring. */
+      .input-wrap {
+        flex: 1;
+        min-width: 0;
+        align-self: stretch;
+        display: flex;
+        align-items: center;
+        position: relative;
+      }
+
+      .input-wrap::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 10px;
+        height: 2px;
+        border-radius: var(--radius-pill);
+        background: var(--accent);
+        transform: scaleX(0);
+        transition: transform var(--dur-normal) var(--ease-out);
+      }
+
+      .input-wrap:focus-within::after {
+        transform: scaleX(1);
+      }
+
+      #barGoal {
+        width: 100%;
+        background: transparent;
+        border: 0;
+        outline: none;
+        color: var(--text-primary);
+        font: 400 16px/24px var(--font-text);
+      }
+
+      #barGoal::placeholder {
+        color: var(--text-tertiary);
+      }
+
+      .mic {
+        position: relative;
+        flex: 0 0 auto;
+        width: 40px;
+        height: 40px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--stroke);
+        border-radius: 50%;
+        background: var(--control);
+        color: var(--text-secondary);
+        cursor: default;
+        transition: background-color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+      }
+
       .mic:hover {
-        background: #1d2d4a;
+        background: var(--control-hover);
+        color: var(--text-primary);
       }
 
       .mic:active {
         transform: scale(0.94);
       }
 
+      .mic:focus-visible {
+        outline: 2px solid var(--focus-ring);
+        outline-offset: 1px;
+      }
+
+      .mic .icon {
+        width: 18px;
+        height: 18px;
+      }
+
+      .mic::before {
+        content: "";
+        position: absolute;
+        inset: -1px;
+        border-radius: 50%;
+        border: 2px solid var(--accent);
+        opacity: 0;
+      }
+
       .mic.live {
-        background: rgba(248, 113, 113, 0.18);
-        border-color: rgba(248, 113, 113, 0.55);
-        animation: breathe 1.6s ease-in-out infinite;
+        background: var(--accent);
+        border-color: transparent;
+        color: var(--text-on-accent);
       }
 
-      .mic.live svg {
-        stroke: #fca5a5;
+      .mic.live::before {
+        animation: ripple 1.4s var(--ease-out) infinite;
       }
 
-      @keyframes breathe {
-        50% {
-          box-shadow: 0 0 0 7px rgba(248, 113, 113, 0.12);
+      @keyframes ripple {
+        from {
+          opacity: 0.7;
+          transform: scale(1);
+        }
+        to {
+          opacity: 0;
+          transform: scale(1.5);
         }
       }
 
-      .mic.busy svg {
-        stroke: var(--accent);
+      .mic.busy .icon {
+        color: var(--accent);
         animation: spin 900ms linear infinite;
       }
 
@@ -129,34 +181,48 @@
         }
       }
 
-      kbd {
+      .hint {
         flex: 0 0 auto;
-        font: 500 10.5px/1 var(--mono);
-        color: var(--ink-faint);
-        border: 1px solid var(--line);
-        border-radius: 5px;
-        padding: 4px 6px;
-        background: var(--surface-2);
+        min-width: 44px;
+        text-align: center;
+        font-size: var(--type-caption);
+        color: var(--text-tertiary);
+        white-space: nowrap;
+      }
+
+      kbd {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: var(--radius-control);
+        border: 1px solid var(--stroke-strong);
+        background: var(--control);
+        font: 600 11px/14px var(--font-text);
+        color: var(--text-secondary);
       }
     </style>
   </head>
   <body>
-    <div class="bar" id="bar">
-      <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-      <input id="barGoal" type="text" autocomplete="off" spellcheck="false" aria-label="Goal" placeholder="Say it, or type it" />
+    <div class="flyout" id="bar">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="1" y="1" width="22" height="22" rx="6" fill="var(--accent)" />
+        <path d="M8 6.5l9 5.2-3.9 1 2.2 4.1-1.8 1-2.2-4.1L8.5 16.6z" fill="var(--text-on-accent)" stroke="var(--text-on-accent)" stroke-width="1" stroke-linejoin="round" />
+      </svg>
+      <div class="input-wrap">
+        <input id="barGoal" type="text" autocomplete="off" spellcheck="false" aria-label="Goal for Pointer" placeholder="Ask Pointer to do something" />
+      </div>
+      <span class="hint" id="hint" aria-live="polite"><kbd>Esc</kbd></span>
       <button class="mic" id="mic" type="button" aria-label="Speak the goal" title="Click, speak, click again">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <rect x="9" y="3" width="6" height="11" rx="3" />
-          <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
-        </svg>
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg>
       </button>
-      <kbd id="hint">Esc</kbd>
     </div>
 
     <script>
       const input = document.getElementById("barGoal");
       const mic = document.getElementById("mic");
       const hint = document.getElementById("hint");
+      const MIC = mic.innerHTML;
+      const SPINNER = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
+      const IDLE_HINT = "<kbd>Esc</kbd>";
       let listening = false;
       let closing = false;
 
@@ -171,7 +237,7 @@
 
       function flash(text) {
         hint.textContent = text;
-        setTimeout(() => (hint.textContent = "Esc"), 1800);
+        setTimeout(() => (hint.innerHTML = IDLE_HINT), 1800);
       }
 
       async function toggleMic() {
@@ -180,27 +246,32 @@
           listening = false;
           mic.classList.remove("live");
           mic.classList.add("busy");
-          hint.textContent = "...";
+          mic.innerHTML = SPINNER;
+          mic.setAttribute("aria-label", "Transcribing");
+          hint.textContent = "Transcribing";
           const reply = await window.core.call("listen_stop");
           mic.classList.remove("busy");
+          mic.innerHTML = MIC;
+          mic.setAttribute("aria-label", "Speak the goal");
           const heard = reply && reply.ok ? reply.result.heard : "";
           if (heard) {
             input.value = heard;
             finish(true, true); // speaking is the whole instruction; there is nothing left to confirm
           } else {
-            flash("nothing heard");
+            flash("Nothing heard");
           }
           return;
         }
         const reply = await window.core.call("listen_start");
         const started = reply && reply.ok && reply.result.listening;
         if (!started) {
-          flash("no mic");
+          flash("No mic");
           return;
         }
         listening = true;
         mic.classList.add("live");
-        hint.textContent = "click to stop";
+        mic.setAttribute("aria-label", "Stop listening");
+        hint.textContent = "Listening";
       }
 
       mic.addEventListener("click", toggleMic);

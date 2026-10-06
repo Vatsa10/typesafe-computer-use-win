@@ -1,0 +1,145 @@
+/* Pointer design tokens. Fluent / Windows 11. Components use these names only; no raw colour
+   values belong anywhere else. Light is the default; dark follows the OS. */
+:root {
+  color-scheme: light dark;
+
+  /* type */
+  --font-text: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, monospace;
+  --type-caption: 12px;
+  --type-body: 14px;
+  --type-body-strong: 600 14px/20px var(--font-text);
+  --type-subtitle: 600 20px/28px var(--font-display);
+  --type-title: 600 28px/36px var(--font-display);
+
+  /* spacing, 4/8 scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* shape */
+  --radius-control: 4px;
+  --radius-card: 8px;
+  --radius-pill: 999px;
+  --control-height: 32px;
+  --titlebar-height: 40px;
+
+  /* motion */
+  --ease-out: cubic-bezier(0, 0, 0, 1);
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 150ms;
+  --dur-normal: 200ms;
+  --dur-slow: 250ms;
+
+  /* colour: light */
+  --surface: #f3f3f3;
+  --surface-solid: #f3f3f3;
+  --surface-raised: #ffffffb3;
+  --surface-raised-solid: #ffffff;
+  --surface-flyout: #fcfcfcf0;
+  --layer: #ffffff80;
+  --layer-hover: #f9f9f980;
+  --control: #ffffffb3;
+  --control-hover: #f9f9f980;
+  --control-pressed: #f9f9f94d;
+  --subtle-hover: #0000000a;
+  --subtle-pressed: #00000006;
+  --stroke: #0000000f;
+  --stroke-strong: #00000029;
+  --stroke-control-bottom: #00000029;
+  --divider: #00000014;
+  --text-primary: #1a1a1a;
+  --text-secondary: #5d5d5d;
+  --text-tertiary: #737373;
+  --text-disabled: #0000005c;
+  --accent: #005fb8;
+  --accent-hover: #0067c0e6;
+  --accent-pressed: #0067c0cc;
+  --accent-subtle: #005fb81a;
+  --text-on-accent: #ffffff;
+  --danger: #c42b1c;
+  --danger-hover: #b0261a;
+  --danger-subtle: #fde7e9;
+  --text-on-danger: #ffffff;
+  --success: #0f7b0f;
+  --success-subtle: #dff6dd;
+  --warning: #9d5d00;
+  --warning-subtle: #fff4ce;
+  --focus-ring: #1a1a1a;
+  --focus-ring-inner: #ffffff;
+  --scrim: #0000004d;
+  --mark: #005fb8;
+  --mark-glow: #005fb833;
+
+  --elevation-card: 0 1px 2px #0000000a;
+  --elevation-flyout: 0 8px 16px #00000024, 0 0 0 1px #0000000f;
+  --elevation-dialog: 0 32px 64px #0000003d, 0 2px 21px #00000029;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #202020;
+    --surface-solid: #202020;
+    --surface-raised: #ffffff0d;
+    --surface-raised-solid: #2b2b2b;
+    --surface-flyout: #2c2c2cf2;
+    --layer: #3a3a3a4d;
+    --layer-hover: #ffffff0f;
+    --control: #ffffff0f;
+    --control-hover: #ffffff15;
+    --control-pressed: #ffffff08;
+    --subtle-hover: #ffffff0f;
+    --subtle-pressed: #ffffff0a;
+    --stroke: #ffffff12;
+    --stroke-strong: #ffffff24;
+    --stroke-control-bottom: #ffffff17;
+    --divider: #ffffff15;
+    --text-primary: #ffffff;
+    --text-secondary: #c5c5c5;
+    --text-tertiary: #9e9e9e;
+    --text-disabled: #ffffff5d;
+    --accent: #60cdff;
+    --accent-hover: #5abce9;
+    --accent-pressed: #52abd4;
+    --accent-subtle: #60cdff1f;
+    --text-on-accent: #00223a;
+    --danger: #ff99a4;
+    --danger-hover: #ff8794;
+    --danger-subtle: #442726;
+    --text-on-danger: #3b0008;
+    --success: #6ccb5f;
+    --success-subtle: #393d1b;
+    --warning: #fce100;
+    --warning-subtle: #433519;
+    --focus-ring: #ffffff;
+    --focus-ring-inner: #000000b3;
+    --scrim: #0000004d;
+    --mark: #60cdff;
+    --mark-glow: #60cdff33;
+
+    --elevation-card: 0 1px 2px #00000033;
+    --elevation-flyout: 0 8px 16px #00000042, 0 0 0 1px #ffffff14;
+    --elevation-dialog: 0 32px 64px #00000047, 0 2px 21px #00000038;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-normal: 0ms;
+    --dur-slow: 0ms;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+  }
+}

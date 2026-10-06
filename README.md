@@ -23,6 +23,34 @@ Automation, `user32` and the OCR engine that ships with Windows.
 winclicker "go to techcrunch and take me to the checkout page for the cheapest tickets to their next upcoming event" --act
 ```
 
+## Pointer, the desktop app
+
+**Pointer** is the same loop shipped as one Windows installer: a Rust core (`pointer-core.exe`)
+and an Electron shell, with no Python, no uv and no terminal. The Python package below stays as
+the reference implementation that every Rust component was checked against on the same screen.
+
+| hotkey | does |
+|---|---|
+| `Right Alt` | opens the command bar at the cursor; type a goal or just speak |
+| `Ctrl+Alt+Space` (hold) | push to talk: a goal, a question about the screen, or "stop" |
+| `Ctrl+Alt+P` | pause or resume the run |
+| `Ctrl+Alt+X` | abort the run (so does the mouse in the top-left corner of the main display) |
+
+Dry run is the default: Pointer decides and draws what it would press on screen, touching
+nothing. Switch to **Act** in the panel to let it click and type.
+
+Keys live in Settings (stored in `.env`, never shown back): `TYPESAFE_API_KEY` for decisions,
+`OPENAI_API_KEY` for writing text, answers and voice transcription.
+
+Build from source:
+
+```
+cd rust && cargo build --release
+cd ../ui && npm install && npm run dist     # NSIS installer in ui/dist/
+```
+
+`npm start` runs the shell against the debug core during development.
+
 ## Why
 
 Frontier-model computer use is capable and expensive: every step ships a screenshot and

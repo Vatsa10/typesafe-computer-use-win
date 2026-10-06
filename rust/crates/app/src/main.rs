@@ -81,12 +81,27 @@ fn start_hotkeys(daemon: Arc<Daemon>) {
         });
 }
 
+/// Where `.env` and `runs/` live. An installed copy starts in its install folder, which is neither
+/// writable nor where anyone would look, so: POINTER_HOME if set, else the working folder when it
+/// already holds a `.env` (a checkout), else `%LOCALAPPDATA%\pointer`.
+fn home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("POINTER_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if cwd.join(".env").is_file() {
+        return cwd;
+    }
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("pointer")).unwrap_or(cwd)
+}
+
 fn main() {
     // Before any window or monitor is asked about anything. Without it every rectangle Windows
     // reports is wrong on a scaled display, and a click computed from one lands short.
     platform::display::declare_dpi_aware();
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = home();
+    std::fs::create_dir_all(&cwd).ok();
     let dotenv = cwd.join(".env");
     let out = Emitter::new(std::io::stdout());
     if let Err(e) = wcore::config::load_dotenv(&dotenv) {

@@ -25,7 +25,7 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `displays` | — | `[ { index, left, top, right, bottom, primary } ]` in physical pixels |
 | `capture` | `{ monitor? }` (default 0) | `{ width, height, origin: [x, y], bytes }` |
 | `start` | `{ goal, act }` | `{ queued: bool }`; `act: null` uses the mode from `set_mode` |
-| `say` | `{ text }` | what the runner made of a spoken line (goal, stop, pause, question...) |
+| `say` | `{ text }` | `{ command, goal, confidence, heard, actionable, routed }` — what the runner made of a spoken line and what it did with it |
 | `ask` | `{ question }` | `{ answer: string }` — talk mode, touches nothing |
 | `pause` | — | `{ paused: bool }` — toggles; also emits `state` |
 | `abort` | — | `{ ok: bool }` — whether there was a run; also emits `state` |
@@ -39,9 +39,6 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `save_settings` | `{ values: { KEY: value } }` | `{ saved: true, keys: [KEY...] }` — names only, never values |
 
 `name` must be a bare run folder name; anything with a separator or `..` is refused.
-
-Until the loop is wired, `start`, `say`, `ask`, `pause` and `abort` fail with
-`"runner not wired yet"`, and `state` reports idle.
 
 ### Secrets
 
