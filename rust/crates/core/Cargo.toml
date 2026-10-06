@@ -1,0 +1,20 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wcore"
+path = "src/lib.rs"
+
+[dependencies]
+platform = { path = "../platform" }
+api = { path = "../api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+rusqlite = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }

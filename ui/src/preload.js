@@ -6,3 +6,11 @@ contextBridge.exposeInMainWorld("core", {
   call: (method, params) => ipcRenderer.invoke("call", method, params),
   on: (handler) => ipcRenderer.on("core", (_event, message) => handler(message)),
 });
+
+// The command bar's own hooks. Whether it should start listening the moment it opens is decided by
+// the shell and handed over in the page URL, because a sandboxed page cannot read the environment.
+const listenOnOpen = new URLSearchParams(location.search).get("listen") === "1";
+contextBridge.exposeInMainWorld("bar", {
+  done: (text, spoken) => ipcRenderer.invoke("bar-done", text, spoken),
+  listenOnOpen,
+});
