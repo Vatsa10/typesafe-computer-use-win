@@ -58,9 +58,25 @@ def switch_window(key: str, screen: Screen) -> str:
         window = screen.windows[int(key)]
     except (ValueError, IndexError):
         return f"switch_window failed: no window {key!r} is open any more"
+    if _already_in_front(window):
+        # Reads as a no-op on purpose: activating the foreground window changes nothing, so the loop
+        # would pick the same window again forever. Two of these in a row stop the run.
+        return f"switch_window refused: {window.app} {window.title[:60]!r} on monitor {window.monitor + 1} was already in front"
     if windows.activate_window(window.hwnd):
         return f"switched to {window.app} {window.title[:60]!r} on monitor {window.monitor + 1}"
     return f"switch_window failed: {window.app} did not come to the front"
+
+
+def _already_in_front(window) -> bool:
+    """Whether this window is the one the user is looking at.
+
+    The screen's own window record answers it, because the inventory marked the foreground window
+    when it was taken. Only a record without the flag pays for a win32 call.
+    """
+    flag = getattr(window, "foreground", None)
+    if flag is not None:
+        return bool(flag)
+    return windows.frontmost_pid() == window.pid
 
 
 def open_app(key: str, ctx: Context) -> str:

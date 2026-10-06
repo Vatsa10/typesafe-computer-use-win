@@ -7,6 +7,7 @@ Audio never reaches the disk.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 
@@ -15,6 +16,20 @@ from . import windows
 SAMPLE_RATE = 16000  # what whisper.cpp wants; resampling anything else is the stream's job
 BLOCK_FRAMES = 1024
 FULL_SCALE = 32768.0
+
+# whisper.cpp biases decoding toward the words in this prompt, which is how "Claude Code" stops
+# coming back as "cloud code". Keep it one short sentence: a long prompt costs decode time on every
+# utterance and makes the model echo the prompt back as if it had been spoken.
+VOICE_PROMPT = (
+    "Claude Code, VS Code, Chrome, WhatsApp, terminal, GitHub: say which monitor or window to use, "
+    "scroll it, and stop, pause, resume or quit."
+)
+
+
+def voice_prompt() -> str:
+    """The decoding bias, overridable with CLICKER_VOICE_PROMPT (empty disables it)."""
+    override = os.environ.get("CLICKER_VOICE_PROMPT")
+    return VOICE_PROMPT if override is None else override
 
 
 class VoiceUnavailable(RuntimeError):
@@ -84,7 +99,8 @@ def transcribe_frames(frames: list[bytes], model_name: str) -> str:
     """The transcript of one utterance, or an empty string when nothing was said."""
     if not frames:
         return ""
-    segments = _load_model(model_name).transcribe(frames_to_audio(frames))
+    # Per call, not per model: the cached model outlives an environment override of the bias.
+    segments = _load_model(model_name).transcribe(frames_to_audio(frames), initial_prompt=voice_prompt())
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 

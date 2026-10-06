@@ -85,7 +85,52 @@ def test_a_transcript_is_stripped_and_joined(monkeypatch):
     monkeypatch.setattr(
         voice,
         "_load_model",
-        lambda name: type("M", (), {"transcribe": lambda self, a: [FakeSegment(" open "), FakeSegment("the console ")]})(),
+        lambda name: type("M", (), {"transcribe": lambda self, a, **kw: [FakeSegment(" open "), FakeSegment("the console ")]})(),
     )
     monkeypatch.setattr(voice, "frames_to_audio", lambda frames: "audio")
     assert voice.transcribe_frames([b"\x00\x00"], "base.en") == "open the console"
+
+
+class RecordingModel:
+    """Captures the decode parameters transcription asked for."""
+
+    def __init__(self):
+        self.params = {}
+
+    def transcribe(self, audio, **params):
+        self.params = params
+        return []
+
+
+def _transcribe_with(monkeypatch):
+    model = RecordingModel()
+    monkeypatch.setattr(voice, "_load_model", lambda name: model)
+    monkeypatch.setattr(voice, "frames_to_audio", lambda frames: "audio")
+    voice.transcribe_frames([b"\x00\x00"], "base.en")
+    return model
+
+
+def test_the_vocabulary_bias_reaches_the_model(monkeypatch):
+    """Without it, whisper hears 'cloud code' for Claude Code."""
+    monkeypatch.delenv("CLICKER_VOICE_PROMPT", raising=False)
+    prompt = _transcribe_with(monkeypatch).params["initial_prompt"]
+    assert prompt == voice.VOICE_PROMPT
+    for word in ("Claude Code", "VS Code", "Chrome", "WhatsApp", "terminal", "GitHub", "monitor", "window", "scroll"):
+        assert word in prompt
+    for command in ("stop", "pause", "resume", "quit"):
+        assert command in prompt
+
+
+def test_the_bias_is_one_short_sentence():
+    """A long prompt costs decode time and gets echoed back as if it had been spoken."""
+    assert len(voice.VOICE_PROMPT) < 300
+
+
+def test_the_environment_overrides_the_bias(monkeypatch):
+    monkeypatch.setenv("CLICKER_VOICE_PROMPT", "Panggu Balcon is not a goal.")
+    assert _transcribe_with(monkeypatch).params["initial_prompt"] == "Panggu Balcon is not a goal."
+
+
+def test_an_empty_override_disables_the_bias(monkeypatch):
+    monkeypatch.setenv("CLICKER_VOICE_PROMPT", "")
+    assert _transcribe_with(monkeypatch).params["initial_prompt"] == ""

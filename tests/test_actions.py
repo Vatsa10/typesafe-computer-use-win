@@ -303,3 +303,28 @@ def test_a_provider_failure_is_named_in_words_whichever_sdk_raised_it():
     assert problem(Exception("insufficient_quota: you exceeded your current quota")) == "the account is out of credit"
     assert problem(Exception("Incorrect API key provided")) == "the key was rejected"
     assert "CLICKER_WRITER_MODEL" in problem(Exception("The model `gpt-9` does not exist"))
+
+
+def test_switching_to_the_window_already_in_front_is_a_no_op(screen, monkeypatch):
+    """A successful switch to the foreground window changes nothing, so the loop repeats it forever."""
+    monkeypatch.setattr(windows, "activate_window", lambda hwnd: pytest.fail("it is already in front"))
+    view = replace(screen, windows=(FakeWin(foreground=True),))
+    what = actions.switch_window("0", view)
+    assert actions.is_noop(what)
+    assert "whatsapp" in what and "WhatsApp" in what and "already in front" in what
+
+
+def test_a_window_record_without_the_flag_asks_windows_for_the_foreground(screen, monkeypatch):
+    @dataclass(frozen=True)
+    class Bare:
+        hwnd: int = 7
+        title: str = "WhatsApp"
+        app: str = "whatsapp"
+        pid: int = 9
+        rect: tuple = (0, 0, 800, 600)
+        monitor: int = 1
+        minimized: bool = False
+
+    monkeypatch.setattr(windows, "activate_window", lambda hwnd: pytest.fail("it is already in front"))
+    monkeypatch.setattr(windows, "frontmost_pid", lambda: 9)
+    assert actions.is_noop(actions.switch_window("0", replace(screen, windows=(Bare(),))))
