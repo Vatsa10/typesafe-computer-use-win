@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>winclicker</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="2.5" y="4" width="19" height="14" rx="2.5" />
+          <path d="M8 21h8M12 18v3" />
+        </svg>
+        <span>winclicker</span>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button class="tab is-on" role="tab" aria-selected="true" data-view="run">Run</button>
+        <button class="tab" role="tab" aria-selected="false" data-view="history">History</button>
+        <button class="tab" role="tab" aria-selected="false" data-view="settings">Settings</button>
+      </nav>
+      <div class="state" id="state">
+        <span class="dot" id="dot"></span>
+        <span id="stateText">idle</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- ---------------------------------------------------------------- run -->
+      <section class="view is-on" id="view-run" role="tabpanel" aria-label="Run">
+        <form class="ask" id="ask">
+          <input
+            id="goal"
+            type="text"
+            autocomplete="off"
+            placeholder="Say what you want done, or hold ctrl+alt+space and speak it"
+            aria-label="Goal"
+          />
+          <button class="btn primary" type="submit" id="start">Start</button>
+        </form>
+
+        <div class="controls">
+          <div class="segment" role="group" aria-label="Mode">
+            <button class="seg is-on" id="modeDry" type="button" aria-pressed="true">
+              Dry run
+              <small>decides, touches nothing</small>
+            </button>
+            <button class="seg danger" id="modeAct" type="button" aria-pressed="false">
+              Act
+              <small>really clicks and types</small>
+            </button>
+          </div>
+
+          <div class="spacer"></div>
+
+          <button class="btn ghost" id="pause" type="button" disabled>Pause</button>
+          <button class="btn ghost danger" id="abort" type="button" disabled>Abort</button>
+        </div>
+
+        <div class="toggles">
+          <label class="check">
+            <input type="checkbox" id="voiceOn" checked />
+            <span>Voice</span>
+          </label>
+          <button class="btn tiny" id="testVoice" type="button">Test voice</button>
+          <label class="check">
+            <input type="checkbox" id="hideOnAct" checked />
+            <span>Hide this window while acting</span>
+          </label>
+          <span class="hint" id="hotkeys"></span>
+        </div>
+
+        <ol class="feed" id="feed" aria-live="polite" aria-label="Live step feed"></ol>
+      </section>
+
+      <!-- ------------------------------------------------------------ history -->
+      <section class="view" id="view-history" role="tabpanel" aria-label="History">
+        <div class="split">
+          <aside class="runs">
+            <div class="runs-head">
+              <span>Runs</span>
+              <button class="btn tiny" id="refresh" type="button">Refresh</button>
+            </div>
+            <ul id="runList" class="run-list"></ul>
+          </aside>
+          <div class="detail">
+            <div id="runMeta" class="meta empty">Pick a run to see what it did.</div>
+            <div id="stepStrip" class="strip"></div>
+            <div class="shot-wrap">
+              <img id="shot" class="shot" alt="" hidden />
+              <p id="shotEmpty" class="placeholder">Pick a step to see what it saw.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ----------------------------------------------------------- settings -->
+      <section class="view" id="view-settings" role="tabpanel" aria-label="Settings">
+        <div class="settings" id="settings"></div>
+        <div class="settings-foot">
+          <button class="btn primary" id="save" type="button">Save to .env</button>
+          <span class="hint" id="saved"></span>
+        </div>
+      </section>
+    </main>
+
+    <script src="panel.js"></script>
+  </body>
+</html>
