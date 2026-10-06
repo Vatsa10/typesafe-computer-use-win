@@ -36,7 +36,9 @@ function startCore() {
   // In a checkout the core runs from the repo root, where .env and runs/ already are; installed, it
   // keeps them under %LOCALAPPDATA%\pointer on its own.
   const cwd = app.isPackaged ? undefined : path.join(__dirname, "..", "..");
-  core = spawn(corePath(), ["--ipc"], { cwd, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  // The core leaves this process's windows out of what it reads: the panel is never the app to work in.
+  const env = { ...process.env, POINTER_UI_PID: String(process.pid) };
+  core = spawn(corePath(), ["--ipc"], { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
 
   readline.createInterface({ input: core.stdout }).on("line", (line) => {
     let message;
@@ -244,7 +246,10 @@ function draw(physicalMarks, seconds) {
   const marks = physicalMarks.slice(0, 6).map(toDip); // more than a handful stops being a hint
   const left = Math.min(...marks.map((m) => m.x)) - 28;
   const top = Math.min(...marks.map((m) => m.y)) - 56; // labels sit above their box
-  const right = Math.max(...marks.map((m) => m.x + m.w)) + 28;
+  // A label is often wider than its box ("would press: Following" over a short tab), so the window
+  // must reach past whichever is wider. ponytail: ~8 DIP per character estimate, measure if it clips.
+  const labelEnd = (m) => m.x + (m.label ? m.label.length * 8 + 32 : 0);
+  const right = Math.max(...marks.map((m) => Math.max(m.x + m.w, labelEnd(m)))) + 28;
   const bottom = Math.max(...marks.map((m) => m.y + m.h)) + 28;
   const local = marks.map((m) => ({ ...m, x: m.x - left, y: m.y - top }));
 

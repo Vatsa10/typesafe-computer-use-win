@@ -178,6 +178,9 @@ fn top_level_windows() -> Vec<HWND> {
 /// read off the rectangle it parked at.
 pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
     let own_pid = unsafe { GetCurrentProcessId() };
+    // The panel is a different process from this core: Electron starts the core and passes its own
+    // pid. Its windows are ours too, or a run reads its own panel as the app to work in.
+    let ui_pid = std::env::var("POINTER_UI_PID").ok().and_then(|v| v.parse::<u32>().ok());
     let front = foreground();
     let mut found: Vec<(usize, WindowInfo)> = Vec::new();
     for (z, hwnd) in top_level_windows().into_iter().enumerate() {
@@ -188,7 +191,9 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
             continue;
         };
         let minimized = minimized_from(unsafe { IsIconic(hwnd) }.as_bool(), rect);
-        if !is_real_window(visible, &title, pid, own_pid, minimized, rect, min_side) {
+        if Some(pid) == ui_pid
+            || !is_real_window(visible, &title, pid, own_pid, minimized, rect, min_side)
+        {
             continue;
         }
         let info = WindowInfo {
