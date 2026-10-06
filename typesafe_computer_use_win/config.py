@@ -90,12 +90,19 @@ def email() -> str | None:
 # Win+key belongs to the shell, and Ctrl+Shift+key to whatever app has focus.
 DEFAULT_HOTKEYS = {
     "talk": "ctrl+alt+space",
+    # The bar is the one most people will use: press, speak, done. Right alt is free on a standard
+    # layout, so it needs no chord; on a layout where it is AltGr, change it in Settings.
+    "bar": "rightalt",
     "goal": "ctrl+alt+g",
     "pause": "ctrl+alt+p",
     "abort": "ctrl+alt+x",
     "quit": "ctrl+alt+q",
 }
 DEFAULT_WHISPER_MODEL = "base.en"
+# How long a pause ends a recording in the command bar. The bar records until clicked again, and
+# people do not click again, so a pause stops it. Short enough not to sit there, long enough to
+# survive thinking mid-sentence.
+DEFAULT_BAR_SILENCE_SECONDS = 1.6
 DEFAULT_VOICE_MAX_SECONDS = 30.0
 DEFAULT_VOICE_MIN_CONFIDENCE = 0.55
 
@@ -106,6 +113,11 @@ def hotkey(name: str) -> str:
 
 def whisper_model() -> str:
     return os.environ.get("CLICKER_WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
+
+
+def bar_silence_seconds() -> float:
+    """Seconds of quiet that end a recording in the bar. Zero waits for the click instead."""
+    return float(os.environ.get("CLICKER_BAR_SILENCE", DEFAULT_BAR_SILENCE_SECONDS))
 
 
 def voice_max_seconds() -> float:

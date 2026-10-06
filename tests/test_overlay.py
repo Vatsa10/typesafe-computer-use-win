@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from typesafe_computer_use_win import overlay
 
 
@@ -141,3 +143,102 @@ def test_a_running_webview_loop_is_used(monkeypatch):
     assert overlay._webview_bar("goal") == (True, "open youtube")
     assert made["kw"]["frameless"] is True and made["kw"]["on_top"] is True
     assert made["destroyed"] is True, "the bar must not outlive the answer"
+
+
+# ------------------------------------------------------- speaking into the bar
+
+
+def test_the_bar_records_on_a_thread_so_the_page_stays_answerable(monkeypatch):
+    """start_listening must return at once. If it recorded inline, the page could not call
+    stop_listening, and the recording would never end."""
+    import threading
+
+    started = threading.Event()
+    monkeypatch.setattr(overlay.voice, "record_until", lambda **kw: (started.set(), [b"\x10\x00"])[1])
+    bar = overlay._Bar()
+    assert bar.start_listening() is True
+    assert started.wait(2.0), "the recording runs, just not on the caller's thread"
+
+
+def test_stopping_transcribes_what_was_recorded(monkeypatch):
+    monkeypatch.setattr(overlay.voice, "record_until", lambda **kw: [b"\x10\x00", b"\x20\x00"])
+    monkeypatch.setattr(overlay.voice, "transcribe_frames", lambda frames, model: "open youtube")
+    bar = overlay._Bar()
+    bar.start_listening()
+    assert bar.stop_listening() == "open youtube"
+
+
+def test_a_recording_with_no_audio_transcribes_to_nothing(monkeypatch):
+    monkeypatch.setattr(overlay.voice, "record_until", lambda **kw: [])
+    monkeypatch.setattr(overlay.voice, "transcribe_frames", lambda frames, model: pytest.fail("nothing to transcribe"))
+    bar = overlay._Bar()
+    bar.start_listening()
+    assert bar.stop_listening() == ""
+
+
+def test_a_microphone_that_fails_does_not_take_the_bar_with_it(monkeypatch):
+    def boom(**kw):
+        raise RuntimeError("no input device")
+
+    monkeypatch.setattr(overlay.voice, "record_until", boom)
+    bar = overlay._Bar()
+    assert bar.start_listening() is True
+    assert bar.stop_listening() == ""
+
+
+def test_the_bar_can_open_straight_into_listening(monkeypatch):
+    monkeypatch.delenv("CLICKER_BAR_LISTEN", raising=False)
+    assert overlay.listens_on_open() is True
+    monkeypatch.setenv("CLICKER_BAR_LISTEN", "0")
+    assert overlay.listens_on_open() is False
+
+
+# ------------------------------------------------------------ where it appears
+
+
+def test_the_bar_opens_under_the_mouse(monkeypatch):
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class M:
+        index: int
+        left: int
+        top: int
+        right: int
+        bottom: int
+        primary: bool = False
+
+    monkeypatch.setattr(overlay.windows, "mouse_location", lambda: (3000.0, 700.0))
+    monkeypatch.setattr(overlay.windows, "monitors", lambda: [M(0, 0, 0, 2560, 1440, True), M(1, 2560, 0, 5120, 1440)])
+    monkeypatch.setattr(overlay.windows, "monitor_at", lambda x, y: 1)
+    left, top = overlay.at_cursor(width=680, height=96)
+    assert 2560 <= left <= 5120 - 680, "it belongs on the monitor the mouse is on"
+    assert top > 700, "and below the pointer rather than under it"
+
+
+def test_the_bar_never_hangs_off_the_edge_of_a_display(monkeypatch):
+    """Centring on the pointer near an edge would push half the bar onto the next monitor."""
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class M:
+        index: int
+        left: int
+        top: int
+        right: int
+        bottom: int
+        primary: bool = True
+
+    monkeypatch.setattr(overlay.windows, "mouse_location", lambda: (2550.0, 1430.0))  # bottom-right corner
+    monkeypatch.setattr(overlay.windows, "monitors", lambda: [M(0, 0, 0, 2560, 1440)])
+    monkeypatch.setattr(overlay.windows, "monitor_at", lambda x, y: 0)
+    left, top = overlay.at_cursor(width=680, height=96)
+    assert left + 680 <= 2560 and top + 96 <= 1440
+
+
+def test_a_desktop_that_will_not_answer_still_gives_a_position(monkeypatch):
+    def boom():
+        raise OSError("no desktop")
+
+    monkeypatch.setattr(overlay.windows, "mouse_location", boom)
+    assert overlay.at_cursor() == (0, 0)

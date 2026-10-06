@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from typesafe_computer_use_win.daemon import Daemon, Job
+from typesafe_computer_use_win.daemon import Daemon, Job, Service
 from typesafe_computer_use_win.intent import Intent
 from typesafe_computer_use_win.runner import Control
 
@@ -192,7 +192,7 @@ def test_the_service_starts_three_threads_without_blocking(monkeypatch):
     service.start()
     try:
         assert pumping.wait(2.0), "the hotkey thread must register and then pump"
-        assert len(registered) == 5, "every binding is claimed on the pumping thread"
+        assert len(registered) == len(Service.HOTKEY_HANDLERS), "every binding is claimed on the pumping thread"
         assert sorted(t.name for t in service.threads) == ["hotkeys", "input", "runs"]
     finally:
         service.stop()
@@ -204,7 +204,7 @@ def test_stopping_the_service_leaves_no_thread_alive(monkeypatch):
     assert pumping.wait(2.0)
     service.stop()
     assert service.daemon.stopped.is_set()
-    assert len(unregistered) == 5
+    assert len(unregistered) == len(Service.HOTKEY_HANDLERS)
     for thread in service.threads:
         assert not thread.is_alive(), f"{thread.name} outlived stop()"
 
@@ -226,7 +226,7 @@ def test_starting_twice_starts_one_set_of_threads(monkeypatch):
     service.start()
     try:
         assert len(service.threads) == 3
-        assert len(registered) == 5
+        assert len(registered) == len(Service.HOTKEY_HANDLERS)
     finally:
         service.stop()
 
@@ -331,3 +331,19 @@ def test_probe_voice_survives_a_missing_microphone():
     daemon.listen_now = lambda: (_ for _ in ()).throw(VoiceUnavailable("no microphone"))
     assert daemon.probe_voice() is None
     assert any("no microphone" in line for line in logged)
+
+
+def test_the_bar_hotkey_queues_what_was_said_or_typed():
+    """Right alt opens the bar; whether the words were spoken into it or typed, the daemon sees
+    the same thing: a goal."""
+    daemon, _ = make_daemon()
+    daemon.ask_goal = lambda: "open youtube"
+    daemon.on_bar()
+    assert daemon.jobs.get_nowait().goal == "open youtube"
+
+
+def test_every_hotkey_in_the_table_has_a_handler():
+    """A name in the table with no on_<name> would fail at registration, in a thread, at startup."""
+    daemon, _ = make_daemon()
+    for name in Service.HOTKEY_HANDLERS:
+        assert callable(getattr(daemon, f"on_{name}", None)), f"no handler for {name}"

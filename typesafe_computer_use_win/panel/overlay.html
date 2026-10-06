@@ -5,10 +5,9 @@
     <title>goal</title>
     <link rel="stylesheet" href="panel.css" />
     <style>
-      /* A command bar, not a window: no chrome, one input, and it leaves as soon as it is done. */
-      /* The window's pixel height depends on the display's scaling, so the bar fills whatever it
-         gets rather than being sized to a number that is right on one monitor and short on the
-         next. */
+      /* A command bar, not a window: no chrome, one line, gone as soon as it has an answer.
+         Its height comes from the window it is given, because a window sized in CSS pixels is a
+         different height on a scaled display. */
       body {
         background: transparent;
         overflow: hidden;
@@ -21,7 +20,7 @@
         display: flex;
         align-items: center;
         gap: 12px;
-        padding: 14px 16px;
+        padding: 0 10px 0 16px;
         border-radius: var(--r-lg);
         background: rgba(17, 28, 48, 0.97);
         border: 1px solid #2b3d5c;
@@ -36,7 +35,7 @@
         }
       }
 
-      .bar svg {
+      .arrow {
         width: 18px;
         height: 18px;
         flex: 0 0 auto;
@@ -46,9 +45,9 @@
         stroke-linecap: round;
       }
 
-      /* The bar is the focus indicator, not a ring inside it: there is one control, it is focused
-         on open, and an outline around it reads as a second box rather than as focus. */
-      input:focus-visible {
+      /* The bar is the focus indicator: one control, focused on open, so a ring inside it would
+         read as a second box rather than as focus. */
+      #barGoal:focus-visible {
         outline: none;
       }
 
@@ -57,8 +56,9 @@
         box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(56, 189, 248, 0.35);
       }
 
-      input {
+      #barGoal {
         flex: 1;
+        min-width: 0;
         background: transparent;
         border: 0;
         outline: none;
@@ -67,11 +67,70 @@
         user-select: text;
       }
 
-      input::placeholder {
+      #barGoal::placeholder {
         color: var(--ink-faint);
       }
 
+      .mic {
+        flex: 0 0 auto;
+        width: 42px;
+        height: 42px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 50%;
+        background: var(--surface-2);
+        cursor: pointer;
+        transition: background var(--fast), border-color var(--fast), transform var(--fast);
+      }
+
+      .mic svg {
+        width: 19px;
+        height: 19px;
+        fill: none;
+        stroke: var(--ink-dim);
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .mic:hover {
+        background: #1d2d4a;
+      }
+
+      .mic:active {
+        transform: scale(0.94);
+      }
+
+      .mic.live {
+        background: rgba(248, 113, 113, 0.18);
+        border-color: rgba(248, 113, 113, 0.55);
+        animation: breathe 1.6s ease-in-out infinite;
+      }
+
+      .mic.live svg {
+        stroke: #fca5a5;
+      }
+
+      @keyframes breathe {
+        50% {
+          box-shadow: 0 0 0 7px rgba(248, 113, 113, 0.12);
+        }
+      }
+
+      .mic.busy svg {
+        stroke: var(--accent);
+        animation: spin 900ms linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
       kbd {
+        flex: 0 0 auto;
         font: 500 10.5px/1 var(--mono);
         color: var(--ink-faint);
         border: 1px solid var(--line);
@@ -82,30 +141,85 @@
     </style>
   </head>
   <body>
-    <div class="bar">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M5 12h14M13 6l6 6-6 6" />
-      </svg>
-      <input id="barGoal" type="text" autocomplete="off" spellcheck="false" aria-label="Goal" placeholder="What do you want done?" />
+    <div class="bar" id="bar">
+      <svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+      <input id="barGoal" type="text" autocomplete="off" spellcheck="false" aria-label="Goal" placeholder="Say it, or type it" />
+      <button class="mic" id="mic" type="button" aria-label="Speak the goal" title="Click, speak, click again">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="9" y="3" width="6" height="11" rx="3" />
+          <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+        </svg>
+      </button>
       <kbd id="hint">Esc</kbd>
     </div>
 
     <script>
       const input = document.getElementById("barGoal");
+      const mic = document.getElementById("mic");
+      const hint = document.getElementById("hint");
+      let listening = false;
+      let closing = false;
 
       function finish(submit) {
+        if (closing) return;
+        closing = true;
         const value = submit ? input.value : "";
-        // The bar is modal to the caller: the worker thread is parked until one of these lands.
         if (window.pywebview) window.pywebview.api[submit ? "submit" : "cancel"](value);
       }
 
+      function flash(text) {
+        hint.textContent = text;
+        setTimeout(() => (hint.textContent = "Esc"), 1800);
+      }
+
+      async function toggleMic() {
+        if (!window.pywebview) return;
+        if (listening) {
+          // Second click: stop, transcribe, and run what it heard.
+          listening = false;
+          mic.classList.remove("live");
+          mic.classList.add("busy");
+          hint.textContent = "...";
+          const heard = await window.pywebview.api.stop_listening();
+          mic.classList.remove("busy");
+          if (heard) {
+            input.value = heard;
+            finish(true); // speaking is the whole instruction; there is nothing left to confirm
+          } else {
+            flash("nothing heard");
+          }
+          return;
+        }
+        const started = await window.pywebview.api.start_listening();
+        if (!started) {
+          flash("no mic");
+          return;
+        }
+        listening = true;
+        mic.classList.add("live");
+        hint.textContent = "click to stop";
+      }
+
+      mic.addEventListener("click", toggleMic);
+
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") finish(true);
-        if (e.key === "Escape") finish(false);
+        if (e.key === "Escape") {
+          if (listening) {
+            toggleMic();
+          } else {
+            finish(false);
+          }
+        }
       });
 
-      window.addEventListener("pywebviewready", () => input.focus());
-      window.addEventListener("blur", () => document.getElementById("hint").textContent = "Esc");
+      window.addEventListener("pywebviewready", () => {
+        input.focus();
+        // Opening straight into listening is the point of the hotkey: press it, speak, done.
+        window.pywebview.api.listen_on_open().then((yes) => {
+          if (yes) toggleMic();
+        });
+      });
       input.focus();
     </script>
   </body>

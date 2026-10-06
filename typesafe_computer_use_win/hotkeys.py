@@ -41,6 +41,18 @@ VK_NAMES = {
     "right": 0x27,
     "down": 0x28,
     **{f"f{n}": 0x6F + n for n in range(1, 13)},
+    # Keys that are normally modifiers, bound on their own. Right alt is the one worth having:
+    # nothing on a normal keyboard layout needs it, so it is free to mean "talk to the computer".
+    # On a layout where right alt is AltGr it types characters, so it is offered rather than default.
+    "rightalt": 0xA5,
+    "ralt": 0xA5,
+    "rightctrl": 0xA3,
+    "rctrl": 0xA3,
+    "rightshift": 0xA1,
+    "rshift": 0xA1,
+    "capslock": 0x14,
+    "pause": 0x13,  # the Pause/Break key, which is not the hotkey named "pause"
+    "scrolllock": 0x91,
 }
 
 
@@ -60,6 +72,7 @@ def parse_hotkey(spec: str) -> tuple[int, int]:
             raise ValueError(f"hotkey {spec!r} names two keys, {key!r} and {part!r}")
     if key is None:
         raise ValueError(f"hotkey {spec!r} has no key, only modifiers")
+    # A bare key with no modifier is allowed, which is what makes "rightalt" or "f9" a hotkey.
     if key in VK_NAMES:
         return modifiers, VK_NAMES[key]
     if len(key) == 1 and (key.isalpha() or key.isdigit()):

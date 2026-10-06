@@ -128,3 +128,17 @@ def test_stop_from_another_thread_ends_a_serving_pump(monkeypatch):
     keys.stop()
     worker.join(2.0)
     assert not worker.is_alive()
+
+
+def test_a_key_on_its_own_is_a_hotkey():
+    """Right alt alone is the one worth having: nothing on a normal layout needs it, so it is free
+    to mean "talk to the computer" without a chord."""
+    mods, vk = hotkeys.parse_hotkey("rightalt")
+    assert mods == 0 and vk == 0xA5
+    assert hotkeys.parse_hotkey("ralt") == (0, 0xA5)
+    assert hotkeys.parse_hotkey("f9") == (0, 0x78)
+
+
+def test_a_modifier_key_can_still_be_combined():
+    mods, vk = hotkeys.parse_hotkey("ctrl+rightalt")
+    assert mods == windows.MOD_CONTROL and vk == 0xA5

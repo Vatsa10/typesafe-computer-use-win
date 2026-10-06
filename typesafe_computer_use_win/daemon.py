@@ -68,6 +68,11 @@ class Daemon:
         self.log(f"heard: {said!r}")
         self.handle_line(said)
 
+    def on_bar(self) -> None:
+        """The command bar: one key, speak or type, and it runs. The same handler as the typed
+        overlay, because the bar is the overlay — it just opens listening."""
+        self.on_goal()
+
     def on_goal(self) -> None:
         typed = self.ask_goal()
         if not typed or not typed.strip():
@@ -171,7 +176,7 @@ class Service:
     pumped on one worker thread, because Windows delivers WM_HOTKEY nowhere else.
     """
 
-    HOTKEY_HANDLERS = ("talk", "goal", "pause", "abort", "quit")
+    HOTKEY_HANDLERS = ("talk", "bar", "goal", "pause", "abort", "quit")
     JOIN_TIMEOUT = 3.0
 
     def __init__(self, daemon: Daemon, log=print) -> None:

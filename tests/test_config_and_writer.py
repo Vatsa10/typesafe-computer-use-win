@@ -38,7 +38,7 @@ def test_hotkeys_have_defaults_and_read_the_environment(monkeypatch):
 def test_every_daemon_hotkey_has_a_default():
     from typesafe_computer_use_win import config
 
-    assert set(config.DEFAULT_HOTKEYS) == {"talk", "goal", "pause", "abort", "quit"}
+    assert set(config.DEFAULT_HOTKEYS) == {"talk", "bar", "goal", "pause", "abort", "quit"}
 
 
 def test_voice_settings_have_defaults_and_read_the_environment(monkeypatch):
