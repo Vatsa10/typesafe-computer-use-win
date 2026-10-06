@@ -222,6 +222,41 @@ def pump_messages(on_hotkey: Callable[[int], None], stop: Callable[[], bool]) ->
             on_hotkey(int(message.wParam))
 
 
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020  # clicks fall through to whatever is underneath
+WS_EX_TOOLWINDOW = 0x00000080  # and it stays out of alt-tab
+WS_EX_NOACTIVATE = 0x08000000  # and never takes focus from the thing it is pointing at
+
+
+def make_click_through(title: str) -> bool:
+    """Turn this process's window with that title into a pane nobody can touch.
+
+    The drawing overlay sits over the desktop, so every one of these matters: without
+    WS_EX_TRANSPARENT it swallows the clicks it is trying to point at, and without NOACTIVATE it
+    steals focus from the app being explained the moment it appears.
+    """
+    me = kernel32.GetCurrentProcessId()
+    changed = False
+
+    def visit(hwnd, _param):
+        nonlocal changed
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == me and _window_title(hwnd) == title:
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            # Deliberately not WS_EX_LAYERED: the webview already composites the window's own
+            # transparency, and adding a layered style without defining the layer's surface paints
+            # the whole thing opaque black. WS_EX_TRANSPARENT alone is what makes clicks fall
+            # through, which is the part actually needed here.
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+            changed = True
+        return True
+
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(visit)
+    user32.EnumWindows(proc, 0)
+    return changed
+
+
 def key_held(vk: int) -> bool:
     """True while a virtual key is physically down. Push-to-talk needs the release that
     RegisterHotKey never reports."""
