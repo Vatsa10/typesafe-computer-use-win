@@ -290,3 +290,36 @@ def test_the_goal_echo_filter_still_works_alongside_history():
     assert is_echo('clear && uv run clicker "go to cnn and click onto something', echoes)
     assert is_echo("did: switched to chrome on monitor 3", echoes)
     assert not is_echo("Trending: Trump and AI warnings", echoes)
+
+
+def test_a_control_is_placed_against_the_display_being_captured_not_the_desktop():
+    """Measured on a desk with a monitor above the primary: the capture starts at y=-1440 and the
+    menu bar's controls report y=-1440, so they belong at pixel 0. Without the offset the boxes
+    land off the capture, the region hints name the wrong third of the screen, and Screen.to_points
+    adds the origin a second time, so a click misses by a whole monitor."""
+    from typesafe_computer_use_win.models import AxNode
+    from typesafe_computer_use_win.perception import to_ax_items
+
+    node = AxNode(role="AXButton", label="File", x=44.0, y=-1440.0, w=46.0, h=44.0, pressable=True, ref=None)
+    on_primary = to_ax_items([node], 1.0)[0]
+    on_its_own_display = to_ax_items([node], 1.0, origin=(1.0, -1440.0))[0]
+
+    assert on_primary.y1 == -1440.0, "without the offset it sits a monitor above the capture"
+    assert on_its_own_display.y1 == 0.0
+    assert on_its_own_display.x1 == 43.0
+    assert on_its_own_display.y2 == 44.0
+
+
+def test_a_click_point_is_not_offset_twice():
+    """to_points adds the origin back, so the item must have had it taken off exactly once."""
+    from PIL import Image
+
+    from typesafe_computer_use_win.models import AxNode, Screen
+    from typesafe_computer_use_win.perception import to_ax_items
+
+    origin = (2560.0, 157.0)
+    node = AxNode(role="AXButton", label="Send", x=2600.0, y=200.0, w=40.0, h=20.0, pressable=True, ref=None)
+    item = to_ax_items([node], 1.0, origin)[0]
+    screen = Screen(image=Image.new("RGB", (2560, 1440)), scale=1.0, app="x", field=None, url=None, origin=origin)
+    x, y = screen.to_points(item)
+    assert (round(x), round(y)) == (2620, 210), "the centre of the control, in desktop coordinates"

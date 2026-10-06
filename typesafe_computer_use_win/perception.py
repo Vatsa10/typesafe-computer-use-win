@@ -190,7 +190,7 @@ def perceive(
         blocks = ocr(screen, budget, goal, cache, timing, history)
     with phase(timing, "ax"):
         nodes, hidden = ax_nodes(screen, budget)
-        controls = to_ax_items(nodes, screen.scale)
+        controls = to_ax_items(nodes, screen.scale, screen.origin)
     merged = merge_with_origins(blocks, controls, budget)
     screen.ax_refs.clear()
     screen.ax_refs.update({it.index: nodes[origin].ref for it, origin in merged if origin is not None and nodes[origin].ref})
@@ -584,17 +584,25 @@ def offscreen_controls(nodes: list[AxNode], items: list[Item]) -> list[AxNode]:
     return out
 
 
-def to_ax_items(nodes: list[AxNode], scale: float) -> list[Item]:
-    """Controls as items, converted from screen points to capture pixels."""
+def to_ax_items(nodes: list[AxNode], scale: float, origin: tuple[float, float] = (0.0, 0.0)) -> list[Item]:
+    """Controls as items, converted from virtual-desktop points to capture pixels.
+
+    The origin is what makes this right on a display that does not start at zero. A control reports
+    its frame on the whole desktop, so on a monitor above the primary its y is around -1440 while
+    the capture of that monitor starts there — the item belongs at pixel 0, not pixel -1440.
+    Without this the boxes land off the capture, the region hints name the wrong third of the
+    screen, and `Screen.to_points` adds the origin a second time, so a click misses by a monitor.
+    """
+    left, top = origin
     return [
         Item(
             index=i,
             text=node.label,
             ocr_confidence=1.0,
-            x1=node.x * scale,
-            y1=node.y * scale,
-            x2=(node.x + node.w) * scale,
-            y2=(node.y + node.h) * scale,
+            x1=(node.x - left) * scale,
+            y1=(node.y - top) * scale,
+            x2=(node.x + node.w - left) * scale,
+            y2=(node.y + node.h - top) * scale,
             role=node.role_word,
             source="ax",
         )
@@ -604,7 +612,7 @@ def to_ax_items(nodes: list[AxNode], scale: float) -> list[Item]:
 
 def ax_items(screen: Screen, budget: int) -> list[Item]:
     """The frontmost app's labelled on-screen controls as items on the capture."""
-    return to_ax_items(ax_nodes(screen, budget)[0], screen.scale)
+    return to_ax_items(ax_nodes(screen, budget)[0], screen.scale, screen.origin)
 
 
 def merge_sources(ocr_items: list[Item], ax_items: list[Item], budget: int = MAX_OPTIONS) -> list[Item]:
