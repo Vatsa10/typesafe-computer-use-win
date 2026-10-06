@@ -86,6 +86,11 @@ pub trait Runner: Send + Sync {
     fn abort(&self) -> Result<bool, String>;
     /// One spoken line: classified (goal, stop, pause, question...) and acted on.
     fn route_said(&self, text: &str, act: bool, events: Events) -> Result<Value, String>;
+    /// A line the shell's browser recognizer heard: routed as `route_said`, but the transcript is
+    /// the recognizer's own final result, so it counts as fully heard (heard = 1.0).
+    fn route_heard(&self, text: &str, act: bool, events: Events) -> Result<Value, String> {
+        self.route_said(text, act, events)
+    }
     /// Talk mode: look at the screen and answer. Touches nothing.
     fn ask(&self, question: &str, events: Events) -> Result<String, String>;
     fn state(&self) -> RunState;
@@ -174,6 +179,31 @@ pub struct Wired {
 }
 
 impl Wired {
+    /// Classify a spoken line and act on it. `fully_heard` marks a browser recognizer's final
+    /// transcript, which passes the heard gate as heard = 1.0 when non-empty.
+    fn route(
+        &self,
+        text: &str,
+        act: bool,
+        events: &Events,
+        fully_heard: bool,
+    ) -> Result<Value, String> {
+        let state = self.state();
+        let mut intent = (self.classify)(text, state.running, state.paused)?;
+        if fully_heard && !text.trim().is_empty() {
+            intent.heard = 1.0;
+        }
+        let routed = self.routed(&intent, act, events);
+        events.line(format!(
+            "heard {:?} -> {} ({:.2}, heard {:.2}): {routed}",
+            intent.transcript, intent.command, intent.confidence, intent.heard
+        ));
+        Ok(json!({
+            "command": intent.command, "goal": intent.goal, "confidence": intent.confidence,
+            "heard": intent.heard, "actionable": intent.actionable(), "routed": routed,
+        }))
+    }
+
     pub fn new(execute: Execute, classify: Classify, answer: Answerer) -> Self {
         let control = wcore::runner::Control::new();
         let running = Arc::new(AtomicBool::new(false));
@@ -308,17 +338,11 @@ impl Runner for Wired {
     }
 
     fn route_said(&self, text: &str, act: bool, events: Events) -> Result<Value, String> {
-        let state = self.state();
-        let intent = (self.classify)(text, state.running, state.paused)?;
-        let routed = self.routed(&intent, act, &events);
-        events.line(format!(
-            "heard {:?} -> {} ({:.2}, heard {:.2}): {routed}",
-            intent.transcript, intent.command, intent.confidence, intent.heard
-        ));
-        Ok(json!({
-            "command": intent.command, "goal": intent.goal, "confidence": intent.confidence,
-            "heard": intent.heard, "actionable": intent.actionable(), "routed": routed,
-        }))
+        self.route(text, act, &events, false)
+    }
+
+    fn route_heard(&self, text: &str, act: bool, events: Events) -> Result<Value, String> {
+        self.route(text, act, &events, true)
     }
 
     fn ask(&self, question: &str, events: Events) -> Result<String, String> {
@@ -537,6 +561,16 @@ mod tests {
             .as_str()
             .is_some_and(|t| t.starts_with("heard \"open youtube\" -> run_goal"))));
         w.abort().unwrap();
+    }
+
+    #[test]
+    fn a_browser_transcript_counts_as_fully_heard() {
+        let (w, events, _) = wired("run_goal", 0.2);
+        let v = w.route_heard("open youtube", false, events).unwrap();
+        assert_eq!(v["heard"], 1.0);
+        assert_eq!(v["actionable"], true);
+        w.abort().unwrap();
+        wait_until(|| !w.state().running);
     }
 
     #[test]

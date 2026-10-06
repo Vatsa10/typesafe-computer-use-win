@@ -81,7 +81,8 @@ impl Daemon {
 
     fn state_value(&self) -> Value {
         let s = self.runner.state();
-        json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hotkeys })
+        json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hotkeys,
+                "stt": self.listener.engine() })
     }
 
     fn emit_state(&self) {
@@ -124,6 +125,15 @@ impl Daemon {
                 Ok(json!({ "listening": self.listener.start()? }))
             }
             "listen_stop" => Ok(json!({ "heard": self.listener.stop()? })),
+            "heard" => {
+                // What the shell's browser recognizer heard: routed exactly as `say`.
+                let text = param_str(params, "text")
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                let text = text.ok_or("heard needs text")?;
+                self.runner
+                    .route_heard(text, self.modes().act, self.events())
+            }
             "pause" => {
                 let paused = self.runner.pause()?;
                 self.emit_state();
@@ -248,6 +258,14 @@ impl Daemon {
             return Err("voice is off".into());
         }
         let vk = self.talk_vk.ok_or("the talk hotkey did not parse")?;
+        if self.listener.engine() == "chrome" {
+            // The shell records on this engine: bracket the held key with start and stop, and the
+            // shell sends what it heard back as `heard`.
+            self.out.event("stt", json!({ "action": "start" }));
+            self.listener.hold(vk);
+            self.out.event("stt", json!({ "action": "stop" }));
+            return Ok(());
+        }
         let said = self.listener.while_held(vk)?;
         if said.is_empty() {
             self.out.line("heard nothing");
@@ -299,6 +317,7 @@ mod tests {
     use super::*;
     use crate::emit::Captured;
     use crate::runner::{RunState, Unwired, NOT_WIRED};
+    use crate::voice::IN_SHELL;
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -351,6 +370,27 @@ mod tests {
         fn while_held(&self, _: u32) -> Result<String, String> {
             Ok("stop".into())
         }
+        fn engine(&self) -> String {
+            "openai".into()
+        }
+        fn hold(&self, _: u32) {}
+    }
+
+    struct ShellMic;
+    impl Listener for ShellMic {
+        fn start(&self) -> Result<bool, String> {
+            Err(IN_SHELL.into())
+        }
+        fn stop(&self) -> Result<String, String> {
+            Err(IN_SHELL.into())
+        }
+        fn while_held(&self, _: u32) -> Result<String, String> {
+            Err(IN_SHELL.into())
+        }
+        fn engine(&self) -> String {
+            "chrome".into()
+        }
+        fn hold(&self, _: u32) {}
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -397,7 +437,7 @@ mod tests {
         let state = d.dispatch("state", &Value::Null).unwrap();
         assert_eq!(
             state,
-            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar" })
+            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai" })
         );
     }
 
@@ -470,6 +510,29 @@ mod tests {
         let messages = captured.messages();
         assert_eq!(messages[0], json!({ "event": "hotkey", "name": "bar" }));
         assert!(messages.iter().any(|m| m["text"] == "heard: stop"));
+    }
+
+    #[test]
+    fn on_chrome_talk_asks_the_shell_to_record_and_heard_routes_like_say() {
+        let dir = tmp("chrome");
+        let (mut d, captured) = daemon(Box::new(FakeRunner::default()), &dir);
+        d.listener = Box::new(ShellMic);
+        assert_eq!(d.dispatch("state", &Value::Null).unwrap()["stt"], "chrome");
+        d.on_hotkey("talk");
+        let stt: Vec<_> = captured
+            .messages()
+            .into_iter()
+            .filter(|m| m["event"] == "stt")
+            .map(|m| m["action"].clone())
+            .collect();
+        assert_eq!(stt, vec![json!("start"), json!("stop")]);
+        assert_eq!(
+            d.dispatch("heard", &json!({ "text": " open youtube " }))
+                .unwrap(),
+            json!({ "command": "run_goal" })
+        );
+        assert!(d.dispatch("heard", &json!({ "text": "  " })).is_err());
+        assert!(d.dispatch("listen_start", &json!({})).is_err());
     }
 
     #[test]

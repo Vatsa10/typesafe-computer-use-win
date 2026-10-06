@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- The core skips any window titled exactly this (rust/crates/platform/src/winlist.rs). -->
+    <title>Pointer speech</title>
+    <style>
+      body { margin: 0; font: 12px system-ui, sans-serif; background: #202020; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="status">idle</div>
+    <script>
+      // Driven by ui/src/stt/bridge.js. The page lives at /<token>/stt.html, so its siblings
+      // /<token>/events and /<token>/result are relative URLs.
+      const base = location.pathname.replace(/stt\.html$/, "");
+      const lang = new URLSearchParams(location.search).get("lang") || "en-US";
+      const status = document.getElementById("status");
+      const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+      let recognition = null;
+      let wanted = false; // between a start and a stop command
+      let running = false;
+      let finals = [];
+      let error = "";
+
+      function post(body) {
+        return fetch(base + "result", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).catch(() => {});
+      }
+
+      function finish() {
+        const text = finals.join(" ").replace(/\s+/g, " ").trim();
+        finals = [];
+        post({ final: true, text, error: error || undefined });
+        error = "";
+        status.textContent = "idle";
+      }
+
+      function make() {
+        const r = new Recognition();
+        r.lang = lang;
+        r.interimResults = true;
+        r.continuous = true;
+        r.onstart = () => {
+          status.textContent = "listening";
+          post({ final: false, state: "listening" }); // the mic is open: no prompt stood in the way
+        };
+        r.onresult = (e) => {
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            if (e.results[i].isFinal) finals.push(e.results[i][0].transcript);
+          }
+        };
+        r.onerror = (e) => {
+          // not-allowed, network, no-speech, audio-capture, aborted...
+          error = e.error || "error";
+          if (e.error !== "aborted") post({ final: false, error });
+          if (e.error === "not-allowed" || e.error === "network" || e.error === "audio-capture") wanted = false;
+        };
+        r.onend = () => {
+          running = false;
+          if (wanted) {
+            // Continuous recognition still ends by itself after a silence; keep going until stop.
+            try {
+              r.start();
+              running = true;
+              return;
+            } catch {}
+          }
+          finish();
+        };
+        return r;
+      }
+
+      function start() {
+        if (!Recognition) {
+          post({ final: true, text: "", error: "unsupported" });
+          return;
+        }
+        if (running) {
+          recognition.onend = null; // a superseded session posts nothing
+          recognition.abort();
+          running = false;
+        }
+        finals = [];
+        error = "";
+        wanted = true;
+        recognition = make();
+        try {
+          recognition.start();
+          running = true; // until onend, which posts the final text
+        } catch (e) {
+          wanted = false;
+          post({ final: true, text: "", error: "start-failed" });
+        }
+      }
+
+      function stop() {
+        wanted = false;
+        if (recognition && running) recognition.stop(); // onend posts the final text
+        else finish();
+      }
+
+      const events = new EventSource(base + "events");
+      events.onmessage = (e) => {
+        let msg;
+        try {
+          msg = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+        if (msg.cmd === "start") start();
+        else if (msg.cmd === "stop") stop();
+      };
+    </script>
+  </body>
+</html>

@@ -229,22 +229,21 @@ pub fn voice_max_seconds() -> Result<f64, String> {
     env_float("CLICKER_VOICE_MAX_SECONDS", DEFAULT_VOICE_MAX_SECONDS)
 }
 
-/// The speech-to-text engine, from `CLICKER_STT`: `auto` (the default) picks OpenAI when
-/// `OPENAI_API_KEY` is set and the free Windows recognizer otherwise; `openai` and `windows` force
-/// one. Returns "openai" or "windows".
+/// The speech-to-text engine, from `CLICKER_STT`: `auto` (the default) is `chrome`, Google's
+/// recognizer through the user's own Chrome (or Edge), driven by the shell - free and keyless.
+/// `openai` and `windows` force the other two. Returns "chrome", "openai" or "windows".
 pub fn stt_engine() -> Result<&'static str, String> {
-    let has_key = env::var("OPENAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
-    choose_stt(&env_or("CLICKER_STT", "auto"), has_key)
+    choose_stt(&env_or("CLICKER_STT", "auto"))
 }
 
 /// The pure half of `stt_engine`.
-pub fn choose_stt(setting: &str, has_openai_key: bool) -> Result<&'static str, String> {
+pub fn choose_stt(setting: &str) -> Result<&'static str, String> {
     match setting.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => Ok(if has_openai_key { "openai" } else { "windows" }),
+        "" | "auto" | "chrome" => Ok("chrome"),
         "openai" => Ok("openai"),
         "windows" => Ok("windows"),
         other => Err(format!(
-            "CLICKER_STT must be auto, openai or windows, not {other:?}"
+            "CLICKER_STT must be auto, chrome, openai or windows, not {other:?}"
         )),
     }
 }
@@ -530,12 +529,12 @@ mod tests {
 
     #[test]
     fn test_stt_engine_choice() {
-        assert_eq!(choose_stt("auto", true).unwrap(), "openai");
-        assert_eq!(choose_stt("auto", false).unwrap(), "windows");
-        assert_eq!(choose_stt("", false).unwrap(), "windows");
-        assert_eq!(choose_stt(" Windows ", true).unwrap(), "windows");
-        assert_eq!(choose_stt("openai", false).unwrap(), "openai");
-        assert!(choose_stt("whisper", true).is_err());
+        assert_eq!(choose_stt("auto").unwrap(), "chrome");
+        assert_eq!(choose_stt("").unwrap(), "chrome");
+        assert_eq!(choose_stt(" Chrome ").unwrap(), "chrome");
+        assert_eq!(choose_stt(" Windows ").unwrap(), "windows");
+        assert_eq!(choose_stt("openai").unwrap(), "openai");
+        assert!(choose_stt("whisper").is_err());
     }
 
     #[test]

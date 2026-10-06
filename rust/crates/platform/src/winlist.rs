@@ -81,6 +81,16 @@ fn is_real_window(
     rect.2 - rect.0 > min_side && rect.3 - rect.1 > min_side
 }
 
+/// The title of the shell's speech page (`ui/src/stt/stt.html`).
+pub const SPEECH_WINDOW_TITLE: &str = "Pointer speech";
+
+/// The shell's hidden speech window. It is a Chrome or Edge app window the shell launched, so its
+/// pid is the browser's, which this core never learns (and the user's own browser may share the
+/// executable): it is recognized by its exact title instead, or a run would read it as an app.
+fn is_speech_window(title: &str) -> bool {
+    title == SPEECH_WINDOW_TITLE
+}
+
 /// Foreground first, then by monitor, then z-order. `z` is the position `EnumWindows` gave it,
 /// which is front-to-back within a monitor.
 fn order_key(info: &WindowInfo, z: usize) -> (u8, usize, usize) {
@@ -180,7 +190,9 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
     let own_pid = unsafe { GetCurrentProcessId() };
     // The panel is a different process from this core: Electron starts the core and passes its own
     // pid. Its windows are ours too, or a run reads its own panel as the app to work in.
-    let ui_pid = std::env::var("POINTER_UI_PID").ok().and_then(|v| v.parse::<u32>().ok());
+    let ui_pid = std::env::var("POINTER_UI_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
     let front = foreground();
     let mut found: Vec<(usize, WindowInfo)> = Vec::new();
     for (z, hwnd) in top_level_windows().into_iter().enumerate() {
@@ -192,6 +204,7 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
         };
         let minimized = minimized_from(unsafe { IsIconic(hwnd) }.as_bool(), rect);
         if Some(pid) == ui_pid
+            || is_speech_window(&title)
             || !is_real_window(visible, &title, pid, own_pid, minimized, rect, min_side)
         {
             continue;
@@ -341,6 +354,14 @@ mod tests {
     fn invisible_and_untitled_windows_are_not_windows() {
         assert!(!is_real_window(false, "Mail", 7, OWN, false, ON_SCREEN, 50));
         assert!(!is_real_window(true, "", 7, OWN, false, ON_SCREEN, 50));
+    }
+
+    #[test]
+    fn the_speech_window_is_skipped_by_its_exact_title_only() {
+        assert!(is_speech_window("Pointer speech"));
+        assert!(!is_speech_window("Pointer speech - Google Chrome"));
+        assert!(!is_speech_window("pointer speech"));
+        assert!(!is_speech_window("Pointer"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
-//! The microphone, on one of two engines (`CLICKER_STT`): OpenAI (recorded on a worker thread,
-//! transcribed with a vocabulary prompt) or the free Windows recognizer (`platform::stt`), which
-//! records and recognizes in one go because WinRT cannot be handed recorded audio.
+//! The microphone, on one of three engines (`CLICKER_STT`): Chrome (the default: Google's free
+//! recognizer in the user's own Chrome or Edge, which the Electron shell drives - this core never
+//! records on it), OpenAI (recorded on a worker thread, transcribed with a vocabulary prompt) or the
+//! free Windows recognizer (`platform::stt`), which records and recognizes in one go because WinRT
+//! cannot be handed recorded audio.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,23 +28,40 @@ pub trait Listener: Send + Sync {
     fn stop(&self) -> Result<String, String>;
     /// Record while `vk` is held, then transcribe.
     fn while_held(&self, vk: u32) -> Result<String, String>;
+    /// The engine's name: "chrome", "openai" or "windows". On "chrome" the shell records.
+    fn engine(&self) -> String;
+    /// Block while `vk` is held (bounded by the longest utterance). Push-to-talk on the chrome
+    /// engine: the shell records between the start and stop this brackets.
+    fn hold(&self, vk: u32);
 }
+
+/// The line `listen_start`/`listen_stop` give when the core is asked to record on Chrome.
+pub const IN_SHELL: &str = "the chrome speech engine runs in the shell, not the core";
 
 type Recording = (Arc<AtomicBool>, JoinHandle<Result<String, String>>);
 
 /// Which engine `CLICKER_STT` selects, as a typed value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
+    Chrome,
     OpenAi,
     Windows,
 }
 
 impl Engine {
     pub fn from_name(name: &str) -> Engine {
-        if name == "windows" {
-            Engine::Windows
-        } else {
-            Engine::OpenAi
+        match name {
+            "windows" => Engine::Windows,
+            "openai" => Engine::OpenAi,
+            _ => Engine::Chrome,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Engine::Chrome => "chrome",
+            Engine::OpenAi => "openai",
+            Engine::Windows => "windows",
         }
     }
 
@@ -55,6 +74,7 @@ impl Engine {
         match self {
             Engine::Windows => stt::unavailable_reason().map_or(Ok(()), Err),
             Engine::OpenAi => Ok(()),
+            Engine::Chrome => Err(IN_SHELL.into()),
         }
     }
 }
@@ -97,6 +117,7 @@ impl Listener for Microphone {
                 match engine {
                     Engine::Windows => stt::recognize_live(stopped, max, silence),
                     Engine::OpenAi => transcribe(&audio::record_until(stopped, max, silence)?),
+                    Engine::Chrome => Err(IN_SHELL.into()),
                 }
             })
             .map_err(|e| format!("could not start recording: {e}"))?;
@@ -127,6 +148,19 @@ impl Listener for Microphone {
                 stt::recognize_live(|| !audio::key_held(vk), max, 0.0)
             }
             Engine::OpenAi => transcribe(&audio::record_while_held(vk, max)?),
+            Engine::Chrome => Err(IN_SHELL.into()),
+        }
+    }
+
+    fn engine(&self) -> String {
+        Engine::current().map_or_else(|_| "chrome".into(), |e| e.name().into())
+    }
+
+    fn hold(&self, vk: u32) {
+        let max = wcore::config::voice_max_seconds().unwrap_or(30.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(max.max(1.0));
+        while audio::key_held(vk) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(30));
         }
     }
 }
@@ -144,14 +178,14 @@ mod tests {
     fn the_engine_name_maps_to_the_engine() {
         assert_eq!(Engine::from_name("windows"), Engine::Windows);
         assert_eq!(Engine::from_name("openai"), Engine::OpenAi);
+        assert_eq!(Engine::from_name("chrome"), Engine::Chrome);
         assert_eq!(
-            Engine::from_name(wcore::config::choose_stt("auto", false).unwrap()),
-            Engine::Windows
+            Engine::from_name(wcore::config::choose_stt("auto").unwrap()),
+            Engine::Chrome
         );
-        assert_eq!(
-            Engine::from_name(wcore::config::choose_stt("auto", true).unwrap()),
-            Engine::OpenAi
-        );
+        for e in [Engine::Chrome, Engine::OpenAi, Engine::Windows] {
+            assert_eq!(Engine::from_name(e.name()), e);
+        }
     }
 
     #[test]

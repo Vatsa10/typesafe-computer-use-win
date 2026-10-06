@@ -21,15 +21,16 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 
 | method | params | result |
 |---|---|---|
-| `state` | — | `{ running, paused, hotkeys }` — `hotkeys` is a display string of the bindings |
+| `state` | — | `{ running, paused, hotkeys, stt }` — `hotkeys` is a display string of the bindings; `stt` is the speech engine: `chrome`, `openai` or `windows` |
 | `displays` | — | `[ { index, left, top, right, bottom, primary } ]` in physical pixels |
 | `capture` | `{ monitor? }` (default 0) | `{ width, height, origin: [x, y], bytes }` |
 | `start` | `{ goal, act }` | `{ queued: bool }`; `act: null` uses the mode from `set_mode` |
 | `say` | `{ text }` | `{ command, goal, confidence, heard, actionable, routed }` — what the runner made of a spoken line and what it did with it |
+| `heard` | `{ text }` | as `say` — a final transcript from the shell's browser recognizer (chrome engine), which counts as fully heard (`heard: 1.0`) |
 | `ask` | `{ question }` | `{ answer: string }` — talk mode, touches nothing |
 | `pause` | — | `{ paused: bool }` — toggles; also emits `state` |
 | `abort` | — | `{ ok: bool }` — whether there was a run; also emits `state` |
-| `listen_start` | — | `{ listening: bool }` — false when already recording; error when voice is off |
+| `listen_start` | — | `{ listening: bool }` — false when already recording; error when voice is off, or on the chrome engine (the shell answers it there) |
 | `listen_stop` | — | `{ heard: string }` — `""` for silence |
 | `set_mode` | `{ act, voice, hide }` (any subset) | the same three, as applied |
 | `runs` | — | `[ { name, goal, outcome, answer, goal_achieved, seconds, steps_taken, acted } ]`, newest first |
@@ -52,8 +53,19 @@ take effect in the running core at once, except hotkeys, which need a restart.
 
 `listen_start` records the default microphone on a worker thread until `listen_stop`, the longest
 utterance (`CLICKER_VOICE_MAX_SECONDS`), or a pause after speech (`CLICKER_BAR_SILENCE`).
-`CLICKER_STT` (a non-secret setting) picks the engine: `auto` (default) is OpenAI when
-`OPENAI_API_KEY` is set and Windows otherwise; `openai` and `windows` force one. The Windows engine
+`CLICKER_STT` (a non-secret setting) picks the engine: `auto` (default) and `chrome` use Google's
+recognizer through the user's own Chrome (or Edge); `openai` and `windows` force those engines.
+
+On **chrome** the core does not record. The shell (`src/stt/bridge.js`) serves `src/stt/stt.html`
+on 127.0.0.1 behind a random per-session token and opens it with `webkitSpeechRecognition` in a
+dedicated, off-screen Chrome/Edge app window on its own profile (`%LOCALAPPDATA%\pointer\speech-profile`),
+started on first use and killed on quit. (Inside Electron the same API fails with `network`.) The
+shell answers the panel's and bar's `listen_start` / `listen_stop` itself, in the same reply shapes;
+push-to-talk is the core emitting `stt` `start`/`stop` around the held key, after which the shell
+sends what it heard as `heard`. The speech window is titled exactly `Pointer speech`, and the core's
+window survey skips that title, since its pid is the browser's and unknown to the core.
+
+The Windows engine
 (free, keyless) records and recognizes in one go with the built-in recognizer; when it is not
 available (speech privacy off, no speech language) `listen_start` and push-to-talk fail with a line
 saying which setting to change. On the OpenAI engine the audio
@@ -69,6 +81,7 @@ prompt naming Claude Code, VS Code, Chrome and the commands, so "Claude" is not 
 | `state` | `{ running, paused, hotkeys }` | at startup, and when a run starts, pauses, resumes or ends |
 | `hotkey` | `{ name }` | a global hotkey fired: `bar`, `talk`, `goal`, `pause`, `abort` or `quit` (the bar opens on `bar`) |
 | `highlight` | `{ marks: [ { x, y, w, h, label? } ], seconds }` | point at something on screen for `seconds` |
+| `stt` | `{ action: "start" \| "stop" }` | chrome engine only: the talk key went down / up; the shell records and replies with `heard` |
 | `answer` | `{ text, spoken }` | an answer is ready, and whether it was read aloud (`CLICKER_SPEAK`) |
 
 `highlight` marks are in PHYSICAL pixels on the virtual desktop — what the core captures and clicks

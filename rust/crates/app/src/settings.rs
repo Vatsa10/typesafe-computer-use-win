@@ -104,7 +104,7 @@ pub fn catalog() -> Vec<Setting> {
         row(
             "CLICKER_STT",
             "Speech-to-text engine",
-            "auto (openai with a key, else windows)",
+            "auto (chrome, free)",
         ),
         row(
             "CLICKER_TRANSCRIBE_MODEL",

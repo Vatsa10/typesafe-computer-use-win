@@ -12,6 +12,7 @@ const { spawn } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const { createBridge } = require("./stt/bridge");
 
 const DEV_CORE = path.join(__dirname, "..", "..", "rust", "target", "debug", "pointer-core.exe");
 const PACKED_CORE = path.join(process.resourcesPath || "", "core.exe");
@@ -25,6 +26,7 @@ let overlay = null;
 let overlayTimer = null;
 let nextId = 1;
 const pending = new Map();
+let voiceOn = true; // mirrors the panel's voice toggle (set_mode), which the core checks too
 
 /* ------------------------------------------------------------------ the core */
 
@@ -73,7 +75,51 @@ function call(method, params) {
   });
 }
 
+/* ------------------------------------------------------- the free speech engine */
+
+// CLICKER_STT=chrome (the default): the core cannot record on this engine, so the shell does,
+// through Google's recognizer in a dedicated, hidden Chrome or Edge window (src/stt/bridge.js).
+// Started on first use, kept alive, killed on quit. Transcripts are never logged here.
+const speech = createBridge({ log: (text) => toPanel({ event: "line", text }) });
+
+async function sttEngine() {
+  const reply = await call("state");
+  return reply && reply.ok ? reply.result.stt : "";
+}
+
+async function speechStart() {
+  if (!voiceOn) return { ok: false, error: "voice is off" };
+  try {
+    return { ok: true, result: { listening: await speech.start() } };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function speechStop() {
+  const t0 = Date.now();
+  const heard = await speech.stop();
+  if (SELFTEST) console.log(`[stt-selftest] stop -> heard=${JSON.stringify(heard)} error=${speech.lastError() || "none"} in ${Date.now() - t0}ms`);
+  return { ok: true, result: { heard } };
+}
+
+// Push-to-talk on the chrome engine: the core brackets the held key with start and stop, and what
+// was heard goes back as `heard`, which routes exactly like `say`.
+async function onSttEvent(message) {
+  if (message.action === "start") {
+    const started = await speechStart();
+    if (!started.ok) toPanel({ event: "line", text: `voice: ${started.error}` });
+  } else if (message.action === "stop") {
+    const { result } = await speechStop();
+    if (!result.heard) return toPanel({ event: "line", text: "heard nothing" });
+    toPanel({ event: "line", text: `heard: ${result.heard}` });
+    const routed = await call("heard", { text: result.heard });
+    if (!routed.ok) toPanel({ event: "line", text: `voice: ${routed.error}` });
+  }
+}
+
 function onEvent(message) {
+  if (message.event === "stt") return onSttEvent(message);
   if (message.event === "hotkey" && message.name === "bar") return openBar();
   if (message.event === "hotkey" && message.name === "goal") showPanel();
   if (message.event === "highlight") return draw(message.marks || [], message.seconds || 5);
@@ -86,8 +132,15 @@ function toPanel(message) {
   if (panel && !panel.isDestroyed()) panel.webContents.send("core", message);
 }
 
-ipcMain.handle("call", (_event, method, params) => {
-  if (method === "set_mode" && params) panelHidesWhileActing = params.hide !== false;
+ipcMain.handle("call", async (_event, method, params) => {
+  if (method === "set_mode" && params) {
+    panelHidesWhileActing = params.hide !== false;
+    if (typeof params.voice === "boolean") voiceOn = params.voice;
+  }
+  // On the chrome engine the panel's and the bar's mic are answered here, from the bridge.
+  if ((method === "listen_start" || method === "listen_stop") && (await sttEngine()) === "chrome") {
+    return method === "listen_start" ? speechStart() : speechStop();
+  }
   return call(method, params);
 });
 
@@ -295,10 +348,21 @@ ipcMain.handle("draw", (_event, marks, seconds) => draw(marks || [], seconds || 
 app.whenReady().then(() => {
   startCore();
   createPanel();
+  if (process.env.POINTER_STT_SELFTEST === "1") panel.webContents.once("did-finish-load", sttSelfTest);
 });
 
-app.on("window-all-closed", () => {
-  // The core drives the machine; it must not outlive the window that can stop it.
-  if (core && !core.killed) core.kill();
-  app.quit();
-});
+// A development check (POINTER_STT_SELFTEST=1): click the panel's mic, wait, click it again, and
+// print to stdout what the bridge answered — the whole path a user's click takes.
+const SELFTEST = process.env.POINTER_STT_SELFTEST === "1";
+
+function sttSelfTest() {
+  const click = () => panel.webContents.executeJavaScript(`document.querySelector("button.mic").click()`);
+  setTimeout(async () => {
+    console.log(`[stt-selftest] engine=${await sttEngine()} browser=${speech.browser()}`);
+    await click();
+    setTimeout(async () => {
+      console.log(`[stt-selftest] speech browser pid=${speech.pid()} recognizer listening=${speech.listening()}; clicking stop`);
+      await click();
+    }, Number(process.env.POINTER_STT_SELFTEST_MS || 6000));
+  }, 2000);
+}
