@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from .timing import OCR_RECTS, OCR_REGION_PCT, phase
 
 Line = tuple[str, float, Box]
 ECHO_CHARS = 24
+# A history line shorter than this never filters anything: "waited" or "typed y" would otherwise
+# eat legitimate screen text wherever those words happen to appear.
+MIN_HISTORY_ECHO_CHARS = 12
 MIN_BOX_OVERLAP = 0.5  # intersection over the smaller box
 MIN_TOKEN_OVERLAP = 0.5
 
@@ -60,6 +64,12 @@ def capture(
             frontmost, pid = app, None
         else:
             frontmost, pid = windows.frontmost_app_and_pid()
+            # Our own control panel in front would make every step about this program: its buttons
+            # become items, and the accessibility walk reads our Tk tree instead of the app's.
+            if pid == os.getpid():
+                stand_in = stand_in_window(inventory)
+                if stand_in is not None:
+                    frontmost, pid = stand_in.app, stand_in.pid
             frontmost = app or frontmost
     with phase(timing, "window"):
         window = None if replay else windows.frontmost_window_bounds(pid)
@@ -88,6 +98,10 @@ def survey() -> tuple[tuple, tuple, int, tuple[float, float]]:
     The one being read is the one holding the foreground window, because that is where the work
     is. Everything else is still reported, so a goal about a window on another monitor is
     answerable rather than invisible.
+
+    Unless the foreground window is our own control panel, which a run can hit before the panel's
+    hide takes effect, or again when the loop switches windows and the panel comes back to the
+    front. Then the display read is the top window someone else owns.
     """
     try:
         screens = tuple(windows.monitors())
@@ -97,14 +111,51 @@ def survey() -> tuple[tuple, tuple, int, tuple[float, float]]:
     if not screens:
         return (), inventory, 0, (0.0, 0.0)
     front = next((w for w in inventory if w.foreground), None)
+    if foreground_is_ours():
+        front = stand_in_window(inventory) or front
     which = front.monitor if front is not None and 0 <= front.monitor < len(screens) else 0
     return screens, inventory, which, (float(screens[which].left), float(screens[which].top))
+
+
+def foreground_is_ours() -> bool:
+    """Whether the window in front belongs to this process, which is our own control panel."""
+    try:
+        return windows.frontmost_pid() == os.getpid()
+    except Exception:  # a desktop that refuses to answer: assume the foreground is someone else's
+        return False
+
+
+def stand_in_window(inventory: tuple):
+    """The window to read instead of our own panel: the top-ranked one that is not this process's.
+
+    `windows.open_windows()` already leaves out own-process windows, so the inventory is a clean
+    source; the pid check is belt and braces. None when nothing else is open, and then the caller
+    keeps today's behaviour rather than inventing a window.
+    """
+    return next((w for w in inventory if getattr(w, "pid", None) != os.getpid()), None)
 
 
 def goal_echoes(goal: str) -> set[str]:
     """Substrings that identify a screen line as the command that launched this run."""
     norm = " ".join(goal.lower().split())
     return {norm[:ECHO_CHARS], norm[-ECHO_CHARS:]} if len(norm) >= ECHO_CHARS else {norm}
+
+
+def history_echoes(history: list[str] | None) -> set[str]:
+    """Substrings that identify a screen line as this run's own output read back off the screen.
+
+    The terminal the run prints to is usually on screen, so the action descriptions the loop
+    printed a second ago ("did: switched to chrome ... on monitor 3") come back as items and the
+    loop considers clicking its own log. Only the head of each entry is matched, the way a goal's
+    head is, and only once the entry is long enough to be distinctive: a tail like "on monitor 3"
+    or a whole entry like "waited" would filter honest screen text.
+    """
+    out: set[str] = set()
+    for entry in history or ():
+        norm = " ".join(entry.lower().split())
+        if len(norm) >= MIN_HISTORY_ECHO_CHARS:
+            out.add(norm[:ECHO_CHARS])
+    return out
 
 
 def is_echo(text: str, echoes: set[str]) -> bool:
@@ -118,6 +169,7 @@ def perceive(
     goal: str,
     timing: dict[str, float] | None = None,
     cache: OcrCache | None = None,
+    history: list[str] | None = None,
 ) -> list[Item]:
     """Everything worth clicking on this screen: OCR text blocks, plus the app's own controls.
 
@@ -130,9 +182,12 @@ def perceive(
 
     A `cache` carries the previous capture's OCR, so only the tiles that changed are read again.
     Pass None to read the whole region every time, which is what a replay and an inspection do.
+
+    `history` is the run's own recent action descriptions, so the terminal showing them is not read
+    back as something to click. Pass None when there is nothing printed yet.
     """
     with phase(timing, "ocr"):
-        blocks = ocr(screen, budget, goal, cache, timing)
+        blocks = ocr(screen, budget, goal, cache, timing, history)
     with phase(timing, "ax"):
         nodes, hidden = ax_nodes(screen, budget)
         controls = to_ax_items(nodes, screen.scale)
@@ -151,17 +206,19 @@ def ocr(
     goal: str,
     cache: OcrCache | None = None,
     timing: dict[str, float] | None = None,
+    history: list[str] | None = None,
 ) -> list[Item]:
     """The screen's text as items, filtered and merged into blocks.
 
     The filter runs over the raw lines every step, including the reused ones, so a cached line is
-    treated exactly as a freshly read one.
+    treated exactly as a freshly read one. It drops both the goal and this run's own printed
+    history when they come back off the screen.
     """
     lines, read_pct, rects = ocr_lines(screen, cache)
     if timing is not None:
         timing[OCR_REGION_PCT] = round(read_pct, 1)
         timing[OCR_RECTS] = rects
-    echoes = goal_echoes(goal)
+    echoes = goal_echoes(goal) | history_echoes(history)
     kept: list[Line] = [
         (t.strip(), c, b) for t, c, b in lines if t.strip() and c >= MIN_OCR_CONFIDENCE and not is_echo(t, echoes)
     ]

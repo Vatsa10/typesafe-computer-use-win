@@ -169,3 +169,124 @@ def test_a_window_on_the_captured_display_is_unaffected_by_the_offset():
     assert ocr_region(primary) == ocr_region(primary)
     left, _, right, _ = ocr_region(primary)
     assert left < right <= 2560
+
+
+# ------------------------------------------------------------------ never reading our own panel
+
+
+def _monitor(index, left, top, right, bottom, primary=False):
+    from typesafe_computer_use_win.windows import Monitor
+
+    return Monitor(index=index, left=left, top=top, right=right, bottom=bottom, primary=primary)
+
+
+def _window(hwnd, app, pid, monitor, title=None, foreground=False):
+    from typesafe_computer_use_win.windows import WindowInfo
+
+    return WindowInfo(
+        hwnd=hwnd,
+        title=title or f"{app} window",
+        app=app,
+        pid=pid,
+        rect=(0, 0, 800, 600),
+        monitor=monitor,
+        minimized=False,
+        foreground=foreground,
+    )
+
+
+def _fake_desktop(monkeypatch, monitors, inventory, front=("python", None)):
+    """Stand in for the desktop. `front[1]` of None means the foreground window is this process's."""
+    import os
+
+    from PIL import Image
+
+    from typesafe_computer_use_win import perception, windows
+
+    front_pid = os.getpid() if front[1] is None else front[1]
+    monkeypatch.setattr(windows, "monitors", lambda: list(monitors))
+    monkeypatch.setattr(windows, "open_windows", lambda *a, **k: list(inventory))
+    monkeypatch.setattr(windows, "frontmost_pid", lambda: front_pid)
+    monkeypatch.setattr(windows, "frontmost_app_and_pid", lambda: (front[0], front_pid))
+    monkeypatch.setattr(windows, "screenshot", lambda bounds=None: Image.new("RGB", (640, 480)))
+    monkeypatch.setattr(windows, "display_scale", lambda image: 1.0)
+    monkeypatch.setattr(windows, "frontmost_window_bounds", lambda pid=None: None)
+    monkeypatch.setattr(windows, "focused_field", lambda: None)
+    monkeypatch.setattr(windows, "browser_url", lambda browser: None)
+    return perception
+
+
+def test_survey_falls_back_to_another_window_display_when_the_foreground_is_ours(monkeypatch):
+    screens = [_monitor(0, 0, 0, 1920, 1080, primary=True), _monitor(1, 1920, 0, 4480, 1440)]
+    inventory = [_window(2, "chrome", 4242, 1)]
+    perception = _fake_desktop(monkeypatch, screens, inventory)
+    _monitors, _inventory, which, origin = perception.survey()
+    assert which == 1 and origin == (1920.0, 0.0)
+
+
+def test_capture_reports_the_fallback_window_app_and_pid_when_the_foreground_is_ours(monkeypatch):
+    screens = [_monitor(0, 0, 0, 1920, 1080, primary=True)]
+    inventory = [_window(2, "chrome", 4242, 0)]
+    perception = _fake_desktop(monkeypatch, screens, inventory)
+    screen = perception.capture()
+    assert screen.app == "chrome" and screen.pid == 4242  # not "python", and not our own pid
+
+
+def test_our_own_foreground_with_no_other_window_keeps_todays_behaviour(monkeypatch):
+    import os
+
+    screens = [_monitor(0, 0, 0, 1920, 1080, primary=True), _monitor(1, 1920, 0, 4480, 1440)]
+    perception = _fake_desktop(monkeypatch, screens, [])
+    _monitors, _inventory, which, origin = perception.survey()
+    assert which == 0 and origin == (0.0, 0.0)
+    screen = perception.capture()
+    assert screen.app == "python" and screen.pid == os.getpid()
+
+
+def test_capture_leaves_a_foreign_foreground_window_alone(monkeypatch):
+    screens = [_monitor(0, 0, 0, 1920, 1080, primary=True), _monitor(1, 1920, 0, 4480, 1440)]
+    inventory = [_window(2, "chrome", 4242, 1, foreground=True), _window(3, "code", 99, 0)]
+    perception = _fake_desktop(monkeypatch, screens, inventory, front=("chrome", 4242))
+    _monitors, _inventory, which, _origin = perception.survey()
+    screen = perception.capture()
+    assert which == 1
+    assert screen.app == "chrome" and screen.pid == 4242
+
+
+# ------------------------------------------------------------------ never reading our own log
+
+
+def test_a_screen_line_echoing_a_recent_action_is_dropped():
+    from typesafe_computer_use_win.perception import history_echoes
+
+    history = ["did: switched to chrome 'Vatsa10/typesafe-computer-use' on monitor 3", "did: typed the search query"]
+    echoes = history_echoes(history)
+    assert is_echo("did: switched to chrome — Google Chrome'", echoes)
+    assert is_echo("0.10 [22] did: switched to CHROME ...", echoes)
+    assert not is_echo("Google Chrome", echoes)
+    assert not is_echo("Trending: Trump and AI warnings", echoes)
+
+
+def test_a_short_history_line_does_not_filter_unrelated_screen_text():
+    from typesafe_computer_use_win.perception import history_echoes
+
+    echoes = history_echoes(["waited", "typed y", "did: done"])
+    assert echoes == set()
+    assert not is_echo("waited for the page", echoes)
+    assert not is_echo("Start", echoes)
+
+
+def test_history_echoes_tolerate_no_history():
+    from typesafe_computer_use_win.perception import history_echoes
+
+    assert history_echoes(None) == set() and history_echoes([]) == set()
+
+
+def test_the_goal_echo_filter_still_works_alongside_history():
+    from typesafe_computer_use_win.perception import history_echoes
+
+    goal = "go to cnn and click onto something related to AI on the homepage"
+    echoes = goal_echoes(goal) | history_echoes(["did: switched to chrome on monitor 3"])
+    assert is_echo('clear && uv run clicker "go to cnn and click onto something', echoes)
+    assert is_echo("did: switched to chrome on monitor 3", echoes)
+    assert not is_echo("Trending: Trump and AI warnings", echoes)

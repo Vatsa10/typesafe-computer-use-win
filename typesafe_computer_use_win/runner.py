@@ -195,7 +195,7 @@ def conclude(cfg: RunConfig, ctx: Context, state: RunState, log: Log) -> None:
         windows.check_abort()
         screen = capture(cfg.image, cfg.app, cfg.url, ctx.browser)
         screen.image.save(cfg.out / "answer-raw.png")
-        state.view = (screen, perceive(screen, MAX_OPTIONS, cfg.goal))
+        state.view = (screen, perceive(screen, MAX_OPTIONS, cfg.goal, None, None, state.history))
     screen, items = state.view
     try:
         state.answer = compose_answer(ctx.writer, cfg.goal, screen, items, state.history, stopped)
@@ -214,7 +214,9 @@ def run_step(cfg: RunConfig, ctx: Context, state: RunState, step: int, log: Log,
     started = time.perf_counter()
     with phase(timing, "capture"):
         screen = capture(cfg.image, cfg.app, cfg.url, ctx.browser, timing)
-    items = perceive(screen, MAX_OPTIONS, cfg.goal, timing, None if cfg.replay else state.ocr_cache)
+    # The history goes in so the echo filter can drop the loop's own log lines when a terminal
+    # showing them is on screen: without it a run considers clicking what it just printed.
+    items = perceive(screen, MAX_OPTIONS, cfg.goal, timing, None if cfg.replay else state.ocr_cache, state.history)
     state.view = (screen, items)
     prefix = cfg.out / f"step-{step:03d}"  # three digits, so a run of 100 steps still lists in order
     screen.image.save(prefix.with_name(prefix.name + "-raw.png"))
