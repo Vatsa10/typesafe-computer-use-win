@@ -1,42 +1,41 @@
-"""A local control panel: type or speak a goal, watch the run, browse what happened.
+"""The control panel: a WebView2 window driven by the daemon behind it.
 
-Tkinter, because it ships with Python and because the alternative is worse than it looks: a browser
-dashboard would live in the browser this program drives, so a run would read its own UI through OCR
-and could click it. A desktop window has a milder version of the same problem, which is what the
-"hide while acting" switch is for.
+Tkinter drew this before, and the ceiling was obvious — no rounded corners, no shadows, no icons,
+and a feed that could only be one colour. WebView2 ships with Windows, so an HTML panel costs one
+pure-Python dependency and renders properly. It is still a desktop window, not a browser tab,
+which matters here: a dashboard living in the browser this program drives would be read by its own
+OCR and could be clicked by its own run.
 
-Threading rule, and the reason this module exists at all: Tk owns the main thread, so the hotkey
-pump cannot. `daemon.Service` runs the pump, the input worker and the run worker on their own
-threads, and everything they want to say arrives here through a queue that `_drain` empties on a
-Tk timer. No widget is ever touched from another thread.
+Two rules shape the code:
+
+- The page polls, Python never pushes. The run loop logs from a worker thread, and a poll is the
+  one shape that cannot race the WebView2 message pump: the page asks when it is ready and gets
+  whatever has queued up since last time.
+- The window hides the instant a job is queued, not when a poll notices the run started. The old
+  panel hid on a 100 ms timer and lost that race, so the first capture of a run read the panel's
+  own buttons and offered them as things to click.
 """
 
 from __future__ import annotations
 
+import base64
 import queue
-import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
 
 from . import config, dotenv_io, runs_index
 from . import daemon as daemon_module
 
+PANEL = Path(__file__).parent / "panel"
 DOTENV = Path.cwd() / ".env"
 RUNS = Path.cwd() / "runs"
+WINDOW = {"width": 1120, "height": 780, "min_size": (900, 600)}
+MAX_QUEUED_LINES = 4000  # a long run logs a lot; the page only ever shows the tail
 
-BG = "#0b1120"
-PANEL = "#111c30"
-INK = "#e8eefc"
-MUTED = "#8ba3c4"
-ACCENT = "#38bdf8"
-DRAIN_MS = 100
-MAX_LOG_LINES = 2000
-PREVIEW_WIDTH = 820
-
-# The settings the panel edits, as (env key, label, how to show the default when the value is blank).
+# What the settings tab edits. API keys are deliberately absent: a panel should never display or
+# write a secret, and these are the knobs anyone actually turns.
 SETTINGS: list[tuple[str, str, str]] = [
     ("CLICKER_BROWSER", "Browser", config.DEFAULT_BROWSER),
-    ("CLICKER_EMAIL", "Email for type_email", "(unset: the action is not offered)"),
+    ("CLICKER_EMAIL", "Email for type_email", "unset: the action is not offered"),
     ("CLICKER_HOTKEY_TALK", "Hotkey: push to talk", config.DEFAULT_HOTKEYS["talk"]),
     ("CLICKER_HOTKEY_GOAL", "Hotkey: typed goal", config.DEFAULT_HOTKEYS["goal"]),
     ("CLICKER_HOTKEY_PAUSE", "Hotkey: pause or resume", config.DEFAULT_HOTKEYS["pause"]),
@@ -45,372 +44,207 @@ SETTINGS: list[tuple[str, str, str]] = [
     ("CLICKER_WHISPER_MODEL", "Whisper model", config.DEFAULT_WHISPER_MODEL),
     ("CLICKER_VOICE_MAX_SECONDS", "Longest utterance (s)", str(config.DEFAULT_VOICE_MAX_SECONDS)),
     ("CLICKER_VOICE_MIN_CONFIDENCE", "Voice confidence floor", str(config.DEFAULT_VOICE_MIN_CONFIDENCE)),
-    ("CLICKER_CATALOG", "Site catalog from browser", "1 (0 = only the pinned sites)"),
-    ("CLICKER_CATALOG_TITLES", "Use page titles as labels", "1 (0 = bare domains only)"),
+    ("CLICKER_CATALOG", "Site catalog from browser", "1 (0 = pinned sites only)"),
+    ("CLICKER_CATALOG_TITLES", "Page titles as labels", "1 (0 = bare domains)"),
     ("CLICKER_CATALOG_LIMIT", "Sites offered per goal", str(config.DEFAULT_CATALOG_LIMIT)),
     ("CLICKER_OCR_ENGINE", "OCR engine", "windows"),
     ("CLICKER_OCR_LANGUAGE", "OCR language", "en-US"),
+    ("CLICKER_WRITER_PROVIDER", "Writer provider", "openai when its key is set"),
+    ("CLICKER_WRITER_MODEL", "Writer model", config.DEFAULT_OPENAI_WRITER_MODEL),
+    ("CLICKER_ANSWER_MODEL", "Answer model", config.DEFAULT_OPENAI_ANSWER_MODEL),
 ]
 
 
-def apply_theme(root: tk.Tk) -> None:
-    """Dark ttk chrome. The default Windows theme ignores background colours on notebooks and
-    buttons, so it has to be `clam`, which honours them."""
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(16, 8), borderwidth=0)
-    style.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", ACCENT)])
-    style.configure("TButton", background=PANEL, foreground=INK, borderwidth=0, padding=(14, 7), focuscolor=BG)
-    style.map("TButton", background=[("active", "#1d2d४a".replace("४", "4")), ("pressed", ACCENT)])
-    style.configure("Vertical.TScrollbar", background=PANEL, troughcolor=BG, borderwidth=0, arrowcolor=MUTED)
+def hotkey_hint() -> str:
+    """The bindings, for the corner of the title bar. The window is optional; these are not."""
+    return "   ".join(f"{config.hotkey(name)} {name}" for name in ("talk", "goal", "pause", "abort"))
 
 
-def preview_factor(image_width: int, target: int = PREVIEW_WIDTH) -> int:
-    """The integer shrink Tk needs to fit a full-display capture into the preview pane.
-
-    Tk only subsamples by whole numbers, so this rounds up: a 2560 px capture into an 820 px pane
-    is a factor of 4, not 3.1, and lands at 640 px rather than overflowing.
-    """
-    if image_width <= 0:
-        return 1
-    return max(1, -(-image_width // target))
-
-
-def state_label(running: bool, paused: bool) -> str:
-    """What the status bar says. Paused only means anything while something is running."""
-    if running:
-        return "paused" if paused else "running"
-    return "idle"
+def line_queue(messages: queue.Queue, limit: int = MAX_QUEUED_LINES) -> list[str]:
+    """Everything said since the last poll. Bounded, because a page that was closed for a minute
+    must not be handed a minute of backlog in one frame."""
+    drained: list[str] = []
+    while len(drained) < limit:
+        try:
+            drained.append(str(messages.get_nowait()))
+        except queue.Empty:
+            break
+    return drained
 
 
-def _text_widget(parent, height: int = 10) -> tk.Text:
-    widget = tk.Text(
-        parent,
-        height=height,
-        wrap="word",
-        bg=PANEL,
-        fg=INK,
-        insertbackground=INK,
-        relief="flat",
-        font=("Cascadia Mono", 10),
-        padx=10,
-        pady=8,
-    )
-    widget.configure(state="disabled")
-    return widget
+def settings_rows(current: dict[str, str]) -> list[dict]:
+    return [
+        {"key": key, "label": label, "fallback": fallback, "value": current.get(key, "")} for key, label, fallback in SETTINGS
+    ]
 
 
-def _append(widget: tk.Text, line: str) -> None:
-    """Append one line and keep the view at the bottom, trimming what has scrolled out of use."""
-    widget.configure(state="normal")
-    widget.insert("end", line + "\n")
-    excess = int(widget.index("end-1c").split(".")[0]) - MAX_LOG_LINES
-    if excess > 0:
-        widget.delete("1.0", f"{excess}.0")
-    widget.see("end")
-    widget.configure(state="disabled")
+def run_rows(runs) -> list[dict]:
+    return [
+        {
+            "name": run.name,
+            "goal": run.goal,
+            "outcome": run.outcome,
+            "answer": run.answer,
+            "goal_achieved": run.goal_achieved,
+            "seconds": run.seconds,
+            "steps_taken": run.steps_taken,
+            "acted": run.acted,
+        }
+        for run in runs
+    ]
 
 
-class Panel:
-    """The window. Owns the Tk main thread and drives a `daemon.Service` behind it."""
+def step_rows(steps) -> list[dict]:
+    return [{"number": step.number, "has_shot": bool(step.annotated or step.raw)} for step in steps]
 
-    def __init__(self, root: tk.Tk, service, messages: queue.Queue) -> None:
-        self.root = root
+
+def data_url(path: Path | None) -> str:
+    """A capture as something an <img> can show. The panel is local and the files are already on
+    this disk, so inlining avoids standing up a file server just to look at a screenshot."""
+    if path is None or not path.is_file():
+        return ""
+    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+class Api:
+    """What the page can call. Every method is reached from the WebView2 thread, so nothing here
+    may block: the slow things go to the daemon's own workers."""
+
+    def __init__(self, service, messages: queue.Queue) -> None:
         self.service = service
         self.daemon = service.daemon
         self.messages = messages
-        self.hidden_for_run = False
-        self.runs: list[runs_index.RunSummary] = []
-        self.preview_image: tk.PhotoImage | None = None  # Tk drops an image that nothing references
+        self._window = None  # private: pywebview walks public attributes and the native window recurses
+        self.hide_while_acting = True
+        self._hidden = False
 
-        root.title("winclicker")
-        root.configure(bg=BG)
-        root.geometry("1040x760")
-        root.minsize(880, 560)
-        apply_theme(root)
-        root.protocol("WM_DELETE_WINDOW", self.close)
+    # ------------------------------------------------------------------ run
 
-        self.status = tk.Label(root, text="idle", anchor="w", bg=PANEL, fg=MUTED, font=("Cascadia Mono", 9), padx=12, pady=6)
-        self.status.pack(side="bottom", fill="x")  # packed first, so the notebook cannot squeeze it out
+    def attach(self, window) -> None:
+        """Hold the native window. Private on purpose: see _window."""
+        self._window = window
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True, padx=10, pady=(10, 6))
-        self._build_run_tab(notebook)
-        self._build_history_tab(notebook)
-        self._build_settings_tab(notebook)
+    def poll(self) -> dict:
+        running = self.daemon.running
+        if not running and self._hidden:
+            self._show()
+        return {
+            "lines": line_queue(self.messages),
+            "running": running,
+            "paused": self.daemon.control.paused,
+            "hotkeys": hotkey_hint(),
+        }
 
-        self.root.after(DRAIN_MS, self._drain)
-
-    # ------------------------------------------------------------------ run tab
-
-    def _build_run_tab(self, notebook: ttk.Notebook) -> None:
-        frame = tk.Frame(notebook, bg=BG)
-        notebook.add(frame, text="Run")
-
-        entry_row = tk.Frame(frame, bg=BG)
-        entry_row.pack(fill="x", padx=12, pady=12)
-        self.goal_entry = tk.Entry(entry_row, bg=PANEL, fg=INK, insertbackground=INK, relief="flat", font=("Segoe UI", 12))
-        self.goal_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
-        self.goal_entry.bind("<Return>", lambda _e: self.start())
-        self.goal_entry.focus_set()
-        ttk.Button(entry_row, text="Start", command=self.start).pack(side="left", padx=2)
-        self.pause_button = ttk.Button(entry_row, text="Pause", command=self.toggle_pause)
-        self.pause_button.pack(side="left", padx=2)
-        ttk.Button(entry_row, text="Abort", command=self.abort).pack(side="left", padx=2)
-
-        modes = tk.Frame(frame, bg=BG)
-        modes.pack(fill="x", padx=12, pady=(0, 4))
-        self.act_mode = tk.BooleanVar(value=False)  # dry run by default: nothing clicks until you say so
-        self.act_mode.trace_add("write", lambda *_: self._apply_mode())
-        for label, value, hint in (
-            ("Dry run", False, "decide and report, touch nothing"),
-            ("Act", True, "really click and type"),
-        ):
-            tk.Radiobutton(
-                modes,
-                text=f"{label}  ({hint})",
-                variable=self.act_mode,
-                value=value,
-                bg=BG,
-                fg=MUTED,
-                selectcolor=PANEL,
-                activebackground=BG,
-                activeforeground=INK,
-                font=("Segoe UI", 9),
-            ).pack(side="left", padx=(0, 16))
-
-        self.voice_on = tk.BooleanVar(value=True)
-        self.voice_on.trace_add("write", lambda *_: self._apply_mode())
-        tk.Checkbutton(
-            modes,
-            text="voice",
-            variable=self.voice_on,
-            bg=BG,
-            fg=MUTED,
-            selectcolor=PANEL,
-            activebackground=BG,
-            activeforeground=INK,
-            font=("Segoe UI", 9),
-        ).pack(side="left")
-        ttk.Button(modes, text="Test voice", command=self.test_voice).pack(side="left", padx=8)
-
-        options = tk.Frame(frame, bg=BG)
-        options.pack(fill="x", padx=12)
-        self.hide_while_acting = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            options,
-            text="hide this window while a run acts (it is on screen, so the run would read it)",
-            variable=self.hide_while_acting,
-            bg=BG,
-            fg=MUTED,
-            selectcolor=PANEL,
-            activebackground=BG,
-            activeforeground=INK,
-            font=("Segoe UI", 9),
-        ).pack(side="left")
-
-        feed_box = tk.Frame(frame, bg=BG)
-        feed_box.pack(fill="both", expand=True, padx=12, pady=12)
-        self.feed = _text_widget(feed_box, height=24)
-        scroll = ttk.Scrollbar(feed_box, orient="vertical", command=self.feed.yview, style="Vertical.TScrollbar")
-        self.feed.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.feed.pack(side="left", fill="both", expand=True)
-        _append(self.feed, "ready. type a goal, or hold the talk hotkey and say one.")
-
-    def _apply_mode(self) -> None:
-        """Push the toggles onto the daemon. Both are read at dispatch, so a change lands on the
-        next goal rather than on the run already going."""
-        self.daemon.act = bool(self.act_mode.get())
-        self.daemon.voice_enabled = bool(self.voice_on.get())
-
-    def test_voice(self) -> None:
-        """Hear one line and report what it was taken for, without running it.
-
-        Recording blocks for as long as the key is held, so it cannot happen on the Tk thread:
-        the window would freeze mid-utterance. It goes to the input worker like a hotkey does.
-        """
-        if not self.voice_on.get():
-            _append(self.feed, "voice is off")
-            return
-        _append(self.feed, "test: hold the talk hotkey and say something")
-        self.service.post(self.daemon.probe_voice)
-
-    def start(self) -> None:
-        goal = self.goal_entry.get().strip()
+    def start(self, goal: str) -> bool:
+        goal = (goal or "").strip()
         if not goal:
-            return
-        self.goal_entry.delete(0, "end")
+            return False
+        self._hide_for_run()  # before the job exists, so the first capture cannot include this window
         self.daemon.queue_goal(goal)
+        return True
 
-    def toggle_pause(self) -> None:
+    def pause(self) -> bool:
         self.daemon.on_pause()
+        return self.daemon.control.paused
 
-    def abort(self) -> None:
+    def abort(self) -> bool:
         self.daemon.on_abort()
+        return True
 
-    # ------------------------------------------------------------------ history tab
+    def test_voice(self) -> bool:
+        """Hear one line and report what it was taken for, without running it. Recording blocks for
+        as long as the key is held, so it goes to the input worker rather than this thread."""
+        if not self.daemon.voice_enabled:
+            self.messages.put("voice is off")
+            return False
+        self.messages.put("test: hold the talk hotkey and say something")
+        self.service.post(self.daemon.probe_voice)
+        return True
 
-    def _build_history_tab(self, notebook: ttk.Notebook) -> None:
-        frame = tk.Frame(notebook, bg=BG)
-        notebook.add(frame, text="History")
+    def set_mode(self, act: bool, voice: bool, hide: bool) -> dict:
+        self.daemon.act = bool(act)
+        self.daemon.voice_enabled = bool(voice)
+        self.hide_while_acting = bool(hide)
+        return {"act": self.daemon.act, "voice": self.daemon.voice_enabled, "hide": self.hide_while_acting}
 
-        left = tk.Frame(frame, bg=BG)
-        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
-        ttk.Button(left, text="Refresh", command=self.refresh_history).pack(fill="x", pady=(0, 6))
-        self.run_list = tk.Listbox(
-            left, width=34, bg=PANEL, fg=INK, relief="flat", font=("Cascadia Mono", 9), selectbackground=ACCENT
-        )
-        self.run_list.pack(fill="y", expand=True)
-        self.run_list.bind("<<ListboxSelect>>", lambda _e: self.show_run())
+    # -------------------------------------------------------------- history
 
-        right = tk.Frame(frame, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(6, 12), pady=12)
-        self.run_detail = _text_widget(right, height=6)
-        self.run_detail.pack(fill="x")
-        self.step_list = tk.Listbox(
-            right, height=4, bg=PANEL, fg=INK, relief="flat", font=("Cascadia Mono", 9), selectbackground=ACCENT
-        )
-        self.step_list.pack(fill="x", pady=(8, 8))
-        self.step_list.bind("<<ListboxSelect>>", lambda _e: self.show_step())
-        self.preview = tk.Label(right, bg=PANEL, text="select a step to see what it saw", fg=MUTED)
-        self.preview.pack(fill="both", expand=True)
+    def runs(self) -> list[dict]:
+        return run_rows(runs_index.list_runs(RUNS))
 
-        self.refresh_history()
+    def steps(self, name: str) -> list[dict]:
+        return step_rows(runs_index.steps_of(RUNS / name))
 
-    def refresh_history(self) -> None:
-        self.runs = runs_index.list_runs(RUNS)
-        self.run_list.delete(0, "end")
-        for run in self.runs:
-            self.run_list.insert("end", f"{run.name}  {run.outcome}")
-        if not self.runs:
-            self.run_list.insert("end", "(no runs yet)")
+    def shot(self, name: str, number: int) -> str:
+        for step in runs_index.steps_of(RUNS / name):
+            if step.number == number:
+                return data_url(step.annotated or step.raw)
+        return ""
 
-    def _selected_run(self) -> runs_index.RunSummary | None:
-        selection = self.run_list.curselection()
-        if not selection or selection[0] >= len(self.runs):
-            return None
-        return self.runs[selection[0]]
+    # ------------------------------------------------------------- settings
 
-    def show_run(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            return
-        self.run_detail.configure(state="normal")
-        self.run_detail.delete("1.0", "end")
-        self.run_detail.configure(state="disabled")
-        for line in (
-            f"goal:     {run.goal}",
-            f"outcome:  {run.outcome}" + (f"   ({run.seconds:.0f}s)" if run.seconds is not None else ""),
-            f"steps:    {run.steps_taken}" + ("   acted" if run.acted else "   dry run"),
-            f"answer:   {run.answer or '(none)'}",
-            f"folder:   {run.path}",
-        ):
-            _append(self.run_detail, line)
-        self.steps = runs_index.steps_of(run.path)
-        self.step_list.delete(0, "end")
-        for step in self.steps:
-            self.step_list.insert("end", f"step {step.number:03d}")
-        if not self.steps:
-            self.step_list.insert("end", "(no steps recorded)")
+    def settings(self) -> list[dict]:
+        return settings_rows(dotenv_io.read_env(DOTENV))
 
-    def show_step(self) -> None:
-        selection = self.step_list.curselection()
-        if not selection or selection[0] >= len(getattr(self, "steps", [])):
-            return
-        step = self.steps[selection[0]]
-        image_path = step.annotated or step.raw
-        if image_path is None:
-            self.preview.configure(image="", text="this step wrote no capture")
-            return
-        try:
-            image = tk.PhotoImage(file=str(image_path))
-        except tk.TclError as e:  # a truncated PNG from a killed run
-            self.preview.configure(image="", text=f"cannot read {image_path.name}: {e}")
-            return
-        # A capture is the whole display, so it needs shrinking by an integer factor to fit.
-        factor = preview_factor(image.width())
-        self.preview_image = image.subsample(factor, factor)
-        self.preview.configure(image=self.preview_image, text="")
+    def save_settings(self, values: dict) -> bool:
+        wanted = {key for key, _, _ in SETTINGS}
+        dotenv_io.write_env(DOTENV, {k: str(v).strip() for k, v in values.items() if k in wanted})
+        return True
 
-    # ------------------------------------------------------------------ settings tab
+    # --------------------------------------------------------- the window
 
-    def _build_settings_tab(self, notebook: ttk.Notebook) -> None:
-        frame = tk.Frame(notebook, bg=BG)
-        notebook.add(frame, text="Settings")
-        current = dotenv_io.read_env(DOTENV)
+    def _hide_for_run(self) -> None:
+        """Get out of the way before the run looks at the screen.
 
-        grid = tk.Frame(frame, bg=BG)
-        grid.pack(fill="both", expand=True, padx=16, pady=16)
-        self.setting_vars: dict[str, tk.StringVar] = {}
-        for row, (key, label, default) in enumerate(SETTINGS):
-            tk.Label(grid, text=label, bg=BG, fg=INK, anchor="w", font=("Segoe UI", 10)).grid(
-                row=row, column=0, sticky="w", pady=4
-            )
-            var = tk.StringVar(value=current.get(key, ""))
-            self.setting_vars[key] = var
-            tk.Entry(
-                grid, textvariable=var, bg=PANEL, fg=INK, insertbackground=INK, relief="flat", font=("Cascadia Mono", 10)
-            ).grid(row=row, column=1, sticky="ew", padx=10, ipady=4)
-            tk.Label(grid, text=f"default: {default}", bg=BG, fg=MUTED, anchor="w", font=("Segoe UI", 8)).grid(
-                row=row, column=2, sticky="w"
-            )
-        grid.columnconfigure(1, weight=1)
+        This is a correctness fix, not a courtesy. The panel is on screen, so OCR reads its buttons
+        and the accessibility tree lists them; a run that captured while it was visible was offered
+        its own controls as things to click, and took them.
+        """
+        if self._window is not None and self.hide_while_acting and not self._hidden:
+            self._hidden = True
+            self._window.hide()
 
-        footer = tk.Frame(frame, bg=BG)
-        footer.pack(fill="x", padx=16, pady=(0, 16))
-        ttk.Button(footer, text="Save to .env", command=self.save_settings).pack(side="left")
-        self.settings_note = tk.Label(footer, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9))
-        self.settings_note.pack(side="left", padx=12)
-
-    def save_settings(self) -> None:
-        """Write the file. Hotkeys are read when the daemon registers them, so they need a restart."""
-        dotenv_io.write_env(DOTENV, {key: var.get().strip() for key, var in self.setting_vars.items()})
-        self.settings_note.configure(text=f"saved to {DOTENV.name}. hotkey changes need a restart.")
-
-    # ------------------------------------------------------------------ the pump
-
-    def _drain(self) -> None:
-        """Move whatever the worker threads said into the feed. The only place widgets are written
-        on behalf of another thread, and it runs on the Tk thread by construction."""
-        for _ in range(200):  # bounded, so a chatty run cannot starve the UI
-            try:
-                line = self.messages.get_nowait()
-            except queue.Empty:
-                break
-            _append(self.feed, str(line))
-        self._refresh_status()
-        self.root.after(DRAIN_MS, self._drain)
-
-    def _refresh_status(self) -> None:
-        running, paused = self.daemon.running, self.daemon.control.paused
-        state = state_label(running, paused)
-        hotkeys = "  ".join(f"{config.hotkey(name)} {name}" for name in ("talk", "goal", "pause", "abort"))
-        self.status.configure(text=f"{state}    {hotkeys}")
-        self.pause_button.configure(text="Resume" if paused else "Pause")
-        if running and self.hide_while_acting.get() and not self.hidden_for_run:
-            self.hidden_for_run = True
-            self.root.iconify()
-        elif not running and self.hidden_for_run:
-            self.hidden_for_run = False
-            self.root.deiconify()
-            self.refresh_history()  # the run just finished: it belongs in the list
-
-    def close(self) -> None:
-        self.service.stop()
-        self.root.destroy()
+    def _show(self) -> None:
+        self._hidden = False
+        if self._window is not None:
+            self._window.show()
 
 
 def launch() -> None:
-    """Build the daemon, start its threads, and hand the main thread to Tk."""
+    """Build the daemon, start its threads, and hand this thread to the webview."""
+    import webview
+
     messages: queue.Queue = queue.Queue()
     worker = daemon_module.build(log=messages.put)
+    worker.act = False  # a panel that opens ready to click things is a panel nobody trusts
     service = daemon_module.Service(worker, log=messages.put)
     service.start()
-    root = tk.Tk()
-    Panel(root, service, messages)
+
+    api = Api(service, messages)
+    window = webview.create_window(
+        "winclicker",
+        str(PANEL / "index.html"),
+        js_api=api,
+        width=WINDOW["width"],
+        height=WINDOW["height"],
+        min_size=WINDOW["min_size"],
+        background_color="#0b1120",
+    )
+    api.attach(window)
+    # A hotkey can start a run while the window is hidden, so the hide has to happen there too.
+    _hook_hotkey_runs(worker, api)
     try:
-        root.mainloop()
+        webview.start()
     finally:
         service.stop()
+
+
+def _hook_hotkey_runs(worker, api: Api) -> None:
+    """Hide the panel for a run started by voice or the overlay, not only by the Start button."""
+    original = worker.queue_goal
+
+    def queue_goal(goal: str) -> None:
+        api._hide_for_run()
+        original(goal)
+
+    worker.queue_goal = queue_goal
