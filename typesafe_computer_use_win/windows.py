@@ -701,8 +701,34 @@ def _root_children(node) -> list:
     return node.windows if isinstance(node, _ProcessRoot) else _children(node)
 
 
+def _window_roots(uia, pid: int, hwnd: int | None) -> list:
+    """The top-level windows the walk should cover.
+
+    Just the one window when a usable handle names it, every window of the process otherwise.
+
+    One Chrome process hosts every Chrome window, so a whole-process root puts another window's
+    controls in the tree. The display bounds check hides most of them, but an off-screen control is
+    offered *because* it is not visible, so nothing contradicts it: that is how a run on an X post
+    pressed the `Like` of a YouTube Music tab in a different window. Scoping to the window keeps the
+    window's own toolbar, tab strip and menus, which are all inside its tree.
+    """
+    if hwnd:
+        try:
+            window = uia.ControlFromHandle(hwnd)
+        except Exception:
+            window = None
+        if window is not None:
+            return [window]
+    desktop = uia.GetRootControl()
+    return [w for w in _children(desktop) if getattr(w, "ProcessId", None) == pid]
+
+
 def actionable_elements(
-    pid: int, display_w_pt: float, display_h_pt: float, origin: tuple[float, float] = (0.0, 0.0)
+    pid: int,
+    display_w_pt: float,
+    display_h_pt: float,
+    origin: tuple[float, float] = (0.0, 0.0),
+    hwnd: int | None = None,
 ) -> tuple[list[AxNode], list[AxNode], bool]:
     """Labelled controls of one process: the on-screen ones, the pressable off-screen ones, and
     whether a cap cut the walk short.
@@ -710,11 +736,14 @@ def actionable_elements(
     `origin` is where the display being read sits on the virtual desktop. UI Automation reports
     every frame in virtual-desktop coordinates, so without it a window on the second monitor looks
     like it is thousands of pixels off the right edge and the whole app is pruned as invisible.
+
+    `hwnd` names the window being looked at. Given one, the walk covers only that window, so a
+    sibling window of the same process cannot contribute controls. Missing, unusable, or yielding
+    nothing, the walk covers every top-level window of the process as it always did.
     """
     uia = _uia()
-    desktop = uia.GetRootControl()
-    windows = [w for w in _children(desktop) if getattr(w, "ProcessId", None) == pid]
-    root = _ProcessRoot(windows)
+    roots = _window_roots(uia, pid, hwnd)
+    root = _ProcessRoot(roots)
     return walk_actionable(root, _root_children, _attrs, _actions, display_w_pt, display_h_pt, origin)
 
 

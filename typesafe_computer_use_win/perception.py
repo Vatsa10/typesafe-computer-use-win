@@ -534,15 +534,35 @@ def ax_nodes(screen: Screen, budget: int) -> tuple[list[AxNode], list[AxNode]]:
 
     Icon-only buttons are invisible to OCR and live only here. Accessibility is best effort:
     a missing pid, a refusing app, or a raising bridge all mean OCR carries the step alone.
+
+    One process can host many windows -- Chrome hosts all of its -- so the walk is scoped to the
+    foreground window's handle when the inventory knows it. Without that, a sibling window's
+    off-screen controls are offered as this window's own.
     """
     if screen.pid is None:
         return [], []
     width_pt, height_pt = screen.size_pt
+    hwnd = foreground_hwnd_of(screen)
     try:
-        nodes, hidden, _capped = windows.actionable_elements(screen.pid, width_pt, height_pt, screen.origin)
+        nodes, hidden, _capped = windows.actionable_elements(screen.pid, width_pt, height_pt, screen.origin, hwnd)
     except Exception:
         return [], []
     return [node for node in nodes[:budget] if node.label], [node for node in hidden if node.label]
+
+
+def foreground_hwnd_of(screen: Screen) -> int | None:
+    """The handle of the window this step is about, out of the inventory the capture already carries.
+
+    The foreground record when there is one, else the record whose pid matches the app being read
+    (the stand-in window a step picks when our own panel is in front). None when the inventory is
+    empty, as it is in a replay, and then the walk keeps its whole-process behaviour.
+    """
+    inventory = screen.windows or ()
+    front = next((w for w in inventory if getattr(w, "foreground", False)), None)
+    if front is None or (screen.pid is not None and getattr(front, "pid", None) != screen.pid):
+        front = next((w for w in inventory if getattr(w, "pid", None) == screen.pid), front)
+    hwnd = getattr(front, "hwnd", None)
+    return int(hwnd) if hwnd else None
 
 
 def offscreen_controls(nodes: list[AxNode], items: list[Item]) -> list[AxNode]:

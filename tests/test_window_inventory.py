@@ -214,3 +214,76 @@ def test_the_real_desktop_enumerates_and_agrees_with_itself():
         assert info.title
         assert 0 <= info.monitor < len(screens)
         assert info.pid != os.getpid()
+
+
+# ------------------------------------------------------------------ scoping the walk to one window
+#
+# `actionable_elements` used to root its walk at every top-level window of the process. One Chrome
+# process hosts every Chrome window, so another window's controls were in the tree; see the
+# incident test in tests/test_ax.py.
+
+
+class _FakeWindow:
+    def __init__(self, name, pid):
+        self.Name = name
+        self.ProcessId = pid
+        self.ControlTypeName = "WindowControl"
+        self.BoundingRectangle = None
+
+    def GetChildren(self):
+        return []
+
+
+def fake_uia(monkeypatch, windows_of_desktop, handles=None, raises=False):
+    """Stand in for uiautomation: a desktop of top-level windows, and a handle -> element table."""
+
+    class _Uia:
+        @staticmethod
+        def GetRootControl():
+            root = _FakeWindow("desktop", 0)
+            root.GetChildren = lambda: list(windows_of_desktop)
+            return root
+
+        @staticmethod
+        def ControlFromHandle(hwnd):
+            if raises:
+                raise OSError("no such window")
+            return (handles or {}).get(hwnd)
+
+    monkeypatch.setattr(windows, "_uia", lambda: _Uia)
+    seen: dict = {}
+
+    def record(root, *_a, **_kw):
+        seen["roots"] = list(root.windows)
+        return [], [], False
+
+    monkeypatch.setattr(windows, "walk_actionable", record)
+    return seen
+
+
+def test_a_handle_scopes_the_walk_to_that_window_alone(monkeypatch):
+    post, music = _FakeWindow("X post", 7), _FakeWindow("YouTube Music", 7)
+    seen = fake_uia(monkeypatch, [post, music], handles={0x100: post})
+    windows.actionable_elements(7, 1920.0, 1080.0, (0.0, 0.0), 0x100)
+    assert seen["roots"] == [post], "the sibling window of the same process must not be in the tree"
+
+
+def test_without_a_handle_the_walk_still_covers_every_window_of_the_process(monkeypatch):
+    post, music, other = _FakeWindow("X post", 7), _FakeWindow("YouTube Music", 7), _FakeWindow("Notepad", 9)
+    seen = fake_uia(monkeypatch, [post, music, other])
+    windows.actionable_elements(7, 1920.0, 1080.0)
+    assert seen["roots"] == [post, music]
+
+
+def test_an_unusable_handle_falls_back_instead_of_raising(monkeypatch):
+    post, music = _FakeWindow("X post", 7), _FakeWindow("YouTube Music", 7)
+    seen = fake_uia(monkeypatch, [post, music], handles={}, raises=True)
+    windows.actionable_elements(7, 1920.0, 1080.0, (0.0, 0.0), 0xDEAD)
+    assert seen["roots"] == [post, music]
+
+
+def test_a_handle_that_names_no_element_falls_back_too(monkeypatch):
+    post, music = _FakeWindow("X post", 7), _FakeWindow("YouTube Music", 7)
+    seen = fake_uia(monkeypatch, [post, music], handles={0x100: None})
+    windows.actionable_elements(7, 1920.0, 1080.0, (0.0, 0.0), 0x100)
+    assert seen["roots"] == [post, music]

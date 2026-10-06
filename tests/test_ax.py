@@ -178,7 +178,7 @@ def test_ax_items_convert_points_to_capture_pixels_and_name_the_role(screen, mon
         AxNode(role="AXPopUpButton", label="View site information", x=126.0, y=89.0, w=24.0, h=24.0, pressable=True),
         AxNode(role="AXDisclosureTriangle", label="More", x=10.0, y=10.0, w=12.0, h=12.0, pressable=True),
     ]
-    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0): (nodes, [], False))
+    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0), hwnd=None: (nodes, [], False))
     items = perception.ax_items(replace(screen, pid=123), 255)
     assert [(it.role, it.source, it.text) for it in items] == [
         ("popup", "ax", "View site information"),
@@ -188,7 +188,7 @@ def test_ax_items_convert_points_to_capture_pixels_and_name_the_role(screen, mon
 
 
 def test_ax_items_are_skipped_without_a_pid_and_when_the_walk_raises(screen, monkeypatch):
-    def boom(pid, w, h):
+    def boom(pid, w, h, *_a, **_kw):
         raise RuntimeError("accessibility said no")
 
     monkeypatch.setattr(windows, "actionable_elements", boom)
@@ -209,7 +209,7 @@ def test_ax_refs_follow_items_through_the_merge_and_the_renumbering(screen, monk
         AxNode(role="AXButton", label="Right", x=400.0, y=50.0, w=60.0, h=20.0, pressable=True, ref=right),
         AxNode(role="AXLink", label="Left", x=50.0, y=52.0, w=60.0, h=20.0, pressable=True, ref=left),
     ]
-    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0): (nodes, [], False))
+    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0), hwnd=None: (nodes, [], False))
     monkeypatch.setattr(
         perception,
         "ocr",
@@ -235,7 +235,7 @@ def test_offscreen_controls_are_deduplicated_and_never_repeat_a_visible_item(scr
         AxNode(role="AXButton", label="Note 900", x=0.0, y=48000.0, w=40.0, h=40.0, pressable=True, ref=object()),
         AxNode(role="AXLink", label="Only text", x=0.0, y=-900.0, w=60.0, h=20.0, pressable=True, ref=object()),
     ]
-    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0): ([], hidden, False))
+    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0), hwnd=None: ([], hidden, False))
     monkeypatch.setattr(perception, "ocr", lambda screen, budget, goal, *_: [Item(0, "Only text", 0.9, 10.0, 10.0, 90.0, 40.0)])
     live = replace(screen, pid=123)
     perception.perceive(live, 255, "goal")
@@ -243,7 +243,9 @@ def test_offscreen_controls_are_deduplicated_and_never_repeat_a_visible_item(scr
 
 
 def test_offscreen_controls_are_empty_in_replay(screen, monkeypatch):
-    monkeypatch.setattr(windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0): pytest.fail("no pid to walk"))
+    monkeypatch.setattr(
+        windows, "actionable_elements", lambda pid, w, h, origin=(0.0, 0.0), hwnd=None: pytest.fail("no pid to walk")
+    )
     monkeypatch.setattr(perception, "ocr", lambda screen, budget, goal, *_: [])
     perception.perceive(screen, 255, "goal")
     assert screen.offscreen == []
@@ -334,3 +336,57 @@ def test_the_walk_passes_its_origin_down_to_the_on_screen_test():
 
     found, _, _ = walk_actionable("app", lambda n: tree[n], attrs, lambda n: ["AXPress"], 1920, 1080, origin=(5120.0, 0.0))
     assert [n.label for n in found] == ["Send"]
+
+
+# ------------------------------------------------------------------ one process, several windows
+
+
+def chrome_windows():
+    """Two Chrome windows of one process: an X post in front, YouTube Music behind it.
+
+    The music window's transport controls are scrolled out of the display, which is exactly why they
+    survive as off-screen candidates: nothing on the capture contradicts a control nobody can see.
+    """
+    post = node(
+        "AXWindow",
+        "karpathy on X",
+        frame=(0.0, 0.0, 1728.0, 1000.0),
+        children=[
+            node("AXButton", "Reload", frame=(80.0, 40.0, 24.0, 24.0), press=True),
+            node("AXTab", "karpathy on X", frame=(200.0, 8.0, 180.0, 24.0), press=True),
+            node("AXButton", "Like", frame=(400.0, -5000.0, 32.0, 32.0), press=True),
+        ],
+    )
+    music = node(
+        "AXWindow",
+        "YouTube Music",
+        frame=(0.0, 0.0, 1728.0, 1000.0),
+        children=[
+            node("AXButton", "Play", frame=(60.0, -9000.0, 32.0, 32.0), press=True),
+            node("AXButton", "Dislike", frame=(100.0, -9000.0, 32.0, 32.0), press=True),
+            node("AXButton", "Like", frame=(140.0, -9000.0, 32.0, 32.0), press=True),
+        ],
+    )
+    return post, music
+
+
+def test_a_walk_scoped_to_one_window_cannot_offer_a_sibling_windows_control():
+    """The incident of runs/20261006-202038: the goal was "like this post" on an X post in Chrome,
+    and the run pressed an off-screen `Like` at 0.92 confidence that belonged to a YouTube Music
+    tab in a *different* Chrome window. Chrome is one process hosting many windows, and
+    `actionable_elements` rooted its walk at every window of the process, so the music window's
+    controls were in the tree; being off screen, nothing on the capture could contradict them.
+
+    Rooted at the window being looked at, the sibling's controls are simply not reachable, while the
+    window's own chrome -- its toolbar and tab strip -- still is.
+    """
+    post, music = chrome_windows()
+    whole_process = node("AXGroup", "", frame=None, children=[post, music])
+    found, hidden, _capped = walk(whole_process)
+    assert [n.label for n in hidden].count("Like") == 2, "the bug: both windows' Like buttons are offered"
+    assert ("AXButton", "Play") in [(n.role, n.label) for n in hidden]
+
+    found, hidden, _capped = walk(node("AXGroup", "", frame=None, children=[post]))
+    assert [(n.role, n.label) for n in hidden] == [("AXButton", "Like")], "only this window's own Like"
+    assert sorted(n.label for n in found) == ["Reload", "karpathy on X"], "the window's own toolbar and tab strip stay"
+    assert "Play" not in [n.label for n in hidden] and "Dislike" not in [n.label for n in hidden]
