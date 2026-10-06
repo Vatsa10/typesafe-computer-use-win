@@ -133,3 +133,44 @@ def test_a_half_caught_goal_is_still_refused():
 def test_a_command_below_the_confidence_floor_is_still_refused():
     client = FakeClient(command="quit_daemon", confidence=0.3, heard=0.9)
     assert interpret(client, "mumble", running=False, paused=False).actionable is False
+
+
+def test_a_question_about_the_screen_routes_to_ask_screen():
+    for said in ("what does this say", "how do I export this", "what am I looking at", "explain this error"):
+        client = FakeClient(command="ask_screen", confidence=0.9)
+        intent = interpret(client, said, running=False, paused=False)
+        assert intent.command == "ask_screen"
+        assert intent.actionable is True
+
+
+def test_a_task_still_routes_to_run_goal():
+    for said in ("open youtube", "like this post", "switch to whatsapp"):
+        client = FakeClient(command="run_goal", confidence=0.9)
+        intent = interpret(client, said, running=False, paused=False)
+        assert intent.command == "run_goal"
+        assert intent.goal == said
+
+
+def test_ask_screen_is_offered_as_a_criterion():
+    client = FakeClient(command="ask_screen", confidence=0.9)
+    interpret(client, "what does this say", running=False, paused=False)
+    assert "ask_screen" in client.questions["command"].criteria
+
+
+def test_ask_screen_carries_no_goal_because_it_never_drives_anything():
+    client = FakeClient(command="ask_screen", confidence=0.9)
+    intent = interpret(client, "what does this say", running=False, paused=False)
+    assert intent.goal == ""
+    assert intent.transcript == "what does this say"
+
+
+def test_a_half_caught_question_is_refused_by_the_heard_gate():
+    """ask_screen starts work too: acting on a misheard question spends a vision call and then tells
+    the user something confident about a screen they never asked about."""
+    client = FakeClient(command="ask_screen", confidence=0.95, heard=0.2)
+    assert interpret(client, "what does the uh", running=False, paused=False).actionable is False
+
+
+def test_a_cleanly_heard_question_below_the_confidence_floor_is_refused():
+    client = FakeClient(command="ask_screen", confidence=0.3, heard=0.95)
+    assert interpret(client, "what does this say", running=False, paused=False).actionable is False

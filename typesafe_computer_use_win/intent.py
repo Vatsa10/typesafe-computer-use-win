@@ -21,11 +21,22 @@ from typesafe_sdk import Choice, Noul
 MIN_HEARD = 0.5
 DEFAULT_MIN_CONFIDENCE = 0.55
 IGNORED = "ignore"
+# The two commands that start work, and so the two that must be heard cleanly. `run_goal` becomes
+# clicking; `ask_screen` spends a vision call and then tells the user something confident about a
+# screen they did not ask about, which is its own kind of damage.
+MUST_BE_HEARD = ("run_goal", "ask_screen")
 
 COMMANDS = {
     "run_goal": (
         "The line is a task to carry out on this computer: something to open, find, fill in, "
-        "check or navigate to. This is the only answer that starts work."
+        "check or navigate to: the user wants it done for them, not explained to them. This is the "
+        "only answer that touches the machine."
+    ),
+    "ask_screen": (
+        "The line is a question about what is on the screen right now, or a request to be taught or "
+        "walked through something, rather than a task to carry out: what something says or means, "
+        "what the user is looking at, what an error is, or how they would do something themselves. "
+        "This answer only looks and explains; it never clicks anything."
     ),
     "stop_run": "The line asks for the current run to stop now: stop, cancel that, abort, never mind.",
     "pause_run": "The line asks for the current run to hold where it is, to be continued later.",
@@ -51,13 +62,14 @@ class Intent:
     def actionable(self) -> bool:
         """Whether the daemon should act.
 
-        Every answer must clear the confidence floor. Only `run_goal` must also clear MIN_HEARD:
-        a goal becomes clicking, so a half-caught one is worth refusing, while refusing a
-        half-caught "stop" would leave the user shouting at a run that will not stop.
+        Every answer must clear the confidence floor. Only the commands that start work --
+        `run_goal` and `ask_screen` -- must also clear MIN_HEARD: a goal becomes clicking and a
+        question becomes an answer about the wrong screen, so a half-caught one is worth refusing,
+        while refusing a half-caught "stop" would leave the user shouting at a run that will not stop.
         """
         if self.command == IGNORED or self.confidence < self.min_confidence:
             return False
-        return self.heard >= MIN_HEARD if self.command == "run_goal" else True
+        return self.heard >= MIN_HEARD if self.command in MUST_BE_HEARD else True
 
 
 def interpret(client, transcript: str, running: bool, paused: bool, min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> Intent:
@@ -74,7 +86,9 @@ def interpret(client, transcript: str, running: bool, paused: bool, min_confiden
         "a_run_is_active": running,
         "the_run_is_paused": paused,
         "what_the_assistant_does": (
-            "drives this Windows machine toward a goal spoken in plain English: opening sites, clicking controls, filling fields"
+            "does two things with this Windows machine. It drives it toward a goal spoken in plain "
+            "English -- opening sites, clicking controls, filling fields -- and it also answers "
+            "questions about what is on the screen, explaining or teaching without touching anything"
         ),
     }
     questions = {

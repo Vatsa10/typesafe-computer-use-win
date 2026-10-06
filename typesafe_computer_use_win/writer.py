@@ -246,3 +246,39 @@ def compose_answer(writer: Writer, goal: str, screen: Screen, items: list[Item],
         image=screen.image,
     )
     return Answer(text=data["answer"].strip(), achieved=data["achieved"])
+
+
+def compose_explanation(writer: Writer, question: str, screen: Screen, items: list[Item]) -> str:
+    """The answer to a question the user asked about the screen in front of them.
+
+    `compose_answer`'s sibling for talk mode: the same capture-plus-text packet and the same
+    structured reply, but the subject is a question rather than a finished run, so there are no
+    actions to report and nothing to judge achieved. Nothing here acts; the writer's job is to
+    read the screen and explain it, including naming the controls the user would press themselves.
+    """
+    packet = {
+        "question": question,
+        "now": now_context(),
+        "frontmost_app": screen.app,
+        "browser_active_tab_url": screen.url,
+        "screen_text_in_reading_order": [it.text for it in items],
+    }
+    data = _structured(
+        writer,
+        system=(
+            "A user asked a question about the screen in front of them. You receive the question, a "
+            "capture of their screen as it is now, and the text read from that screen. Answer from "
+            "what is visible and nothing else: never from memory, and never a guess. When the screen "
+            "does not contain the answer, say so plainly, then say what is on screen instead. When "
+            "the user asks how to do something, do not do it and do not offer to: name the actual "
+            "on-screen controls they should use, by the labels visible on the capture, in the order "
+            "they would use them. You are teaching, not acting. Trust the capture over the text where "
+            "the two disagree. Plain text, no markdown, five sentences at most."
+        ),
+        packet=packet,
+        properties={"answer": {"type": "string"}},
+        max_tokens=1024,
+        model=answer_model(),
+        image=screen.image,
+    )
+    return data["answer"].strip()
