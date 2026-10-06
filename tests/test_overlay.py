@@ -79,3 +79,65 @@ def test_an_empty_entry_counts_as_a_cancel():
     entry = FakeEntry("   ")
     root = FakeRoot(entry)
     assert overlay.ask_for_goal(tk_factory=lambda: (root, entry)) is None
+
+
+# ------------------------------------------------------- the webview command bar
+
+
+def test_the_bar_returns_what_was_typed():
+    bar = overlay._Bar()
+    bar.submit("  open the console  ")
+    assert bar.wait(0.1) == "open the console"
+
+
+def test_an_empty_submit_is_a_cancel():
+    bar = overlay._Bar()
+    bar.submit("   ")
+    assert bar.wait(0.1) is None
+
+
+def test_cancelling_returns_nothing():
+    bar = overlay._Bar()
+    bar.cancel()
+    assert bar.wait(0.1) is None
+
+
+def test_the_bar_does_not_wait_for_ever():
+    """A bar left open would hold the input worker, and the hotkeys with it."""
+    assert overlay._Bar().wait(0.05) is None
+
+
+def test_the_page_is_offered_methods_and_nothing_else():
+    """Same rule as the panel: pywebview walks public attributes, and an Event is not something to
+    hand a browser."""
+    assert {name for name in vars(overlay._Bar()) if not name.startswith("_")} == set()
+
+
+def test_without_a_webview_loop_it_falls_back_rather_than_starting_one(monkeypatch):
+    """A worker thread cannot start a GUI loop, so the headless daemon gets the Tk bar instead."""
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(windows=[]))
+    assert overlay._webview_bar("goal") == (False, None)
+
+
+def test_a_running_webview_loop_is_used(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    made = {}
+
+    class FakeWindow:
+        def destroy(self):
+            made["destroyed"] = True
+
+    def create_window(prompt, url, js_api, **kw):
+        made["kw"] = kw
+        js_api.submit("open youtube")  # the page answering
+        return FakeWindow()
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(windows=["panel"], create_window=create_window))
+    assert overlay._webview_bar("goal") == (True, "open youtube")
+    assert made["kw"]["frameless"] is True and made["kw"]["on_top"] is True
+    assert made["destroyed"] is True, "the bar must not outlive the answer"

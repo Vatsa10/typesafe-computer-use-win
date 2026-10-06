@@ -89,8 +89,8 @@ def api():
 
 
 def test_the_page_is_handed_everything_said_since_it_last_asked(api):
-    api.messages.put("heard: 'open youtube'")
-    api.messages.put("  queued: 'open youtube'")
+    api._messages.put("heard: 'open youtube'")
+    api._messages.put("  queued: 'open youtube'")
     assert api.poll()["lines"] == ["heard: 'open youtube'", "  queued: 'open youtube'"]
     assert api.poll()["lines"] == [], "a second poll must not repeat what was already delivered"
 
@@ -103,8 +103,8 @@ def test_a_backlog_is_capped_so_one_frame_cannot_be_handed_a_minute_of_log():
 
 
 def test_the_state_the_page_paints_comes_from_the_daemon(api):
-    api.daemon.running = True
-    api.daemon.control.paused = True
+    api._daemon.running = True
+    api._daemon.control.paused = True
     state = api.poll()
     assert state["running"] is True and state["paused"] is True
     assert "talk" in state["hotkeys"]
@@ -118,16 +118,16 @@ def test_the_window_hides_before_the_job_exists(api):
     buttons and offered them as things to click. The hide has to happen first, not eventually."""
     api.start("open youtube")
     assert api._window.events == ["hide"]
-    assert api.daemon.queued == ["open youtube"], "and the goal still has to be queued"
+    assert api._daemon.queued == ["open youtube"], "and the goal still has to be queued"
     assert api._window.events.index("hide") == 0
 
 
 def test_the_window_comes_back_when_the_run_finishes(api):
     api.start("open youtube")
-    api.daemon.running = True
+    api._daemon.running = True
     api.poll()
     assert api._window.visible is False
-    api.daemon.running = False
+    api._daemon.running = False
     api.poll()
     assert api._window.visible is True
 
@@ -135,12 +135,12 @@ def test_the_window_comes_back_when_the_run_finishes(api):
 def test_hiding_can_be_turned_off(api):
     api.set_mode(act=True, voice=True, hide=False)
     api.start("open youtube")
-    assert api._window.events == [] and api.daemon.queued == ["open youtube"]
+    assert api._window.events == [] and api._daemon.queued == ["open youtube"]
 
 
 def test_an_empty_goal_starts_nothing_and_does_not_hide(api):
     assert api.start("   ") is False
-    assert api.daemon.queued == [] and api._window.events == []
+    assert api._daemon.queued == [] and api._window.events == []
 
 
 # ----------------------------------------------------------------- controls
@@ -148,19 +148,19 @@ def test_an_empty_goal_starts_nothing_and_does_not_hide(api):
 
 def test_the_mode_switches_reach_the_daemon(api):
     api.set_mode(act=True, voice=False, hide=True)
-    assert api.daemon.act is True and api.daemon.voice_enabled is False
+    assert api._daemon.act is True and api._daemon.voice_enabled is False
 
 
 def test_testing_voice_goes_to_the_input_worker_not_this_thread(api):
     """Recording blocks until the key comes up; doing that on the webview thread freezes the UI."""
     api.test_voice()
-    assert api.service.posted == [api.daemon.probe_voice]
+    assert api._service.posted == [api._daemon.probe_voice]
 
 
 def test_testing_voice_while_voice_is_off_says_so_and_records_nothing(api):
     api.set_mode(act=False, voice=False, hide=True)
     assert api.test_voice() is False
-    assert api.service.posted == []
+    assert api._service.posted == []
     assert "voice is off" in api.poll()["lines"]
 
 
@@ -220,3 +220,23 @@ def test_a_capture_becomes_something_an_img_can_show(tmp_path):
     shot = tmp_path / "step-001.png"
     Image.new("RGB", (8, 6)).save(shot)
     assert ui.data_url(shot).startswith("data:image/png;base64,")
+
+
+# ------------------------------------------------- what the page is allowed to see
+
+
+def test_the_page_is_offered_methods_and_nothing_else(api):
+    """pywebview builds the JS proxy by walking this object's public attributes.
+
+    A public reference to the native window recursed through .NET font families until the stack
+    ended and filled the console with GenericSansSerif.GenericSansSerif...; a public reference to
+    the service or the daemon would hand the page threads, queues and locks to serialise. So the
+    rule is that only methods are public, and this test is the rule.
+    """
+    public = {name for name in vars(api) if not name.startswith("_")}
+    assert public == set(), f"these would be walked and serialised: {sorted(public)}"
+
+
+def test_every_method_the_page_calls_is_still_reachable(api):
+    for name in ("poll", "start", "pause", "abort", "test_voice", "set_mode", "runs", "steps", "shot", "settings"):
+        assert callable(getattr(api, name)), f"the page calls {name}"

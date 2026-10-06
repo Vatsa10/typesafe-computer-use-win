@@ -111,11 +111,15 @@ class Api:
     may block: the slow things go to the daemon's own workers."""
 
     def __init__(self, service, messages: queue.Queue) -> None:
-        self.service = service
-        self.daemon = service.daemon
-        self.messages = messages
-        self._window = None  # private: pywebview walks public attributes and the native window recurses
-        self.hide_while_acting = True
+        # Every one of these is private, and that is load-bearing rather than tidiness: pywebview
+        # builds the page's JS proxy by walking this object's public attributes, so a public
+        # reference to anything holding a native handle, a lock or a thread either serialises
+        # something it should not or recurses until the stack ends. Only the methods are the API.
+        self._service = service
+        self._daemon = service.daemon
+        self._messages = messages
+        self._window = None
+        self._hide_while_acting = True
         self._hidden = False
 
     # ------------------------------------------------------------------ run
@@ -125,13 +129,13 @@ class Api:
         self._window = window
 
     def poll(self) -> dict:
-        running = self.daemon.running
+        running = self._daemon.running
         if not running and self._hidden:
             self._show()
         return {
-            "lines": line_queue(self.messages),
+            "lines": line_queue(self._messages),
             "running": running,
-            "paused": self.daemon.control.paused,
+            "paused": self._daemon.control.paused,
             "hotkeys": hotkey_hint(),
         }
 
@@ -140,32 +144,32 @@ class Api:
         if not goal:
             return False
         self._hide_for_run()  # before the job exists, so the first capture cannot include this window
-        self.daemon.queue_goal(goal)
+        self._daemon.queue_goal(goal)
         return True
 
     def pause(self) -> bool:
-        self.daemon.on_pause()
-        return self.daemon.control.paused
+        self._daemon.on_pause()
+        return self._daemon.control.paused
 
     def abort(self) -> bool:
-        self.daemon.on_abort()
+        self._daemon.on_abort()
         return True
 
     def test_voice(self) -> bool:
         """Hear one line and report what it was taken for, without running it. Recording blocks for
         as long as the key is held, so it goes to the input worker rather than this thread."""
-        if not self.daemon.voice_enabled:
-            self.messages.put("voice is off")
+        if not self._daemon.voice_enabled:
+            self._messages.put("voice is off")
             return False
-        self.messages.put("test: hold the talk hotkey and say something")
-        self.service.post(self.daemon.probe_voice)
+        self._messages.put("test: hold the talk hotkey and say something")
+        self._service.post(self._daemon.probe_voice)
         return True
 
     def set_mode(self, act: bool, voice: bool, hide: bool) -> dict:
-        self.daemon.act = bool(act)
-        self.daemon.voice_enabled = bool(voice)
-        self.hide_while_acting = bool(hide)
-        return {"act": self.daemon.act, "voice": self.daemon.voice_enabled, "hide": self.hide_while_acting}
+        self._daemon.act = bool(act)
+        self._daemon.voice_enabled = bool(voice)
+        self._hide_while_acting = bool(hide)
+        return {"act": self._daemon.act, "voice": self._daemon.voice_enabled, "hide": self._hide_while_acting}
 
     # -------------------------------------------------------------- history
 
@@ -200,7 +204,7 @@ class Api:
         and the accessibility tree lists them; a run that captured while it was visible was offered
         its own controls as things to click, and took them.
         """
-        if self._window is not None and self.hide_while_acting and not self._hidden:
+        if self._window is not None and self._hide_while_acting and not self._hidden:
             self._hidden = True
             self._window.hide()
 
