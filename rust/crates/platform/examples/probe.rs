@@ -1,7 +1,9 @@
 //! Live checks against the real desktop: the monitor table, and that BitBlt produced pixels.
 
 use platform::capture::{capture_monitor, capture_primary};
-use platform::display::{cursor_position, monitor_at, monitors, primary_size, virtual_bounds};
+use platform::display::{
+    cursor_position, monitor_at, monitor_of, monitors, primary_size, virtual_bounds,
+};
 
 fn main() {
     println!(
@@ -40,6 +42,14 @@ fn main() {
     println!("  (-32000, -32000) -> {}", monitor_at(-32000, -32000));
     let (cx, cy) = cursor_position();
     println!("  cursor ({cx}, {cy}) -> {}", monitor_at(cx, cy));
+
+    // monitor_of asks Windows, so it answers for a window whose rectangle names no screen: a
+    // minimized one parked near -32000, and the desktop-wide handle 0.
+    let front =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+    println!("\nmonitor_of:");
+    println!("  foreground hwnd {front} -> {}", monitor_of(front));
+    println!("  hwnd 0 (nearest) -> {}", monitor_of(0));
 
     println!("\ncaptures:");
     for m in &list {

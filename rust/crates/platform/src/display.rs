@@ -350,7 +350,9 @@ mod tests {
     fn a_point_outside_every_monitor_falls_back_to_zero() {
         let list = layout();
         assert_eq!(index_at(&list, -5000, -5000), 0); // nowhere at all
-        assert_eq!(index_at(&list, 2560, -800), 0); // the one-pixel gap left of the top monitor
+                                                      // Just past the top monitor's right edge, and above the right monitor's top: a real hole in
+                                                      // this layout, not a rounding artefact.
+        assert_eq!(index_at(&list, 2561, -800), 0);
         assert_eq!(index_at(&list, -32000, -32000), 0); // a minimized window's parked corner
     }
 

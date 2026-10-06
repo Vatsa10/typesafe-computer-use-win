@@ -172,12 +172,15 @@ pub fn type_text(text: &str) {
     }
 }
 
-/// Scroll the window under the cursor by a number of lines. Positive scrolls up, as Windows means
-/// it.
+/// Scroll by a number of lines. Positive scrolls up, as Windows means it.
 ///
-/// Wheel events go wherever the cursor is, so the caller parks it over the window it means first;
-/// this sends the notch and nothing else.
+/// A wheel event goes to whatever sits under the cursor, not to the focused window, so the cursor
+/// is parked over the centre of the frontmost window first — otherwise the scroll lands in whatever
+/// the pointer happened to be resting on.
 pub fn scroll(lines: i32) {
+    if let Some((x, y)) = crate::winlist::foreground_center() {
+        move_mouse(x, y);
+    }
     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, lines * WHEEL_PER_LINE);
 }
 
@@ -270,7 +273,9 @@ mod tests {
     #[test]
     fn the_key_down_bit_is_the_high_bit_of_a_signed_short() {
         assert_eq!(KEY_DOWN_BIT, i16::MIN);
-        assert_ne!(-1i16 & KEY_DOWN_BIT, 0); // every bit set: held
-        assert_eq!(1i16 & KEY_DOWN_BIT, 0); // only "pressed since last asked": not held
+        let every_bit: i16 = -1; // the state of a key that is down and was pressed since asked
+        assert_ne!(every_bit & KEY_DOWN_BIT, 0); // held
+        let toggled: i16 = 1; // only "pressed since last asked"
+        assert_eq!(toggled & KEY_DOWN_BIT, 0); // not held
     }
 }

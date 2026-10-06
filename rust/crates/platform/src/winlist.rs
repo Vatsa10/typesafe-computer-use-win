@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{AttachThreadInput, SetForegroundWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, ShowWindow, SW_RESTORE,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    ShowWindow, SW_RESTORE,
 };
 
 /// A minimized window parks at about (-32000, -32000). Anything out that far is a parked window,
@@ -156,7 +156,7 @@ fn executable_stem(path: &str) -> String {
 
 /// The handle of the window that currently has the foreground, or 0 when none does.
 pub fn foreground() -> isize {
-    unsafe { GetForegroundWindow() }.0
+    unsafe { GetForegroundWindow() }.0 as isize
 }
 
 unsafe extern "system" fn collect(hwnd: HWND, param: LPARAM) -> BOOL {
@@ -192,19 +192,34 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
             continue;
         }
         let info = WindowInfo {
-            hwnd: hwnd.0,
+            hwnd: hwnd.0 as isize,
             title,
             app: process_name(pid),
             pid,
             rect,
-            monitor: crate::display::monitor_of(hwnd.0),
+            monitor: crate::display::monitor_of(hwnd.0 as isize),
             minimized,
-            foreground: hwnd.0 == front,
+            foreground: hwnd.0 as isize == front,
         };
         found.push((z, info));
     }
     found.sort_by_key(|(z, info)| order_key(info, *z));
     found.into_iter().map(|(_z, info)| info).collect()
+}
+
+/// The centre of the foreground window, in physical pixels, when it is big enough to be a window
+/// being worked in. Wheel events go to whatever is under the cursor, so `scroll` parks there first.
+pub(crate) fn foreground_center() -> Option<(i32, i32)> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let (left, top, right, bottom) = window_rect(hwnd)?;
+    let (w, h) = (right - left, bottom - top);
+    if w <= MIN_WINDOW_SIDE_PX || h <= MIN_WINDOW_SIDE_PX {
+        return None;
+    }
+    Some((left + w / 2, top + h / 2))
 }
 
 /// Bring a window to the front, the documented way, and confirm it got there.
@@ -213,9 +228,11 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
 /// borrows the foreground thread's input queue with `AttachThreadInput` first. A minimized window
 /// is restored before it is raised, or it comes forward still an icon.
 pub fn activate_window(hwnd: isize, timeout_ms: u64) -> bool {
-    let target = HWND(hwnd);
+    let target = HWND(hwnd as *mut core::ffi::c_void);
     if unsafe { IsIconic(target) }.as_bool() {
-        unsafe { ShowWindow(target, SW_RESTORE) };
+        unsafe {
+            let _ = ShowWindow(target, SW_RESTORE);
+        }
     }
     let current = unsafe { GetCurrentThreadId() };
     let owner = thread_of(unsafe { GetForegroundWindow() });
@@ -227,7 +244,9 @@ pub fn activate_window(hwnd: isize, timeout_ms: u64) -> bool {
         let _ = BringWindowToTop(target);
     }
     if attached {
-        unsafe { AttachThreadInput(current, owner, false) };
+        unsafe {
+            let _ = AttachThreadInput(current, owner, false);
+        }
     }
     // Windows may refuse quietly, so the only honest answer comes from looking.
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -274,7 +293,7 @@ mod tests {
     fn a_monitor_left_of_the_primary_is_not_mistaken_for_a_parked_window() {
         // A real second monitor can start at -1920. The sentinel has to sit far past that.
         assert!(!minimized_from(false, (-1920, 0, -20, 1080)));
-        assert!(ICONIC_RECT_EDGE < -20000);
+        const { assert!(ICONIC_RECT_EDGE < -20000) };
     }
 
     #[test]
@@ -330,7 +349,7 @@ mod tests {
 
     #[test]
     fn the_foreground_window_sorts_first_whatever_monitor_it_is_on() {
-        let mut rows = vec![
+        let mut rows = [
             (0usize, info(0, false)),
             (1usize, info(2, true)),
             (2usize, info(1, false)),
@@ -346,7 +365,7 @@ mod tests {
 
     #[test]
     fn within_a_monitor_the_order_is_z_order() {
-        let mut rows = vec![(5usize, info(1, false)), (2usize, info(1, false))];
+        let mut rows = [(5usize, info(1, false)), (2usize, info(1, false))];
         rows.sort_by_key(|(z, w)| order_key(w, *z));
         assert_eq!(rows.iter().map(|(z, _)| *z).collect::<Vec<_>>(), vec![2, 5]);
     }
