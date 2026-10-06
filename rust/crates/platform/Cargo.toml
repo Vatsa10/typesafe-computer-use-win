@@ -26,5 +26,8 @@ features = [
   "Media_Ocr",
   "Globalization",
   "Storage_Streams",
+  "Foundation",
   "Foundation_Collections",
+  "Media_SpeechRecognition",
+  "implement",
 ]

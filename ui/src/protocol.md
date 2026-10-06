@@ -51,7 +51,12 @@ take effect in the running core at once, except hotkeys, which need a restart.
 ### Voice
 
 `listen_start` records the default microphone on a worker thread until `listen_stop`, the longest
-utterance (`CLICKER_VOICE_MAX_SECONDS`), or a pause after speech (`CLICKER_BAR_SILENCE`). The audio
+utterance (`CLICKER_VOICE_MAX_SECONDS`), or a pause after speech (`CLICKER_BAR_SILENCE`).
+`CLICKER_STT` (a non-secret setting) picks the engine: `auto` (default) is OpenAI when
+`OPENAI_API_KEY` is set and Windows otherwise; `openai` and `windows` force one. The Windows engine
+(free, keyless) records and recognizes in one go with the built-in recognizer; when it is not
+available (speech privacy off, no speech language) `listen_start` and push-to-talk fail with a line
+saying which setting to change. On the OpenAI engine the audio
 is transcribed by OpenAI (`OPENAI_API_KEY`, model `CLICKER_TRANSCRIBE_MODEL`) with a vocabulary
 prompt naming Claude Code, VS Code, Chrome and the commands, so "Claude" is not heard as "cloud";
 `CLICKER_VOICE_PROMPT` overrides it and empty disables it.

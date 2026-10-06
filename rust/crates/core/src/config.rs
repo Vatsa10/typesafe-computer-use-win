@@ -229,6 +229,26 @@ pub fn voice_max_seconds() -> Result<f64, String> {
     env_float("CLICKER_VOICE_MAX_SECONDS", DEFAULT_VOICE_MAX_SECONDS)
 }
 
+/// The speech-to-text engine, from `CLICKER_STT`: `auto` (the default) picks OpenAI when
+/// `OPENAI_API_KEY` is set and the free Windows recognizer otherwise; `openai` and `windows` force
+/// one. Returns "openai" or "windows".
+pub fn stt_engine() -> Result<&'static str, String> {
+    let has_key = env::var("OPENAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
+    choose_stt(&env_or("CLICKER_STT", "auto"), has_key)
+}
+
+/// The pure half of `stt_engine`.
+pub fn choose_stt(setting: &str, has_openai_key: bool) -> Result<&'static str, String> {
+    match setting.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(if has_openai_key { "openai" } else { "windows" }),
+        "openai" => Ok("openai"),
+        "windows" => Ok("windows"),
+        other => Err(format!(
+            "CLICKER_STT must be auto, openai or windows, not {other:?}"
+        )),
+    }
+}
+
 pub fn voice_min_confidence() -> Result<f64, String> {
     env_float("CLICKER_VOICE_MIN_CONFIDENCE", DEFAULT_VOICE_MIN_CONFIDENCE)
 }
@@ -506,6 +526,16 @@ mod tests {
         env::set_var("CLICKER_VOICE_MAX_SECONDS", "eight");
         assert!(voice_max_seconds().is_err());
         env::remove_var("CLICKER_VOICE_MAX_SECONDS");
+    }
+
+    #[test]
+    fn test_stt_engine_choice() {
+        assert_eq!(choose_stt("auto", true).unwrap(), "openai");
+        assert_eq!(choose_stt("auto", false).unwrap(), "windows");
+        assert_eq!(choose_stt("", false).unwrap(), "windows");
+        assert_eq!(choose_stt(" Windows ", true).unwrap(), "windows");
+        assert_eq!(choose_stt("openai", false).unwrap(), "openai");
+        assert!(choose_stt("whisper", true).is_err());
     }
 
     #[test]

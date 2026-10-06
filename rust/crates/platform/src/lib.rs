@@ -11,5 +11,6 @@ pub mod hotkeys;
 pub mod input;
 pub mod ocr;
 pub mod speech;
+pub mod stt;
 pub mod uia;
 pub mod winlist;

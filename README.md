@@ -40,7 +40,11 @@ Dry run is the default: Pointer decides and draws what it would press on screen,
 nothing. Switch to **Act** in the panel to let it click and type.
 
 Keys live in Settings (stored in `.env`, never shown back): `TYPESAFE_API_KEY` for decisions,
-`OPENAI_API_KEY` for writing text, answers and voice transcription.
+`OPENAI_API_KEY` for writing text and answers, and optionally voice. Voice works without any key:
+`CLICKER_STT` picks the engine - `auto` (default) uses OpenAI transcription when `OPENAI_API_KEY`
+is set and the free, built-in Windows speech recognizer otherwise; `openai` or `windows` forces one.
+The Windows engine needs Settings > Privacy & security > Speech > Online speech recognition on and
+an installed speech language; when either is missing, voice says so instead of failing silently.
 
 Build from source:
 

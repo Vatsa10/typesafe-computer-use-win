@@ -1,10 +1,12 @@
-//! The microphone: recorded on a worker thread, transcribed by OpenAI with a vocabulary prompt.
+//! The microphone, on one of two engines (`CLICKER_STT`): OpenAI (recorded on a worker thread,
+//! transcribed with a vocabulary prompt) or the free Windows recognizer (`platform::stt`), which
+//! records and recognizes in one go because WinRT cannot be handed recorded audio.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use platform::audio;
+use platform::{audio, stt};
 
 /// The decoding bias, the same sentence the Python uses, so "Claude Code" is not heard as "cloud
 /// code". Short on purpose: a long prompt gets echoed back as if it had been spoken.
@@ -26,7 +28,36 @@ pub trait Listener: Send + Sync {
     fn while_held(&self, vk: u32) -> Result<String, String>;
 }
 
-type Recording = (Arc<AtomicBool>, JoinHandle<Result<Vec<i16>, String>>);
+type Recording = (Arc<AtomicBool>, JoinHandle<Result<String, String>>);
+
+/// Which engine `CLICKER_STT` selects, as a typed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    OpenAi,
+    Windows,
+}
+
+impl Engine {
+    pub fn from_name(name: &str) -> Engine {
+        if name == "windows" {
+            Engine::Windows
+        } else {
+            Engine::OpenAi
+        }
+    }
+
+    pub fn current() -> Result<Engine, String> {
+        wcore::config::stt_engine().map(Engine::from_name)
+    }
+
+    /// A clear line when this engine cannot run here, checked before recording starts.
+    fn check(self) -> Result<(), String> {
+        match self {
+            Engine::Windows => stt::unavailable_reason().map_or(Ok(()), Err),
+            Engine::OpenAi => Ok(()),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Microphone {
@@ -38,7 +69,7 @@ fn transcribe(samples: &[i16]) -> Result<String, String> {
         return Ok(String::new());
     }
     let client = api::openai::OpenAi::from_env()
-        .ok_or_else(|| "voice needs OPENAI_API_KEY (Settings)".to_string())?;
+        .ok_or_else(|| "voice on OpenAI needs OPENAI_API_KEY (Settings), or set CLICKER_STT=windows for the free engine".to_string())?;
     let wav = audio::to_wav(samples, audio::SAMPLE_RATE);
     let prompt = voice_prompt();
     client
@@ -53,13 +84,21 @@ impl Listener for Microphone {
         if active.as_ref().is_some_and(|(_, h)| !h.is_finished()) {
             return Ok(false);
         }
+        let engine = Engine::current()?;
+        engine.check()?;
         let max = wcore::config::voice_max_seconds()?;
         let silence = wcore::config::bar_silence_seconds()?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let handle = std::thread::Builder::new()
             .name("record".into())
-            .spawn(move || audio::record_until(|| flag.load(Ordering::SeqCst), max, silence))
+            .spawn(move || {
+                let stopped = || flag.load(Ordering::SeqCst);
+                match engine {
+                    Engine::Windows => stt::recognize_live(stopped, max, silence),
+                    Engine::OpenAi => transcribe(&audio::record_until(stopped, max, silence)?),
+                }
+            })
             .map_err(|e| format!("could not start recording: {e}"))?;
         *active = Some((stop, handle));
         Ok(true)
@@ -75,15 +114,20 @@ impl Listener for Microphone {
             return Err("not listening".into());
         };
         stop.store(true, Ordering::SeqCst);
-        let samples = handle
+        handle
             .join()
-            .map_err(|_| "the recorder crashed".to_string())??;
-        transcribe(&samples)
+            .map_err(|_| "the recorder crashed".to_string())?
     }
 
     fn while_held(&self, vk: u32) -> Result<String, String> {
-        let samples = audio::record_while_held(vk, wcore::config::voice_max_seconds()?)?;
-        transcribe(&samples)
+        let max = wcore::config::voice_max_seconds()?;
+        match Engine::current()? {
+            Engine::Windows => {
+                Engine::Windows.check()?;
+                stt::recognize_live(|| !audio::key_held(vk), max, 0.0)
+            }
+            Engine::OpenAi => transcribe(&audio::record_while_held(vk, max)?),
+        }
     }
 }
 
@@ -94,6 +138,20 @@ mod tests {
     #[test]
     fn the_prompt_names_claude_so_it_is_not_heard_as_cloud() {
         assert!(VOICE_PROMPT.starts_with("Claude Code"));
+    }
+
+    #[test]
+    fn the_engine_name_maps_to_the_engine() {
+        assert_eq!(Engine::from_name("windows"), Engine::Windows);
+        assert_eq!(Engine::from_name("openai"), Engine::OpenAi);
+        assert_eq!(
+            Engine::from_name(wcore::config::choose_stt("auto", false).unwrap()),
+            Engine::Windows
+        );
+        assert_eq!(
+            Engine::from_name(wcore::config::choose_stt("auto", true).unwrap()),
+            Engine::OpenAi
+        );
     }
 
     #[test]

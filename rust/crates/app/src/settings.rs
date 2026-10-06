@@ -102,6 +102,11 @@ pub fn catalog() -> Vec<Setting> {
             config::DEFAULT_VOICE_MIN_CONFIDENCE.to_string(),
         ),
         row(
+            "CLICKER_STT",
+            "Speech-to-text engine",
+            "auto (openai with a key, else windows)",
+        ),
+        row(
             "CLICKER_TRANSCRIBE_MODEL",
             "Transcription model",
             "gpt-4o-mini-transcribe",
