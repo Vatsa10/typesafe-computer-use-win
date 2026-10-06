@@ -347,3 +347,62 @@ def test_every_hotkey_in_the_table_has_a_handler():
     daemon, _ = make_daemon()
     for name in Service.HOTKEY_HANDLERS:
         assert callable(getattr(daemon, f"on_{name}", None)), f"no handler for {name}"
+
+
+# ------------------------------------------------------------------ talk mode
+
+
+def test_a_question_is_answered_and_never_run():
+    """The whole value of talk mode is that it cannot act, so this pins it at the daemon too."""
+    from typesafe_computer_use_win.intent import Intent
+
+    daemon, ran = make_daemon(intent=Intent("ask_screen", "", 0.95, 0.9, "what does this say", 0.55))
+    daemon.writer = object()
+    answered = []
+    daemon.answer = lambda question: answered.append(question) or "it says hello"
+    daemon.on_talk()
+    assert answered == ["what does this say"]
+    assert daemon.jobs.empty() and ran == [], "a question must not start a run"
+
+
+def test_a_question_without_a_writer_says_so_rather_than_failing():
+    daemon, _ = make_daemon()
+    daemon.writer = None
+    logged = []
+    daemon.log = logged.append
+    assert daemon.answer("what is this") == ""
+    assert any("no writer" in line for line in logged)
+
+
+def test_an_answer_is_spoken_when_speaking_is_on(monkeypatch):
+    from typesafe_computer_use_win import speech
+
+    said = []
+    monkeypatch.setenv("CLICKER_SPEAK", "1")
+    monkeypatch.setattr(speech, "speak", lambda text: said.append(text) or True)
+    monkeypatch.setattr(speech, "speakable", lambda text: text[:50])
+    daemon, _ = make_daemon()
+    daemon.say("the billing page shows the Starter plan")
+    assert said == ["the billing page shows the Starter plan"]
+
+
+def test_speaking_can_be_turned_off(monkeypatch):
+    from typesafe_computer_use_win import speech
+
+    monkeypatch.setenv("CLICKER_SPEAK", "0")
+
+    def spoke(_text):
+        raise AssertionError("speaking is off, so nothing should reach the engine")
+
+    monkeypatch.setattr(speech, "speak", spoke)
+    daemon, _ = make_daemon()
+    daemon.say("something")
+
+
+def test_a_speech_engine_that_fails_does_not_take_the_answer_with_it(monkeypatch):
+    from typesafe_computer_use_win import speech
+
+    monkeypatch.setenv("CLICKER_SPEAK", "1")
+    monkeypatch.setattr(speech, "speak", lambda text: (_ for _ in ()).throw(RuntimeError("no audio device")))
+    daemon, _ = make_daemon()
+    daemon.say("still fine")

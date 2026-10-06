@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -11,7 +12,7 @@ from threading import Event
 
 from typesafe_sdk import TypeSafeClient
 
-from . import windows
+from . import highlight, windows
 from .actions import Context, is_noop, perform
 from .config import DEFAULT_DELAY, DEFAULT_MIN_CONFIDENCE, DEFAULT_STEPS, MAX_OPTIONS
 from .decide import Decision, decide, offscreen_records
@@ -283,6 +284,8 @@ def resolve(
         return False
     if not cfg.act or cfg.replay:
         log(f"  would do: {decision.chosen}. dry run (pass --act without --image to drive the machine)")
+        if not cfg.replay:
+            point_at(screen, items, decision, log)
         state.outcome = "dry run"
         return False
 
@@ -302,6 +305,29 @@ def resolve(
     else:
         state.consecutive_noops = 0
     return True
+
+
+def point_at(screen: Screen, items: list[Item], decision: Decision, log: Log) -> None:
+    """Draw a box around what the run would have pressed.
+
+    This is what makes a dry run worth watching: instead of a line of text naming an item number,
+    the thing itself is circled on the screen. Showing somebody the button also cannot press the
+    wrong one, which is the failure this program has actually had.
+    """
+    target = next((it for it in items if str(it.index) == decision.chosen), None)
+    if target is None:
+        return
+    left, top = screen.origin
+    mark = highlight.Mark(
+        x=left + target.x1 / screen.scale,
+        y=top + target.y1 / screen.scale,
+        w=(target.x2 - target.x1) / screen.scale,
+        h=(target.y2 - target.y1) / screen.scale,
+        label=f"would press: {target.text[:40]}",
+    )
+    with contextlib.suppress(Exception):  # a desktop that will not draw must not fail the run
+        if highlight.show([mark]):
+            log("  (drawn on screen)")
 
 
 def answers(decision: Decision, screen: Screen, items: list[Item], timing: dict[str, float]) -> dict:

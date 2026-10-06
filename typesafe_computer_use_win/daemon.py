@@ -11,6 +11,7 @@ Every collaborator is injected, which is what makes this testable without a micr
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 import time
@@ -46,6 +47,7 @@ class Daemon:
         self.running = False
         self.act = True  # the panel flips this; the headless daemon always acts
         self.voice_enabled = True
+        self.writer = None  # set by build(); talk mode needs it and the loop already has one
 
     # ------------------------------------------------------------------ hotkey handlers
 
@@ -129,6 +131,8 @@ class Daemon:
             return
         if decided.command == "run_goal":
             self.queue_goal(decided.goal)
+        elif decided.command == "ask_screen":
+            self.answer(decided.transcript)
         elif decided.command == "quit_daemon":
             self.on_quit()
         elif not self.running:
@@ -144,6 +148,28 @@ class Daemon:
         elif decided.command == "resume_run":
             self.control.resume()
             self.log("resumed")
+
+    def answer(self, question: str) -> str:
+        """Look at the screen and explain it. This path touches nothing: it is the half of the
+        program that teaches rather than drives, and that is the whole reason it is safe."""
+        from . import talk
+
+        if self.writer is None:
+            self.log("  I cannot answer that: no writer is configured")
+            return ""
+        answer = talk.answer_question(self.writer, question, config.browser(), log=self.log)
+        self.say(answer)
+        return answer
+
+    def say(self, text: str) -> None:
+        """Speak an answer, when speaking is on. Never blocks: a long answer must not hold the
+        hotkeys, and the next thing said replaces it."""
+        if not text or not config.speak_answers():
+            return
+        from . import speech
+
+        with contextlib.suppress(Exception):
+            speech.speak(speech.speakable(text))
 
     def queue_goal(self, goal: str) -> None:
         self.jobs.put(Job(goal, act=self.act))
@@ -308,7 +334,9 @@ def build(log=print) -> Daemon:
 
         # echo=log is what puts the step lines in front of whoever is watching: the terminal for
         # the headless daemon, the live feed for the panel.
-        run(cfg, ctx_factory, control, echo=log)
+        state = run(cfg, ctx_factory, control, echo=log)
+        if state.answer is not None:
+            daemon.say(state.answer.text)
 
     def interpret_line(text: str, running: bool, paused: bool):
         from typesafe_sdk import TypeSafeClient
@@ -319,7 +347,7 @@ def build(log=print) -> Daemon:
     def listen_now() -> str:
         return voice.listen(keys.vk_of("talk"), config.voice_max_seconds(), config.whisper_model())
 
-    return Daemon(
+    daemon = Daemon(
         run_job=run_job,
         interpret_line=interpret_line,
         listen_now=listen_now,
@@ -328,6 +356,8 @@ def build(log=print) -> Daemon:
         control=control,
         log=log,
     )
+    daemon.writer = writer  # the same writer the loop uses, for the half that only explains
+    return daemon
 
 
 def serve(log=print) -> None:

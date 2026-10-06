@@ -115,6 +115,12 @@ def whisper_model() -> str:
     return os.environ.get("CLICKER_WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
 
 
+def speak_answers() -> bool:
+    """Whether answers are read out loud. On by default: an answer you have to go and read is a
+    log line, and the point of asking out loud is being answered out loud."""
+    return os.environ.get("CLICKER_SPEAK", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def bar_silence_seconds() -> float:
     """Seconds of quiet that end a recording in the bar. Zero waits for the click instead."""
     return float(os.environ.get("CLICKER_BAR_SILENCE", DEFAULT_BAR_SILENCE_SECONDS))
