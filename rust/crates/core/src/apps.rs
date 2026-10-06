@@ -3,7 +3,7 @@
 //!
 //! This is `catalog`'s sibling: same shape, same instincts. It walks the two Start Menu `Programs`
 //! trees Windows keeps -- one per user, one per machine -- turns every `.lnk` into an `App` row, and
-//! caches the result as JSON under `%LOCALAPPDATA%/winclicker/apps.json`. Nothing here calls a
+//! caches the result as JSON under `%LOCALAPPDATA%/pointer/apps.json`. Nothing here calls a
 //! model, draws a UI, or touches the decision loop.
 //!
 //! Two rules keep this safe to hand to a model:
@@ -742,7 +742,7 @@ mod tests {
             self.tmp
                 .path()
                 .join("local")
-                .join("winclicker")
+                .join("pointer")
                 .join("apps.json")
         }
         fn list(&self, refresh: bool) -> Vec<App> {

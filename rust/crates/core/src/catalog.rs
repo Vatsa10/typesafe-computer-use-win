@@ -477,7 +477,7 @@ fn temp_copy_path() -> PathBuf {
         .unwrap_or(0);
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "winclicker-history-{}-{nanos}-{n}.db",
+        "pointer-history-{}-{nanos}-{n}.db",
         std::process::id()
     ))
 }
@@ -681,7 +681,7 @@ pub fn pinned_sites() -> Vec<Site> {
         .collect()
 }
 
-/// `%LOCALAPPDATA%/winclicker`, falling back to the home directory when the variable is unset.
+/// `%LOCALAPPDATA%/pointer`, falling back to the home directory when the variable is unset.
 pub(crate) fn local_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|v| !v.is_empty())
@@ -690,7 +690,7 @@ pub(crate) fn local_dir() -> PathBuf {
         Some(b) => PathBuf::from(b),
         None => home_dir().join(".cache"),
     };
-    root.join("winclicker")
+    root.join("pointer")
 }
 
 fn home_dir() -> PathBuf {
@@ -1082,7 +1082,7 @@ pub(crate) mod tests {
             self.tmp.path()
         }
         fn local(&self) -> PathBuf {
-            self.tmp.path().join("local").join("winclicker")
+            self.tmp.path().join("local").join("pointer")
         }
         fn cache(&self) -> PathBuf {
             self.local().join("catalog.json")
