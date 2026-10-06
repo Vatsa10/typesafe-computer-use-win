@@ -97,7 +97,7 @@ fn main() {
         .and_then(|spec| platform::hotkeys::parse_hotkey(&spec).ok())
         .map(|(_, vk)| vk);
     let daemon = Arc::new(Daemon {
-        runner: Box::new(runner::Unwired),
+        runner: Box::new(runner::Wired::live()),
         listener: Box::new(voice::Microphone::default()),
         out: out.clone(),
         speaker: Arc::new(runner::speak),

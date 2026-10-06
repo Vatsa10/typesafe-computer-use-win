@@ -173,8 +173,13 @@ impl Control {
 }
 
 /// The corner escape hatch: the pointer slammed into the top-left corner of the primary display.
+///
+/// The primary display's top-left is (0,0) on the virtual desktop, whatever else is attached. The
+/// Python's `x <= 4 && y <= 4` also fired on the left edge of any monitor placed above or left of
+/// the primary (a monitor at origin (0,-1440) puts (1,-1440) there), so both bounds are checked.
 pub fn check_corner(cursor: (i32, i32)) -> Result<(), Abort> {
-    if cursor.0 <= ABORT_CORNER_PX && cursor.1 <= ABORT_CORNER_PX {
+    let near = |v: i32| (0..=ABORT_CORNER_PX).contains(&v);
+    if near(cursor.0) && near(cursor.1) {
         return Err(Abort("mouse in top-left corner".into()));
     }
     Ok(())
@@ -1429,6 +1434,17 @@ mod tests {
         assert!(check_corner((4, 4)).is_err());
         assert!(check_corner((5, 0)).is_ok());
         assert!(check_corner((500, 500)).is_ok());
+    }
+
+    #[test]
+    fn only_the_primary_monitors_corner_aborts_not_a_monitor_above_it() {
+        assert!(
+            check_corner((1, -1440)).is_ok(),
+            "left edge of a monitor above"
+        );
+        assert!(check_corner((-1920, 2)).is_ok(), "a monitor to the left");
+        assert!(check_corner((-2, -2)).is_ok());
+        assert!(check_corner((2, 2)).is_err());
     }
 
     // ------------------------------------------------------------ the answer
