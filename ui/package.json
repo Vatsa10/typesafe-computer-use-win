@@ -15,9 +15,22 @@
   "build": {
     "appId": "ai.typesafe.pointer",
     "productName": "Pointer",
-    "files": ["src/**/*"],
-    "extraResources": [{ "from": "../rust/target/release/pointer-core.exe", "to": "core.exe" }],
-    "win": { "target": "nsis" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+    "files": [
+      "src/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../rust/target/release/pointer-core.exe",
+        "to": "core.exe"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

@@ -125,6 +125,7 @@ function titleBarOverlay() {
 
 function createPanel() {
   panel = new BrowserWindow({
+    icon: path.join(__dirname, "icon.ico"),
     width: 1120,
     height: 780,
     minWidth: 900,
