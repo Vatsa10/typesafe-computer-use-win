@@ -3,18 +3,82 @@
 //! Electron runs this as a child process and talks the line protocol to it. The UI owns windows
 //! and nothing else, which is what keeps a crash in the shell from stranding a run that is already
 //! driving the machine.
+//!
+//! Threads: the main thread reads stdin; each request is handled on its own short-lived thread so
+//! a transcription never holds up an abort; the hotkey pump registers and pumps and only enqueues;
+//! the input worker drains that queue. All output goes through one locked writer.
 
+mod daemon;
+mod emit;
 mod ipc;
+mod runner;
+mod settings;
+mod voice;
 
-use std::io::{BufRead, Write};
+use std::io::BufRead;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
-use serde_json::json;
+use daemon::{Daemon, Modes, Paths};
+use emit::Emitter;
 
-/// Say something nobody asked for. The shell is listening from the moment it spawns this.
-fn emit(out: &mut impl Write, name: &str, payload: serde_json::Value) {
-    let message = ipc::event(name, payload);
-    let _ = writeln!(out, "{message}");
-    let _ = out.flush();
+const HOTKEY_NAMES: [&str; 6] = ["talk", "bar", "goal", "pause", "abort", "quit"];
+
+enum Pumped {
+    Fired(String),
+    Refused(Vec<String>),
+}
+
+/// Register every hotkey on a thread of its own and pump it. Callbacks only send on a channel.
+fn start_hotkeys(daemon: Arc<Daemon>) {
+    let (tx, rx) = mpsc::channel::<Pumped>();
+    let mut keys = platform::hotkeys::Hotkeys::new();
+    for name in HOTKEY_NAMES {
+        let Some(spec) = wcore::config::hotkey(name) else {
+            continue;
+        };
+        let sender = tx.clone();
+        let owned = name.to_string();
+        if let Err(e) = keys.add(name, &spec, move || {
+            let _ = sender.send(Pumped::Fired(owned.clone()));
+        }) {
+            daemon
+                .out
+                .line(format!("hotkey for {name} does not parse ({spec}): {e}"));
+        }
+    }
+    let ready = tx;
+    let spawned = std::thread::Builder::new()
+        .name("hotkeys".into())
+        .spawn(move || {
+            keys.serve(move |refused| {
+                let _ = ready.send(Pumped::Refused(refused));
+            });
+        });
+    if let Err(e) = spawned {
+        daemon
+            .out
+            .line(format!("the hotkey pump would not start: {e}"));
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || {
+            for message in rx {
+                match message {
+                    Pumped::Fired(name) => daemon.on_hotkey(&name),
+                    Pumped::Refused(names) => {
+                        for name in names {
+                            let spec = wcore::config::hotkey(&name).unwrap_or_default();
+                            daemon
+                                .out
+                                .line(format!("hotkey for {name} is taken by another app: {spec}"));
+                        }
+                    }
+                }
+            }
+        });
 }
 
 fn main() {
@@ -22,50 +86,58 @@ fn main() {
     // reports is wrong on a scaled display, and a click computed from one lands short.
     platform::display::declare_dpi_aware();
 
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dotenv = cwd.join(".env");
+    let out = Emitter::new(std::io::stdout());
+    if let Err(e) = wcore::config::load_dotenv(&dotenv) {
+        out.line(format!("could not read .env: {e}"));
+    }
+
+    let talk_vk = wcore::config::hotkey("talk")
+        .and_then(|spec| platform::hotkeys::parse_hotkey(&spec).ok())
+        .map(|(_, vk)| vk);
+    let daemon = Arc::new(Daemon {
+        runner: Box::new(runner::Unwired),
+        listener: Box::new(voice::Microphone::default()),
+        out: out.clone(),
+        speaker: Arc::new(runner::speak),
+        paths: Paths {
+            runs: cwd.join("runs"),
+            dotenv,
+        },
+        hotkeys: daemon::hotkey_hint(),
+        talk_vk,
+        modes: Mutex::new(Modes::default()),
+    });
+
     let screens = platform::display::monitors().len();
-    emit(&mut stdout, "line", json!({ "text": format!("core ready: {screens} displays") }));
+    out.line(format!("core ready: {screens} displays"));
+    // CLICKER_NO_HOTKEYS=1 runs the protocol without touching the global keyboard: for smoke tests
+    // and for a second copy that must not fight the first over the keys.
+    if std::env::var("CLICKER_NO_HOTKEYS")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
+        start_hotkeys(daemon.clone());
+    }
+    daemon.events().state(daemon.runner.state());
+
+    let stdin = std::io::stdin();
+    let mut workers = Vec::new();
     for line in stdin.lock().lines().map_while(Result::ok) {
         let Some(request) = ipc::parse(&line) else {
             continue; // not a request: the shell may be mid-upgrade, and exiting would strand a run
         };
-        let reply = handle(&request);
-        let encoded = serde_json::to_string(&reply).unwrap_or_else(|_| String::from("{}"));
-        if writeln!(stdout, "{encoded}").is_err() || stdout.flush().is_err() {
-            break; // the shell is gone
-        }
+        let daemon = daemon.clone();
+        workers.push(std::thread::spawn(move || {
+            let reply = daemon.handle(&request);
+            daemon.out.reply(&reply);
+        }));
+        workers.retain(|w| !w.is_finished());
     }
-}
-
-fn handle(request: &ipc::Request) -> ipc::Reply {
-    match request.method.as_str() {
-        "state" => ipc::Reply::ok(request.id, json!({ "running": false, "paused": false, "hotkeys": "" })),
-        "capture" => {
-            // Which display to read. Not always the primary: the one being worked on is the one
-            // that matters, and this desk has a monitor above the primary and one to the right.
-            let wanted = request.params.get("monitor").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let screens = platform::display::monitors();
-            let Some(screen) = screens.get(wanted) else {
-                return ipc::Reply::failed(request.id, format!("no display {wanted}"));
-            };
-            match platform::capture::capture_monitor(screen) {
-                Some(shot) => ipc::Reply::ok(
-                    request.id,
-                    json!({ "width": shot.width, "height": shot.height,
-                            "origin": [shot.origin.0, shot.origin.1], "bytes": shot.bgra.len() }),
-                ),
-                None => ipc::Reply::failed(request.id, "the display would not capture"),
-            }
-        }
-        "displays" => {
-            let screens: Vec<_> = platform::display::monitors()
-                .into_iter()
-                .map(|m| json!({ "index": m.index, "left": m.left, "top": m.top,
-                                 "right": m.right, "bottom": m.bottom, "primary": m.primary }))
-                .collect();
-            ipc::Reply::ok(request.id, json!(screens))
-        }
-        other => ipc::Reply::failed(request.id, format!("no method {other}")),
+    // The shell closed the pipe: let what was asked finish answering, then stop the run with it.
+    for worker in workers {
+        let _ = worker.join();
     }
+    let _ = daemon.runner.abort();
 }

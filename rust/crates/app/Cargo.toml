@@ -12,3 +12,6 @@ path = "src/main.rs"
 platform = { path = "../platform" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+wcore = { package = "core", path = "../core" }
+api = { path = "../api" }
+base64 = { workspace = true }

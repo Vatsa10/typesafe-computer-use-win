@@ -29,11 +29,21 @@ pub struct Reply {
 
 impl Reply {
     pub fn ok(id: u64, result: Value) -> Self {
-        Self { id, ok: true, result: Some(result), error: None }
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn failed(id: u64, error: impl Into<String>) -> Self {
-        Self { id, ok: false, result: None, error: Some(error.into()) }
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -60,7 +70,8 @@ mod tests {
 
     #[test]
     fn a_request_round_trips() {
-        let request = parse(r#"{"id":7,"method":"start","params":{"goal":"open youtube"}}"#).unwrap();
+        let request =
+            parse(r#"{"id":7,"method":"start","params":{"goal":"open youtube"}}"#).unwrap();
         assert_eq!(request.id, 7);
         assert_eq!(request.method, "start");
         assert_eq!(request.params["goal"], "open youtube");
@@ -87,7 +98,10 @@ mod tests {
         assert_eq!(encoded["id"], 7);
         assert_eq!(encoded["ok"], true);
         assert_eq!(encoded["result"]["queued"], true);
-        assert!(encoded.get("error").is_none(), "a success carries no error field");
+        assert!(
+            encoded.get("error").is_none(),
+            "a success carries no error field"
+        );
     }
 
     #[test]
