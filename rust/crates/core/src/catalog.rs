@@ -33,20 +33,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// The curated core, mirroring `config.SITES` in the Python.
-///
-/// `config.rs` is owned elsewhere during the port; until it carries `SITES`, the table lives here
-/// with exactly the Python's keys and URLs.
-pub const SITES: &[(&str, &str)] = &[
-    ("github", "https://github.com/"),
-    ("gmail", "https://mail.google.com/"),
-    ("google_calendar", "https://calendar.google.com/"),
-    ("launchdarkly", "https://app.launchdarkly.com/"),
-    ("linear", "https://linear.app/"),
-    ("notion", "https://www.notion.so/"),
-    ("slack", "https://app.slack.com/"),
-    ("typesafe_console", "https://console.typesafe.ai/"),
-];
+/// The curated core. `config.rs` is the single source; re-exported here for callers of
+/// `catalog::SITES`.
+pub use crate::config::SITES;
 
 /// Source ranking, best first. A key present in two sources keeps the better one.
 pub const SOURCES: [&str; 4] = ["pinned", "learned", "bookmark", "history"];

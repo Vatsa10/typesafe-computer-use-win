@@ -257,6 +257,18 @@ pub fn catalog_limit() -> Result<i64, String> {
     }
 }
 
+/// `CLICKER_SILENCE_LEVEL`: a fixed per-block RMS silence threshold for voice capture, replacing
+/// the adaptive noise-floor gate in `platform::audio`. `None` when unset or empty (adaptive).
+/// The platform crate reads the same variable itself, since it does not depend on this crate.
+pub fn silence_level() -> Result<Option<f64>, String> {
+    match env::var("CLICKER_SILENCE_LEVEL") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().map(Some).map_err(|_| {
+            format!("could not convert string to float: {raw:?} (CLICKER_SILENCE_LEVEL)")
+        }),
+        _ => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // dotenv_io: read and rewrite a `.env` file in place, preserving everything we were not asked to
 // change.
@@ -541,6 +553,11 @@ mod tests {
         env::remove_var("CLICKER_SPEAK");
         env::remove_var("CLICKER_CATALOG_LIMIT");
         assert_eq!(catalog_limit().unwrap(), 30);
+        env::remove_var("CLICKER_SILENCE_LEVEL");
+        assert_eq!(silence_level().unwrap(), None);
+        env::set_var("CLICKER_SILENCE_LEVEL", "200");
+        assert_eq!(silence_level().unwrap(), Some(200.0));
+        env::remove_var("CLICKER_SILENCE_LEVEL");
         assert_eq!(SITES.len(), 8);
         assert_eq!(SITES[0], ("github", "https://github.com/"));
     }

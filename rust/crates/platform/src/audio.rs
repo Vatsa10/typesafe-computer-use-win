@@ -21,13 +21,41 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// The window the silence test measures, in 16 kHz samples.
 pub const BLOCK_FRAMES: usize = 1024;
 
-/// Per-block RMS below which a block counts as silence. Measured, not guessed, on this machine's
-/// array mic: room tone has a per-block median near 800 and a p90 near 1400, but a tail whose
-/// worst block hit 3442 (sample peaks 5764), because the array mic applies its own gain. The first
-/// guess, 2000, read that tail as speech and cut a recording off after 1.4 s. 5000 sits half again
-/// above the loudest quiet block and well under speech at this gain. RMS rather than peak, so one
-/// keyboard click does not read as a spoken word.
+/// A fixed per-block RMS silence level, calibrated for the *Python* capture path and kept for
+/// reference and for callers that want a fixed gate. History: on that path the array mic's room
+/// tone had a per-block median near 800 and a p90 near 1400, with a tail whose worst block hit 3442
+/// (sample peaks 5764), because the array mic applies its own gain. The first guess, 2000, read
+/// that tail as speech and cut a recording off after 1.4 s; 5000 sat half again above the loudest
+/// quiet block. This WinMM path delivers far quieter samples (room tone RMS median 35, max 44,
+/// sample peak 161), so 5000 would never hear speech here; `record` uses the adaptive gate.
 pub const SILENCE_LEVEL: f64 = 5000.0;
+
+/// Blocks at the start of a recording used to measure the noise floor: 5 x 64 ms = 0.32 s.
+pub const CALIBRATION_BLOCKS: usize = 5;
+/// Adaptive threshold = max(floor * NOISE_FACTOR, MIN_SILENCE_LEVEL). Measured on the WinMM path:
+/// room tone per-block RMS median 35, max 44 (a 1.26x spread over the median), sample peak 161.
+/// A factor of 4 puts a 35 floor at 140, three times the loudest quiet block, so room-tone
+/// fluctuation never reads as speech, while speech (hundreds to thousands of RMS) clears it.
+pub const NOISE_FACTOR: f64 = 4.0;
+/// Floor under the adaptive threshold, for a dead-quiet or digitally gated input whose measured
+/// floor is near zero. 150 is over 3x the loudest room-tone block measured (44).
+pub const MIN_SILENCE_LEVEL: f64 = 150.0;
+/// Environment override: a fixed per-block RMS threshold in place of the adaptive one. Read here
+/// because this crate does not depend on core; `core::config::silence_level` reads the same name.
+pub const SILENCE_LEVEL_ENV: &str = "CLICKER_SILENCE_LEVEL";
+
+/// The threshold for a measured noise floor.
+pub fn adaptive_threshold(floor: f64) -> f64 {
+    (floor * NOISE_FACTOR).max(MIN_SILENCE_LEVEL)
+}
+
+/// `CLICKER_SILENCE_LEVEL` when set to a positive number; otherwise `None` (adaptive).
+pub fn silence_level_override() -> Option<f64> {
+    std::env::var(SILENCE_LEVEL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
 
 /// Rates tried in order when opening the device; the first the driver accepts is used.
 const DEVICE_RATES: [u32; 3] = [48_000, 44_100, SAMPLE_RATE];
@@ -68,36 +96,92 @@ pub fn trailing_silence_seconds(samples: &[i16], threshold: f64) -> f64 {
 
 /// Decides when a recording has trailed off. Silence ends a recording only once something was
 /// actually said, or the breath before the first word would cut the user off.
+///
+/// Either fixed ([`SilenceGate::new`]) or adaptive ([`SilenceGate::adaptive`]). The adaptive gate
+/// takes the noise floor as the quietest of the first [`CALIBRATION_BLOCKS`] blocks (the quietest,
+/// so a user who starts speaking at once does not inflate it), then uses [`adaptive_threshold`].
+/// Nothing counts as speech until the threshold is known; the calibration blocks are then judged
+/// against it like any other.
 #[derive(Debug, Clone)]
 pub struct SilenceGate {
     silence_seconds: f64,
-    threshold: f64,
+    threshold: Option<f64>,
+    floor: Option<f64>,
+    blocks_seen: usize,
     heard_speech: bool,
 }
 
 impl SilenceGate {
-    /// `silence_seconds` of 0 or less disables the silence stop.
+    /// A fixed threshold. `silence_seconds` of 0 or less disables the silence stop.
     pub fn new(silence_seconds: f64, threshold: f64) -> Self {
         SilenceGate {
             silence_seconds,
-            threshold,
+            threshold: Some(threshold),
+            floor: None,
+            blocks_seen: 0,
             heard_speech: false,
         }
     }
 
-    /// Feed the whole recording so far, of which `new` samples just arrived. True means stop.
-    pub fn should_stop(&mut self, all: &[i16], new: usize) -> bool {
+    /// A threshold set from the noise floor of the first ~0.3 s.
+    pub fn adaptive(silence_seconds: f64) -> Self {
+        SilenceGate {
+            threshold: None,
+            ..SilenceGate::new(silence_seconds, 0.0)
+        }
+    }
+
+    /// The measured noise floor, once calibrated (adaptive gates only).
+    pub fn floor(&self) -> Option<f64> {
+        self.floor
+    }
+
+    /// The threshold in use, once known.
+    pub fn threshold(&self) -> Option<f64> {
+        self.threshold
+    }
+
+    /// Whether a block above the threshold has been seen.
+    pub fn heard_speech(&self) -> bool {
+        self.heard_speech
+    }
+
+    /// Calibrate (if adaptive and enough audio has arrived) and judge any new whole blocks.
+    fn observe(&mut self, all: &[i16]) -> Option<f64> {
+        let complete = all.len() / BLOCK_FRAMES;
+        if self.threshold.is_none() {
+            if complete < CALIBRATION_BLOCKS {
+                return None;
+            }
+            let floor = all[..CALIBRATION_BLOCKS * BLOCK_FRAMES]
+                .chunks_exact(BLOCK_FRAMES)
+                .map(rms)
+                .fold(f64::INFINITY, f64::min);
+            self.floor = Some(floor);
+            self.threshold = Some(adaptive_threshold(floor));
+        }
+        let threshold = self.threshold?;
+        if !self.heard_speech && complete > self.blocks_seen {
+            self.heard_speech = all[self.blocks_seen * BLOCK_FRAMES..complete * BLOCK_FRAMES]
+                .chunks_exact(BLOCK_FRAMES)
+                .any(|b| !is_silent(b, threshold));
+        }
+        self.blocks_seen = complete;
+        Some(threshold)
+    }
+
+    /// Feed the whole recording so far. True means stop. Only whole [`BLOCK_FRAMES`] blocks are
+    /// judged for speech, so how the capture chunks the audio does not change the answer.
+    pub fn should_stop(&mut self, all: &[i16]) -> bool {
         if self.silence_seconds <= 0.0 {
             return false;
         }
-        if !self.heard_speech {
-            let fresh = &all[all.len() - new.min(all.len())..];
-            self.heard_speech = fresh
-                .chunks(BLOCK_FRAMES)
-                .any(|b| !is_silent(b, self.threshold));
+        let was_heard = self.heard_speech;
+        let Some(threshold) = self.observe(all) else {
             return false;
-        }
-        trailing_silence_seconds(all, self.threshold) >= self.silence_seconds
+        };
+        // The update that first hears speech never stops, as before.
+        was_heard && trailing_silence_seconds(all, threshold) >= self.silence_seconds
     }
 }
 
@@ -306,7 +390,10 @@ fn record(
 ) -> Result<Vec<i16>, String> {
     let mut device = Device::open()?;
     let mut resampler = Resampler::new(device.rate, SAMPLE_RATE);
-    let mut gate = SilenceGate::new(silence_seconds, SILENCE_LEVEL);
+    let mut gate = match silence_level_override() {
+        Some(level) => SilenceGate::new(silence_seconds, level),
+        None => SilenceGate::adaptive(silence_seconds),
+    };
     let deadline = Instant::now() + Duration::from_secs_f64(max_seconds.max(0.0));
     let mut out = Vec::new();
     let mut raw = Vec::new();
@@ -319,9 +406,8 @@ fn record(
             continue;
         }
         next = (next + 1) % BUFFERS;
-        let before = out.len();
         resampler.push(&raw, &mut out);
-        if gate.should_stop(&out, out.len() - before) {
+        if gate.should_stop(&out) {
             break;
         }
     }
@@ -400,7 +486,7 @@ mod tests {
         let mut stopped_at = None;
         for chunk in s.chunks(777) {
             fed.extend_from_slice(chunk);
-            if gate.should_stop(&fed, chunk.len()) {
+            if gate.should_stop(&fed) {
                 stopped_at = Some(fed.len());
                 break;
             }
@@ -417,7 +503,7 @@ mod tests {
         let mut fed = Vec::new();
         for chunk in quiet.chunks(1024) {
             fed.extend_from_slice(chunk);
-            assert!(!gate.should_stop(&fed, chunk.len()));
+            assert!(!gate.should_stop(&fed));
         }
     }
 
@@ -426,8 +512,8 @@ mod tests {
         let mut gate = SilenceGate::new(0.0, SILENCE_LEVEL);
         let mut s = tone(1024, 9000);
         s.extend(tone(64_000, 0));
-        assert!(!gate.should_stop(&s[..1024], 1024));
-        assert!(!gate.should_stop(&s, s.len() - 1024));
+        assert!(!gate.should_stop(&s[..1024]));
+        assert!(!gate.should_stop(&s));
     }
 
     #[test]
@@ -477,6 +563,114 @@ mod tests {
         assert_eq!(&w[36..40], b"data");
         assert_eq!(&w[40..44], &6u32.to_le_bytes());
         assert_eq!(&w[44..], &[1, 0, 0xFF, 0xFF, 0x34, 0x12]);
+    }
+
+    /// Pseudo-random noise at roughly the given RMS, like room tone or (loud) speech.
+    fn noise(n: usize, level: f64, seed: u32) -> Vec<i16> {
+        let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                // uniform in [-1, 1) has RMS 1/sqrt(3)
+                let u = (f64::from(x) / f64::from(u32::MAX)) * 2.0 - 1.0;
+                (u * level * 3f64.sqrt()) as i16
+            })
+            .collect()
+    }
+
+    fn feed(gate: &mut SilenceGate, s: &[i16], chunk: usize) -> Option<usize> {
+        let mut fed = Vec::new();
+        for c in s.chunks(chunk) {
+            fed.extend_from_slice(c);
+            if gate.should_stop(&fed) {
+                return Some(fed.len());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn adaptive_threshold_respects_the_minimum() {
+        assert_eq!(adaptive_threshold(35.0), MIN_SILENCE_LEVEL);
+        assert_eq!(adaptive_threshold(0.0), MIN_SILENCE_LEVEL);
+        assert_eq!(adaptive_threshold(100.0), 400.0);
+    }
+
+    #[test]
+    fn adaptive_quiet_room_then_speech_then_silence_stops() {
+        let mut s = noise(8_000, 35.0, 1); // 0.5 s room tone
+        s.extend(noise(16_000, 1500.0, 2)); // 1 s speech
+        let speech_end = s.len();
+        s.extend(noise(48_000, 40.0, 3)); // 3 s room tone
+        let mut gate = SilenceGate::adaptive(1.0);
+        let at = feed(&mut gate, &s, 768).expect("never stopped");
+        let floor = gate.floor().unwrap();
+        assert!((25.0..50.0).contains(&floor), "floor {floor}");
+        assert_eq!(gate.threshold(), Some(MIN_SILENCE_LEVEL));
+        assert!(gate.heard_speech());
+        let after = (at - speech_end) as f64 / f64::from(SAMPLE_RATE);
+        assert!((1.0..1.3).contains(&after), "stopped {after}s after speech");
+    }
+
+    #[test]
+    fn adaptive_pure_room_tone_never_counts_as_heard() {
+        // Room tone across the measured spread (blocks 30-44 RMS) plus a few louder blocks at 60.
+        let mut s = Vec::new();
+        for i in 0..80u32 {
+            let level = if i % 13 == 7 {
+                60.0
+            } else {
+                30.0 + f64::from(i % 15)
+            };
+            s.extend(noise(BLOCK_FRAMES, level, i + 10));
+        }
+        let mut gate = SilenceGate::adaptive(0.5);
+        assert_eq!(feed(&mut gate, &s, 1000), None);
+        assert!(!gate.heard_speech());
+        assert!(gate.threshold().is_some());
+    }
+
+    #[test]
+    fn adaptive_speech_from_the_first_block_is_heard() {
+        let mut s = noise(2 * BLOCK_FRAMES, 1500.0, 4);
+        s.extend(noise(3 * BLOCK_FRAMES, 35.0, 5));
+        s.extend(noise(32_000, 35.0, 6));
+        let mut gate = SilenceGate::adaptive(1.0);
+        assert!(feed(&mut gate, &s, 1024).is_some());
+        assert!(gate.heard_speech());
+        assert!(gate.floor().unwrap() < 50.0);
+    }
+
+    /// Records four seconds and prints the noise floor, the adaptive threshold and every block's
+    /// RMS. Opens the mic: stay quiet for the first half second, then speak.
+    /// `cargo test -p platform live_adaptive_gate -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_adaptive_gate() {
+        let s = record_until(|| false, 4.0, 0.0).expect("microphone");
+        let mut gate = SilenceGate::adaptive(1e9);
+        gate.should_stop(&s);
+        let threshold = gate.threshold().unwrap_or(f64::NAN);
+        println!(
+            "samples {} ({:.2}s), floor {:.1}, threshold {:.1} (K {NOISE_FACTOR}, min {MIN_SILENCE_LEVEL}), override {:?}",
+            s.len(),
+            s.len() as f64 / f64::from(SAMPLE_RATE),
+            gate.floor().unwrap_or(f64::NAN),
+            threshold,
+            silence_level_override()
+        );
+        for (i, b) in s.chunks_exact(BLOCK_FRAMES).enumerate() {
+            let r = rms(b);
+            println!(
+                "block {i:3} t {:.2}s rms {r:8.1} {}",
+                (i * BLOCK_FRAMES) as f64 / f64::from(SAMPLE_RATE),
+                if r >= threshold { "SPEECH" } else { "" }
+            );
+        }
+        println!("heard speech: {}", gate.heard_speech());
+        assert!(s.len() > 56_000);
     }
 
     /// Records two seconds of room tone and prints its per-block RMS distribution. Opens the mic.

@@ -9,45 +9,35 @@
 //!
 //! The goal does not change during a run, so this is computed once per run, not once per step.
 //!
-//! Configuration: `config.rs` is owned elsewhere during the port, so the three switches are read
-//! straight from the environment here, with the Python's names and defaults:
+//! Configuration comes from `config.rs`, with the Python's names and defaults:
 //! `CLICKER_CATALOG` (default on), `CLICKER_CATALOG_TITLES` (default on) and
 //! `CLICKER_CATALOG_LIMIT` (default 30).
 
 use crate::apps::{self, App};
 use crate::catalog::{self, urlsplit, Site};
+use crate::config;
 use crate::shortlist;
 
 pub const FALLBACK_SOURCE: &str = "pinned";
 
 /// Options handed to the site question; the cap is 255, but mass thins fast.
-pub const DEFAULT_CATALOG_LIMIT: usize = 30;
-
-fn env_flag(name: &str) -> bool {
-    let value = std::env::var(name).unwrap_or_else(|_| "1".to_string());
-    !matches!(
-        value.trim().to_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
+pub const DEFAULT_CATALOG_LIMIT: usize = config::DEFAULT_CATALOG_LIMIT as usize;
 
 /// `CLICKER_CATALOG`: off means the classifier sees only the pinned sites.
 pub fn catalog_enabled() -> bool {
-    env_flag("CLICKER_CATALOG")
+    config::catalog_enabled()
 }
 
 /// `CLICKER_CATALOG_TITLES`: whether a page title may become a site's label. Off means labels are
 /// bare domains, so no page title ever reaches the model.
 pub fn catalog_titles() -> bool {
-    env_flag("CLICKER_CATALOG_TITLES")
+    config::catalog_titles()
 }
 
 /// `CLICKER_CATALOG_LIMIT`. The Python raises on a malformed value; here it falls back to the
 /// default, since a typo in an environment variable should not stop a run.
 pub fn catalog_limit() -> usize {
-    std::env::var("CLICKER_CATALOG_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+    config::catalog_limit()
         .map(|n| n.max(0) as usize)
         .unwrap_or(DEFAULT_CATALOG_LIMIT)
 }
