@@ -82,7 +82,9 @@ impl Daemon {
     fn state_value(&self) -> Value {
         let s = self.runner.state();
         json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hotkeys,
-                "stt": self.listener.engine() })
+                "stt": self.listener.engine(),
+                "stt_lang": std::env::var("CLICKER_STT_LANG").ok().filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "en-US".into()) })
     }
 
     fn emit_state(&self) {
@@ -437,7 +439,8 @@ mod tests {
         let state = d.dispatch("state", &Value::Null).unwrap();
         assert_eq!(
             state,
-            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai" })
+            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai",
+                    "stt_lang": std::env::var("CLICKER_STT_LANG").unwrap_or_else(|_| "en-US".into()) })
         );
     }
 

@@ -29,6 +29,22 @@ winclicker "go to techcrunch and take me to the checkout page for the cheapest t
 and an Electron shell, with no Python, no uv and no terminal. The Python package below stays as
 the reference implementation that every Rust component was checked against on the same screen.
 
+### Getting started
+
+1. Run `Pointer Setup 0.1.0.exe` (from the releases, or build it below). The installer is not
+   signed yet, so Windows SmartScreen asks first: **More info → Run anyway**.
+2. Pointer opens on **Settings** the first time. Paste a `TYPESAFE_API_KEY` (decisions; get one at
+   [typesafe.ai](https://docs.typesafe.ai)) and, optionally, an `OPENAI_API_KEY` (typed text and spoken
+   answers). Save. Keys are stored in `%LOCALAPPDATA%\pointer\.env` and never shown again.
+3. Go to **Run**, leave **Dry run** on, and try a goal: *open YouTube and search for lo-fi*. Pointer
+   reads the screen, decides, and draws a box on what it would press. Nothing is clicked.
+4. Happy with what it points at? Switch to **Act** and run it again: now it clicks and types.
+   Move the mouse to the top-left corner of the main display, or press `Ctrl+Alt+X`, to stop it.
+5. Anywhere, press `Right Alt`: the command bar opens at the cursor and starts listening. Speak a
+   goal ("open my email"), a question ("what's on this screen?") or a command ("stop"), or type.
+
+Every run is saved under `runs\` with a screenshot per step; **History** replays them.
+
 | hotkey | does |
 |---|---|
 | `Right Alt` | opens the command bar at the cursor; type a goal or just speak |

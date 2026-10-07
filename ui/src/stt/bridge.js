@@ -61,7 +61,9 @@ function browserArgs(url, profile) {
   ];
 }
 
-function createBridge({ lang = process.env.CLICKER_STT_LANG || "en-US", log = () => {} } = {}) {
+function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-US", log = () => {} } = {}) {
+  let lang = initialLang;
+  let sweptOrphans = false;
   const token = crypto.randomBytes(24).toString("hex");
   let server = null;
   let port = 0;
@@ -162,8 +164,31 @@ function createBridge({ lang = process.env.CLICKER_STT_LANG || "en-US", log = ()
     return `http://127.0.0.1:${port}/${token}/stt.html?lang=${encodeURIComponent(lang)}`;
   }
 
+  // A speech browser left over from a force-killed Pointer would swallow the new launch (Chrome hands
+  // a second launch on the same profile to the running one). Only processes on OUR dedicated profile
+  // are matched, so the user's own browser is never touched. Once per session.
+  function sweepOrphans() {
+    if (sweptOrphans) return;
+    sweptOrphans = true;
+    const profile = profileDir().replace(/'/g, "''");
+    const script =
+      "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe'\" | " +
+      `Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${profile}') } | ` +
+      "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    try {
+      require("node:child_process").execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        stdio: "ignore",
+        windowsHide: true,
+        timeout: 8000,
+      });
+    } catch {
+      // Nothing to sweep, or PowerShell unavailable: launching still works, just possibly into the old one.
+    }
+  }
+
   function launch() {
     if (child && child.exitCode === null) return;
+    sweepOrphans();
     const proc = spawn(browser, browserArgs(pageUrl(), profileDir()), { stdio: "ignore", windowsHide: false });
     child = proc;
     proc.on("error", (e) => {
@@ -245,7 +270,13 @@ function createBridge({ lang = process.env.CLICKER_STT_LANG || "en-US", log = ()
     server = null;
   }
 
+  // The language comes from the core's settings once it is up; it applies to the next launch.
+  function setLang(next) {
+    if (next) lang = next;
+  }
+
   return {
+    setLang,
     start,
     stop,
     available,

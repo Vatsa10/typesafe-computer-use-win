@@ -47,7 +47,6 @@ fn hotkey_default(name: &str) -> String {
 pub fn catalog() -> Vec<Setting> {
     vec![
         secret("OPENAI_API_KEY", "OpenAI API key"),
-        secret("ANTHROPIC_API_KEY", "Anthropic API key"),
         secret("TYPESAFE_API_KEY", "TypeSafe API key"),
         row("CLICKER_BROWSER", "Browser", config::DEFAULT_BROWSER),
         row(
@@ -106,6 +105,7 @@ pub fn catalog() -> Vec<Setting> {
             "Speech-to-text engine",
             "auto (chrome, free)",
         ),
+        row("CLICKER_STT_LANG", "Speech language", "en-US"),
         row(
             "CLICKER_TRANSCRIBE_MODEL",
             "Transcription model",

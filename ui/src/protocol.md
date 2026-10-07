@@ -43,7 +43,7 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 
 ### Secrets
 
-`settings` lists `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `TYPESAFE_API_KEY` with `secret: true`,
+`settings` lists `OPENAI_API_KEY` and `TYPESAFE_API_KEY` with `secret: true`,
 an always-empty `value`, and a `fallback` that says only whether one is set. A secret's value never
 leaves the core, in a reply, an event or a log line. In `save_settings` an empty secret means
 "unchanged"; a non-empty one replaces the stored key. Keys not in the list are ignored. Saved values

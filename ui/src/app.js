@@ -62,4 +62,19 @@ async function refreshState() {
 
 nav.show("run");
 refreshState();
+firstRun();
+
+// A fresh install has no keys: without TYPESAFE_API_KEY nothing can be decided, so say so and open
+// Settings instead of letting the first Start fail. The row only ever says set or not set.
+async function firstRun() {
+  const rows = await call("settings", {}, { quiet: true });
+  const key = Array.isArray(rows) && rows.find((r) => r.key === "TYPESAFE_API_KEY");
+  if (!key || !/not set/i.test(key.fallback || "")) return;
+  nav.show("settings");
+  toast({
+    kind: "info",
+    title: "Add your TypeSafe key to start",
+    body: "Pointer decides each step with TypeSafe. Paste the key under API keys and save. Voice works without any key.",
+  });
+}
 setInterval(refreshState, 1000); // events carry the news; this only catches a missed one

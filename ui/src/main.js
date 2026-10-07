@@ -84,6 +84,7 @@ const speech = createBridge({ log: (text) => toPanel({ event: "line", text }) })
 
 async function sttEngine() {
   const reply = await call("state");
+  if (reply && reply.ok && reply.result.stt_lang) speech.setLang(reply.result.stt_lang);
   return reply && reply.ok ? reply.result.stt : "";
 }
 
