@@ -4,6 +4,7 @@
 //! the dispatch is tested with fakes and never records or registers anything.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use base64::Engine;
@@ -11,6 +12,7 @@ use serde_json::{json, Value};
 use wcore::runs_index;
 
 use crate::emit::Emitter;
+use crate::hotkeys::{self, Rebind};
 use crate::ipc::{Reply, Request};
 use crate::runner::{Events, Runner, Speaker};
 use crate::settings;
@@ -102,13 +104,27 @@ pub struct Daemon {
     pub out: Emitter,
     pub speaker: Speaker,
     pub paths: Paths,
-    pub hotkeys: String,
-    /// The push-to-talk key, when the talk hotkey parsed.
-    pub talk_vk: Option<u32>,
-    /// The push-to-dictate key, when the dictate hotkey parsed.
-    pub dictate_vk: Option<u32>,
+    /// The hint the shell shows: every binding by name. Changes with `set_hotkeys`.
+    pub hotkeys: Mutex<String>,
+    /// The push-to-talk key, 0 when the talk hotkey did not parse.
+    pub talk_vk: AtomicU32,
+    /// The push-to-dictate key, 0 when the dictate hotkey did not parse.
+    pub dictate_vk: AtomicU32,
     pub typer: Box<dyn Typer>,
     pub modes: Mutex<Modes>,
+    /// Re-registers the global hotkeys on the pump thread.
+    pub rebinder: Box<dyn Rebind>,
+    /// One `set_hotkeys` at a time: the file, the environment and the pump change together.
+    pub rebinding: Mutex<()>,
+}
+
+/// A held key as the atomics store it: 0 for none.
+pub fn vk_slot(vk: Option<u32>) -> AtomicU32 {
+    AtomicU32::new(vk.unwrap_or(0))
+}
+
+fn vk_read(slot: &AtomicU32) -> Option<u32> {
+    Some(slot.load(Ordering::SeqCst)).filter(|&vk| vk != 0)
 }
 
 fn param_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
@@ -132,7 +148,14 @@ pub fn hotkey_hint() -> String {
 
 impl Daemon {
     pub fn events(&self) -> Events {
-        Events::new(self.out.clone(), self.speaker.clone(), &self.hotkeys)
+        Events::new(self.out.clone(), self.speaker.clone(), &self.hint())
+    }
+
+    fn hint(&self) -> String {
+        self.hotkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn modes(&self) -> Modes {
@@ -141,7 +164,7 @@ impl Daemon {
 
     fn state_value(&self) -> Value {
         let s = self.runner.state();
-        json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hotkeys,
+        json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hint(),
                 "stt": self.listener.engine(),
                 "stt_lang": std::env::var("CLICKER_STT_LANG").ok().filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "en-US".into()) })
@@ -179,6 +202,8 @@ impl Daemon {
                 let written = settings::save(&self.paths.dotenv, values)?;
                 Ok(json!({ "saved": true, "keys": written }))
             }
+            "hotkeys" => Ok(hotkeys_value()),
+            "set_hotkeys" => self.set_hotkeys(params),
             "set_mode" => Ok(self.set_mode(params)),
             "listen_start" => {
                 if !self.modes().voice {
@@ -248,6 +273,46 @@ impl Daemon {
         }
     }
 
+    /// Validate, write `.env`, update the environment, re-register on the pump, and say so. A
+    /// single bad name refuses the lot before anything is written.
+    fn set_hotkeys(&self, params: &Value) -> Result<Value, String> {
+        let values = params
+            .get("values")
+            .and_then(Value::as_object)
+            .ok_or("set_hotkeys needs { values: { name: \"ctrl+alt+x\" } }")?;
+        let _one = self.rebinding.lock().unwrap_or_else(|p| p.into_inner());
+        let merged =
+            hotkeys::validate(values, &hotkeys::current()).map_err(|e| hotkeys::describe(&e))?;
+        let pairs: Vec<(String, String)> = merged
+            .iter()
+            .filter(|(n, _)| values.contains_key(n))
+            .map(|(n, spec)| (hotkeys::env_key(n), spec.clone()))
+            .collect();
+        wcore::config::write_env(&self.paths.dotenv, &pairs)
+            .map_err(|e| format!("could not write {}: {e}", self.paths.dotenv.display()))?;
+        for (key, spec) in &pairs {
+            std::env::set_var(key, spec);
+        }
+        let refused = self.rebinder.rebind(&merged)?;
+        self.talk_vk.store(
+            hotkeys::vk_of(&merged, "talk").unwrap_or(0),
+            Ordering::SeqCst,
+        );
+        self.dictate_vk.store(
+            hotkeys::vk_of(&merged, "dictate").unwrap_or(0),
+            Ordering::SeqCst,
+        );
+        *self.hotkeys.lock().unwrap_or_else(|p| p.into_inner()) = hotkey_hint();
+        for name in &refused {
+            self.out
+                .line(format!("hotkey for {name} is taken by another app"));
+        }
+        self.emit_state();
+        let applied: serde_json::Map<String, Value> =
+            merged.into_iter().map(|(n, s)| (n, json!(s))).collect();
+        Ok(json!({ "applied": applied, "refused": refused }))
+    }
+
     fn set_mode(&self, params: &Value) -> Value {
         let mut modes = self.modes.lock().unwrap_or_else(|p| p.into_inner());
         let flag = |key: &str, now: bool| params.get(key).and_then(Value::as_bool).unwrap_or(now);
@@ -301,6 +366,11 @@ impl Daemon {
 
     /// A hotkey fired. Runs on the input worker, never on the pump.
     pub fn on_hotkey(&self, name: &str) {
+        if name == "bar" || name == "goal" {
+            // The hotkey came to this process, so only this process may hand the foreground on:
+            // without the grant Windows' foreground lock keeps the bar the shell opens unfocused.
+            platform::input::allow_foreground_handoff();
+        }
         self.out.event("hotkey", json!({ "name": name }));
         let result = match name {
             "pause" => self
@@ -328,7 +398,7 @@ impl Daemon {
         if !self.modes().voice {
             return Err("voice is off".into());
         }
-        let vk = self.talk_vk.ok_or("the talk hotkey did not parse")?;
+        let vk = vk_read(&self.talk_vk).ok_or("the talk hotkey did not parse")?;
         let Some(said) = self.record_held(vk, Purpose::Talk)? else {
             return Ok(());
         };
@@ -362,7 +432,7 @@ impl Daemon {
         if !self.modes().voice {
             return Err("voice is off".into());
         }
-        let vk = self.dictate_vk.ok_or("the dictate hotkey did not parse")?;
+        let vk = vk_read(&self.dictate_vk).ok_or("the dictate hotkey did not parse")?;
         self.refuse_while_acting()?;
         if let Some(said) = self.record_held(vk, Purpose::Dictate)? {
             self.dictate(&said)?;
@@ -404,6 +474,15 @@ pub fn data_url(path: &Path) -> String {
         ),
         Err(_) => String::new(),
     }
+}
+
+/// Every hotkey now in force, every default, and the names in settings order.
+fn hotkeys_value() -> Value {
+    let object = |pairs: Vec<(String, String)>| -> serde_json::Map<String, Value> {
+        pairs.into_iter().map(|(n, s)| (n, json!(s))).collect()
+    };
+    json!({ "names": hotkeys::names(), "current": object(hotkeys::current()),
+            "defaults": object(hotkeys::defaults()) })
 }
 
 fn displays() -> Value {
@@ -493,6 +572,19 @@ mod tests {
         }
     }
 
+    /// Records each rebind's specs; reports `refused` as taken.
+    #[derive(Clone, Default)]
+    struct FakeRebind {
+        seen: Arc<Mutex<Vec<hotkeys::Specs>>>,
+        refused: Vec<String>,
+    }
+    impl Rebind for FakeRebind {
+        fn rebind(&self, specs: &[(String, String)]) -> Result<Vec<String>, String> {
+            self.seen.lock().unwrap().push(specs.to_vec());
+            Ok(self.refused.clone())
+        }
+    }
+
     struct FakeMic;
     impl Listener for FakeMic {
         fn start(&self) -> Result<bool, String> {
@@ -542,6 +634,7 @@ mod tests {
     fn daemon_typing(runner: Box<dyn Runner>, dir: &Path) -> (Daemon, Captured, FakeTyper) {
         let captured = Captured::default();
         let typer = FakeTyper::default();
+        let rebinds = FakeRebind::default();
         let d = Daemon {
             runner,
             listener: Box::new(FakeMic),
@@ -551,11 +644,13 @@ mod tests {
                 runs: dir.join("runs"),
                 dotenv: dir.join(".env"),
             },
-            hotkeys: "rightalt bar".into(),
-            talk_vk: Some(0x20),
-            dictate_vk: Some(0x44),
+            hotkeys: Mutex::new("rightalt bar".into()),
+            talk_vk: vk_slot(Some(0x20)),
+            dictate_vk: vk_slot(Some(0x44)),
             typer: Box::new(typer.clone()),
             modes: Mutex::new(Modes::default()),
+            rebinder: Box::new(rebinds.clone()),
+            rebinding: Mutex::new(()),
         };
         (d, captured, typer)
     }
@@ -872,6 +967,94 @@ mod tests {
             .dispatch("shot", &json!({ "name": "20260101-120000", "number": 9 }))
             .unwrap();
         assert_eq!(missing["data_url"], "");
+    }
+
+    #[test]
+    fn set_hotkeys_refuses_all_on_one_bad_name_then_applies_live() {
+        let dir = tmp("sethotkeys");
+        std::fs::write(
+            dir.join(".env"),
+            "OPENAI_API_KEY=sk-keep
+",
+        )
+        .unwrap();
+        let (mut d, captured) = daemon(Box::new(Unwired), &dir);
+        let rebinds = FakeRebind {
+            refused: vec!["quit".into()],
+            ..FakeRebind::default()
+        };
+        d.rebinder = Box::new(rebinds.clone());
+        let before = std::fs::read_to_string(dir.join(".env")).unwrap();
+
+        let err = d
+            .dispatch(
+                "set_hotkeys",
+                &json!({ "values": { "talk": "ctrl+alt+t", "bar": "ctrl+nope" } }),
+            )
+            .unwrap_err();
+        assert!(err.contains("bar: ") && !err.contains("talk:"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), before);
+        assert!(
+            rebinds.seen.lock().unwrap().is_empty(),
+            "nothing re-registered"
+        );
+        let dup = d
+            .dispatch(
+                "set_hotkeys",
+                &json!({ "values": { "talk": "ctrl+alt+t", "dictate": "Ctrl+Alt+T" } }),
+            )
+            .unwrap_err();
+        assert!(dup.contains("same keys"), "{dup}");
+        assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), before);
+
+        let reply = d
+            .dispatch(
+                "set_hotkeys",
+                &json!({ "values": { "talk": "ctrl+alt+t", "dictate": "rightctrl" } }),
+            )
+            .unwrap();
+        // Restore the process environment before asserting, for the other tests.
+        let after_talk = std::env::var("CLICKER_HOTKEY_TALK");
+        std::env::remove_var("CLICKER_HOTKEY_TALK");
+        std::env::remove_var("CLICKER_HOTKEY_DICTATE");
+        assert_eq!(after_talk.as_deref(), Ok("ctrl+alt+t"));
+        assert_eq!(reply["applied"]["talk"], "ctrl+alt+t");
+        assert_eq!(reply["applied"]["dictate"], "rightctrl");
+        assert_eq!(reply["applied"].as_object().unwrap().len(), 7);
+        assert_eq!(reply["refused"], json!(["quit"]));
+        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert!(text.contains("OPENAI_API_KEY=sk-keep"));
+        assert!(text.contains("CLICKER_HOTKEY_TALK=ctrl+alt+t"));
+        assert!(text.contains("CLICKER_HOTKEY_DICTATE=rightctrl"));
+        assert!(
+            !text.contains("CLICKER_HOTKEY_BAR"),
+            "only the names given are written"
+        );
+        assert_eq!(rebinds.seen.lock().unwrap().len(), 1);
+        assert_eq!(vk_read(&d.talk_vk), Some(b'T' as u32));
+        assert_eq!(vk_read(&d.dictate_vk), Some(0xA3));
+        let hint = d.hint();
+        assert!(hint.contains("ctrl+alt+t talk"), "{hint}");
+        let state = captured
+            .messages()
+            .into_iter()
+            .rfind(|m| m["event"] == "state")
+            .unwrap();
+        assert_eq!(state["hotkeys"], json!(hint));
+        assert!(lines(&captured).iter().any(|l| l.contains("quit is taken")));
+    }
+
+    #[test]
+    fn hotkeys_lists_current_and_defaults() {
+        let dir = tmp("hotkeys");
+        let (d, _) = daemon(Box::new(Unwired), &dir);
+        let v = d.dispatch("hotkeys", &Value::Null).unwrap();
+        assert_eq!(v["names"].as_array().unwrap().len(), 7);
+        assert_eq!(v["defaults"]["bar"], "rightalt");
+        assert!(v["current"]["abort"].is_string());
+        assert!(d
+            .dispatch("set_hotkeys", &json!({ "values": "nope" }))
+            .is_err());
     }
 
     #[test]

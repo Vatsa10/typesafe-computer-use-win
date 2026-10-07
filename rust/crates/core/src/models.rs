@@ -99,6 +99,24 @@ impl std::fmt::Display for Abort {
 
 impl std::error::Error for Abort {}
 
+/// Where the mouse is, and what it is over. People point at what they are asking about, so "this",
+/// "here" and "that" mean whatever is under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointerInfo {
+    /// Virtual-desktop physical pixels, like every window rectangle. May be negative.
+    pub x: f64,
+    pub y: f64,
+    /// The display the mouse is on.
+    pub monitor: usize,
+    /// Seconds since the last mouse or keyboard input, when Windows would say.
+    pub idle_seconds: Option<f64>,
+    /// The control under the mouse, never one of Pointer's own windows.
+    pub under: Option<platform::uia::Under>,
+    /// The top window (app, title) on the mouse's display, filled only when that display is not
+    /// the one being read and the mouse moved recently: the user is looking there.
+    pub display_window: Option<(String, String)>,
+}
+
 /// Everything captured about the machine at one instant.
 ///
 /// Not `Send`: accessibility handles are COM pointers bound to the thread that fetched them, so a
@@ -127,11 +145,16 @@ pub struct Screen {
     pub ax_refs: std::collections::HashMap<usize, platform::uia::PressHandle>,
     /// Labelled controls the app exposes but does not show: reachable by a press, never by a pixel.
     pub offscreen: Vec<platform::uia::Node>,
+    /// The mouse, when it could be found.
+    pub pointer: Option<PointerInfo>,
 }
 
 impl Screen {
     pub fn size_pt(&self) -> (f64, f64) {
-        (self.width as f64 / self.scale, self.height as f64 / self.scale)
+        (
+            self.width as f64 / self.scale,
+            self.height as f64 / self.scale,
+        )
     }
 
     /// Which ninth of the screen an item sits in, in words.
@@ -149,7 +172,33 @@ impl Screen {
     /// the item had it subtracted exactly once on the way in.
     pub fn to_points(&self, item: &Item) -> (f64, f64) {
         let (cx, cy) = item.center();
-        (self.origin.0 + cx / self.scale, self.origin.1 + cy / self.scale)
+        (
+            self.origin.0 + cx / self.scale,
+            self.origin.1 + cy / self.scale,
+        )
+    }
+
+    /// The mouse in this capture's pixels: the origin subtracted exactly once, as for items.
+    pub fn pointer_px(&self) -> Option<(f64, f64)> {
+        let p = self.pointer.as_ref()?;
+        Some((
+            (p.x - self.origin.0) * self.scale,
+            (p.y - self.origin.1) * self.scale,
+        ))
+    }
+
+    /// The item the mouse is over: the smallest one whose box holds the mouse, so a button inside
+    /// a toolbar wins over the toolbar. None when the mouse is on another display.
+    pub fn under_mouse(&self, items: &[Item]) -> Option<usize> {
+        let (px, py) = self.pointer_px()?;
+        items
+            .iter()
+            .filter(|it| it.x1 <= px && px <= it.x2 && it.y1 <= py && py <= it.y2)
+            .min_by(|a, b| {
+                let area = |it: &&Item| (it.x2 - it.x1) * (it.y2 - it.y1);
+                area(a).total_cmp(&area(b))
+            })
+            .map(|it| it.index)
     }
 }
 
@@ -158,7 +207,17 @@ mod tests {
     use super::*;
 
     fn item(x1: f64, y1: f64, x2: f64, y2: f64) -> Item {
-        Item { index: 0, text: "x".into(), ocr_confidence: 1.0, x1, y1, x2, y2, role: String::new(), source: "ocr".into() }
+        Item {
+            index: 0,
+            text: "x".into(),
+            ocr_confidence: 1.0,
+            x1,
+            y1,
+            x2,
+            y2,
+            role: String::new(),
+            source: "ocr".into(),
+        }
     }
 
     fn screen(origin: (f64, f64)) -> Screen {
@@ -178,7 +237,45 @@ mod tests {
             monitors: Vec::new(),
             ax_refs: Default::default(),
             offscreen: Vec::new(),
+            pointer: None,
         }
+    }
+
+    fn at_mouse(x: f64, y: f64) -> Option<PointerInfo> {
+        Some(PointerInfo {
+            x,
+            y,
+            monitor: 1,
+            idle_seconds: Some(1.0),
+            under: None,
+            display_window: None,
+        })
+    }
+
+    #[test]
+    fn the_item_under_the_mouse_has_the_origin_subtracted_once() {
+        // The display above the primary: origin (1, -1440). The mouse at (51, -1430) is item
+        // pixel (50, 10): inside the small button, inside the big toolbar too.
+        let mut s = screen((1.0, -1440.0));
+        s.pointer = at_mouse(51.0, -1430.0);
+        let mut toolbar = item(0.0, 0.0, 400.0, 40.0);
+        toolbar.index = 1;
+        let mut button = item(40.0, 0.0, 60.0, 20.0);
+        button.index = 2;
+        let mut far = item(500.0, 500.0, 600.0, 600.0);
+        far.index = 3;
+        assert_eq!(
+            s.under_mouse(&[toolbar.clone(), button.clone(), far.clone()]),
+            Some(2)
+        );
+        assert_eq!(s.to_points(&button), (51.0, -1430.0));
+        // Treating the virtual-desktop point as capture pixels would have missed every item.
+        assert_eq!(s.under_mouse(&[far]), None);
+        // Mouse on another display entirely: nothing here is under it.
+        s.pointer = at_mouse(51.0, 300.0);
+        assert_eq!(s.under_mouse(&[toolbar, button]), None);
+        s.pointer = None;
+        assert_eq!(s.pointer_px(), None);
     }
 
     #[test]
@@ -190,15 +287,24 @@ mod tests {
 
     #[test]
     fn a_click_on_the_primary_is_unchanged() {
-        assert_eq!(screen((0.0, 0.0)).to_points(&item(100.0, 100.0, 200.0, 200.0)), (150.0, 150.0));
+        assert_eq!(
+            screen((0.0, 0.0)).to_points(&item(100.0, 100.0, 200.0, 200.0)),
+            (150.0, 150.0)
+        );
     }
 
     #[test]
     fn regions_split_the_capture_into_ninths() {
         let s = screen((0.0, 0.0));
         assert_eq!(s.region(&item(0.0, 0.0, 10.0, 10.0)), "top-left");
-        assert_eq!(s.region(&item(1270.0, 710.0, 1290.0, 730.0)), "middle-center");
-        assert_eq!(s.region(&item(2550.0, 1430.0, 2560.0, 1440.0)), "bottom-right");
+        assert_eq!(
+            s.region(&item(1270.0, 710.0, 1290.0, 730.0)),
+            "middle-center"
+        );
+        assert_eq!(
+            s.region(&item(2550.0, 1430.0, 2560.0, 1440.0)),
+            "bottom-right"
+        );
     }
 
     #[test]
@@ -211,8 +317,16 @@ mod tests {
 
     #[test]
     fn a_text_field_is_recognised_and_a_button_is_not() {
-        let mut f = Field { role: "AXTextField".into(), label: String::new(), placeholder: String::new(),
-                            value: String::new(), x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        let mut f = Field {
+            role: "AXTextField".into(),
+            label: String::new(),
+            placeholder: String::new(),
+            value: String::new(),
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
         assert!(f.is_text());
         f.role = "AXButton".into();
         assert!(!f.is_text());

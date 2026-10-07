@@ -234,11 +234,16 @@ export function createHotkeysSection() {
       status.textContent = refused.size ? `${names.length - refused.size} applied, ${refused.size} refused` : "Hotkeys applied";
     } else {
       const message = (reply && reply.error) || "the core did not answer";
-      // The core may name the action in its message; put it on that row when it does.
+      // The core packs one reason per action: "hotkeys not saved: goal: <why>; abort: <why>".
+      const reasons = new Map();
+      for (const part of message.replace(/^hotkeys not saved:\s*/, "").split(/;\s*/)) {
+        const m = part.match(/^(\w+):\s*(.+)$/);
+        if (m) reasons.set(m[1], m[2]);
+      }
       let placed = false;
       for (const n of names) {
-        if (new RegExp(`\\b${n}\\b`).test(message)) {
-          rows.get(n).result = { kind: "danger", text: message };
+        if (reasons.has(n)) {
+          rows.get(n).result = { kind: "danger", text: reasons.get(n) };
           placed = true;
         }
       }

@@ -236,6 +236,14 @@ pub fn base_state(goal: &str, screen: &Screen, items: &[Item], history: &[String
             .unwrap_or(Value::Null),
     );
     state.insert("previous_actions".into(), json!(last(history, 8)));
+    let under = screen.under_mouse(items);
+    if let Some(p) = &screen.pointer {
+        // A deictic goal ("click this") is the item flagged under_mouse: no action of its own.
+        state.insert(
+            "pointer".into(),
+            worldmodel::pointer_record(p, screen.monitor, under),
+        );
+    }
     let rows: Vec<Value> = items
         .iter()
         .map(|it| {
@@ -248,6 +256,9 @@ pub fn base_state(goal: &str, screen: &Screen, items: &[Item], history: &[String
             }
             if let Some(h) = hints.get(&it.index) {
                 row.insert("when".into(), json!(h));
+            }
+            if under == Some(it.index) {
+                row.insert("under_mouse".into(), json!(true));
             }
             Value::Object(row)
         })
@@ -553,6 +564,7 @@ pub(crate) mod tests {
             monitors: Vec::new(),
             ax_refs: Default::default(),
             offscreen: Vec::new(),
+            pointer: None,
         }
     }
 
@@ -568,6 +580,60 @@ pub(crate) mod tests {
             role: String::new(),
             source: "ocr".into(),
         }
+    }
+
+    /// The mouse over the "Settings" row of `pointed_items`, on a display at (1, -1440).
+    pub(crate) fn pointed_screen() -> Screen {
+        let mut s = screen();
+        s.origin = (1.0, -1440.0);
+        s.monitor = 1;
+        // Item pixels (250, 115) at scale 2: the origin is subtracted once, then scaled.
+        s.pointer = Some(crate::models::PointerInfo {
+            x: 126.0,
+            y: -1382.5,
+            monitor: 1,
+            idle_seconds: Some(0.4),
+            under: Some(platform::uia::Under {
+                role: "AXButton".into(),
+                label: "Settings".into(),
+                x: 126.0,
+                y: -1390.0,
+                w: 150.0,
+                h: 15.0,
+            }),
+            display_window: None,
+        });
+        s
+    }
+
+    pub(crate) fn pointed_items() -> Vec<Item> {
+        vec![
+            make_item(0, "File", 10.0, 30.0),
+            make_item(1, "Settings", 100.0, 130.0),
+        ]
+    }
+
+    #[test]
+    fn base_state_tells_where_the_mouse_is_and_flags_the_item_under_it() {
+        let state = base_state("click this", &pointed_screen(), &pointed_items(), &[]);
+        let pointer = &state["pointer"];
+        assert_eq!(pointer["display"], 2);
+        assert_eq!(pointer["on_display_being_read"], true);
+        assert_eq!(pointer["over"], "button 'Settings'");
+        assert_eq!(pointer["item_under_mouse"], 1);
+        let summary = pointer["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("the mouse is at (126, -1382)") || summary.contains("(126, -1383)")
+        );
+        assert!(summary.contains("over button 'Settings'"), "{summary}");
+        assert!(pointer["note"].as_str().unwrap().contains("'this'"));
+        let rows = state["screen_items_in_reading_order"].as_array().unwrap();
+        assert_eq!(rows[1]["under_mouse"], true);
+        assert!(rows[0].get("under_mouse").is_none());
+        // No mouse: no pointer key and no flags.
+        let state = base_state("g", &screen(), &pointed_items(), &[]);
+        assert!(state.get("pointer").is_none());
+        assert!(!state.to_string().contains("under_mouse"));
     }
 
     fn d(

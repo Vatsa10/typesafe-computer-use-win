@@ -286,7 +286,7 @@ pub struct PerceptionEyes<'a>(pub &'a dyn perception::Desktop);
 
 impl Eyes for PerceptionEyes<'_> {
     fn capture(&self, browser: &str) -> Result<Screen, String> {
-        perception::capture(self.0, browser, None)
+        perception::capture_at(self.0, browser, None, perception::Focus::Mouse)
     }
 
     fn perceive(
@@ -325,6 +325,7 @@ fn copy_screen(s: &Screen) -> Screen {
         monitors: s.monitors.clone(),
         ax_refs: s.ax_refs.clone(),
         offscreen: s.offscreen.clone(),
+        pointer: s.pointer.clone(),
     }
 }
 

@@ -38,6 +38,8 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `shot` | `{ name, number }` | `{ data_url }` — a `data:image/png;base64,...` URL, `""` when there is no capture |
 | `settings` | — | `[ { key, label, value, fallback, secret } ]` |
 | `save_settings` | `{ values: { KEY: value } }` | `{ saved: true, keys: [KEY...] }` — names only, never values |
+| `hotkeys` | — | `{ names: [...], current: { name: spec }, defaults: { name: spec } }` for `talk`, `dictate`, `bar`, `goal`, `pause`, `abort`, `quit` (in that order) |
+| `set_hotkeys` | `{ values: { name: "ctrl+alt+x", ... } }` (any subset of the names) | `{ applied: { name: spec } (all seven, as now in force), refused: [name...] }` — applied live, no restart; see below |
 
 `name` must be a bare run folder name; anything with a separator or `..` is refused.
 
@@ -47,7 +49,30 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 an always-empty `value`, and a `fallback` that says only whether one is set. A secret's value never
 leaves the core, in a reply, an event or a log line. In `save_settings` an empty secret means
 "unchanged"; a non-empty one replaces the stored key. Keys not in the list are ignored. Saved values
-take effect in the running core at once, except hotkeys, which need a restart.
+take effect in the running core at once, except `CLICKER_HOTKEY_*` saved this way, which wait for a
+restart; change hotkeys with `set_hotkeys` instead.
+
+### Hotkeys
+
+`set_hotkeys` checks every given name before anything is written: an unknown name, a non-string, a
+spec that does not parse (`modifier+...+key`, modifiers `ctrl`/`alt`/`shift`/`win`, a letter, digit,
+`f1`–`f12` or a named key such as `space`, `rightalt`, `pause`), or two names on the same keys
+(compared parsed, so `Ctrl+Alt+X` equals `ctrl+alt+x`) fails the request with
+`error: "hotkeys not saved: bar: <reason>; talk: <reason>"` and leaves `.env`, the environment and the
+registered keys untouched. Otherwise the given names are written to `.env` as `CLICKER_HOTKEY_<NAME>`,
+the environment is updated, and the core re-registers every hotkey on its pump thread (the old set is
+released first). `refused` lists names whose keys another app already owns: those are saved but do
+not fire until changed or freed, and each also gets a `line`. A `state` event with the new `hotkeys`
+hint follows. Held keys (`talk`, `dictate`) switch at once too. With `CLICKER_NO_HOTKEYS=1` the keys
+are saved and `refused` is always empty.
+
+### Foreground handoff
+
+Windows only lets the process that received the last input bring a window to the front. A global
+hotkey is delivered to the core, not the shell, so before the core emits `hotkey` for `bar` or
+`goal` it calls `AllowSetForegroundWindow(ASFW_ANY)`. The shell may then focus the window it opens
+(`win.show(); win.focus()`) as soon as it receives the event; the grant lapses at the next input, so
+focus promptly rather than after an animation.
 
 ### Voice
 
@@ -112,12 +137,27 @@ pointing. Who points:
   no `point`. Teaching ends with `{ clear: true }`. A spoken "stop" (or the abort hotkey) ends it
   between steps; the steps are about the capture taken when the question was asked.
 
+### Pointer context
+
+Every capture records the mouse: its position (physical virtual-desktop pixels), its display,
+seconds since the last input, and the control under it (UI Automation `ElementFromPoint`, never one
+of Pointer's own windows: the shell's pid in `POINTER_UI_PID`, or the titles `Pointer buddy` and
+`Pointer speech`). Questions (`ask`, spoken questions, teach) read the display **under the mouse**,
+since people point at what they ask about; goals read the display of the foreground window, and when
+the mouse moved in the last 10 s on another display, that display's top window is named too. The
+models are told `the mouse is at (x, y) on display N over <role> '<label>'`, that "this", "here" and
+"that" mean what is under the mouse, and which listed item contains the mouse (`under_mouse: true`),
+so "click this" or "what does this do?" resolve to it. Answers also get every display and the
+windows open on all of them, so "what's on my other screen" is answered at least by window titles.
+None of this adds an event or a field to the protocol.
+
 The shell's buddy window is titled exactly `Pointer buddy`; the core's window survey skips that
 title, as it does `Pointer speech`.
 
 The core handles `pause`, `abort` and `quit` hotkeys itself (quit aborts the run; closing the app
 is the shell's call) and `talk` records while the key is held and routes what it heard, as `say`
-does. `bar` and `goal` only open windows, which is the shell's job.
+does. `bar` and `goal` only open windows, which is the shell's job (after the foreground handoff
+above).
 
 ## Dictation
 

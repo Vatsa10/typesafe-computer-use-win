@@ -100,6 +100,34 @@ fn is_buddy_window(title: &str) -> bool {
     title == BUDDY_WINDOW_TITLE
 }
 
+/// Whether a window is one of Pointer's own: this core, the Electron shell (its pid comes in as
+/// `POINTER_UI_PID`), or the shell's speech and buddy windows, which run in a browser process and
+/// are known only by their exact titles. Nothing of ours is ever read as an app on screen.
+pub fn is_own_window(pid: u32, title: &str, own_pid: u32, ui_pid: Option<u32>) -> bool {
+    pid == own_pid || Some(pid) == ui_pid || is_speech_window(title) || is_buddy_window(title)
+}
+
+/// The shell's pid, when the shell started this core and said so.
+pub fn ui_pid() -> Option<u32> {
+    std::env::var("POINTER_UI_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+}
+
+/// The top-level window under a point, as (pid, title). Physical pixels on the virtual desktop.
+pub fn top_level_at(x: i32, y: i32) -> Option<(u32, String)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
+    // SAFETY: plain value arguments; a null result means no window.
+    let hwnd = unsafe { WindowFromPoint(POINT { x, y }) };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let root = if root.0.is_null() { hwnd } else { root };
+    Some((pid_of(root), window_title(root)))
+}
+
 /// Foreground first, then by monitor, then z-order. `z` is the position `EnumWindows` gave it,
 /// which is front-to-back within a monitor.
 fn order_key(info: &WindowInfo, z: usize) -> (u8, usize, usize) {
@@ -199,9 +227,7 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
     let own_pid = unsafe { GetCurrentProcessId() };
     // The panel is a different process from this core: Electron starts the core and passes its own
     // pid. Its windows are ours too, or a run reads its own panel as the app to work in.
-    let ui_pid = std::env::var("POINTER_UI_PID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let ui_pid = ui_pid();
     let front = foreground();
     let mut found: Vec<(usize, WindowInfo)> = Vec::new();
     for (z, hwnd) in top_level_windows().into_iter().enumerate() {
@@ -212,9 +238,7 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
             continue;
         };
         let minimized = minimized_from(unsafe { IsIconic(hwnd) }.as_bool(), rect);
-        if Some(pid) == ui_pid
-            || is_speech_window(&title)
-            || is_buddy_window(&title)
+        if is_own_window(pid, &title, own_pid, ui_pid)
             || !is_real_window(visible, &title, pid, own_pid, minimized, rect, min_side)
         {
             continue;
@@ -380,6 +404,16 @@ mod tests {
         assert!(!is_buddy_window("Pointer buddy - Notes"));
         assert!(!is_buddy_window("pointer buddy"));
         assert!(!is_buddy_window("Pointer speech"));
+    }
+
+    #[test]
+    fn own_windows_are_ours_by_pid_or_exact_title() {
+        assert!(is_own_window(10, "Pointer", 10, None));
+        assert!(is_own_window(22, "Pointer", 10, Some(22)));
+        assert!(is_own_window(33, "Pointer buddy", 10, Some(22)));
+        assert!(is_own_window(33, "Pointer speech", 10, None));
+        assert!(!is_own_window(33, "Pointer buddy - Notes", 10, Some(22)));
+        assert!(!is_own_window(33, "Inbox - Outlook", 10, Some(22)));
     }
 
     #[test]

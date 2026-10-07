@@ -18,7 +18,7 @@ use platform::uia::{Hit, Node, Walked, WalkedOf};
 use platform::winlist::{WindowInfo, MIN_WINDOW_SIDE_PX};
 
 use crate::config::{MAX_OPTIONS, MIN_OCR_CONFIDENCE};
-use crate::models::{role_word, Field, Item, PixelBox, Screen};
+use crate::models::{role_word, Field, Item, PixelBox, PointerInfo, Screen};
 use crate::timing::{phase, Timing, OCR_RECTS, OCR_REGION_PCT};
 use crate::worldmodel::{rank, MAX_WINDOWS};
 
@@ -71,6 +71,15 @@ pub trait Desktop {
     fn ocr(&self, bgra: &[u8], width: u32, height: u32) -> Vec<Line>;
     /// The labelled controls of one window, never of a whole process.
     fn walk(&self, hwnd: isize, display_w: f64, display_h: f64, origin: (f64, f64)) -> Walked;
+    /// The mouse in virtual-desktop pixels, and seconds since the last input. None by default, so
+    /// a fake that does not care has no mouse.
+    fn pointer(&self) -> Option<(f64, f64, Option<f64>)> {
+        None
+    }
+    /// The control under a virtual-desktop point, never one of Pointer's own windows.
+    fn element_at(&self, _x: f64, _y: f64) -> Option<platform::uia::Under> {
+        None
+    }
 }
 
 /// The real desktop.
@@ -144,6 +153,15 @@ impl Desktop for LiveDesktop {
     fn walk(&self, hwnd: isize, display_w: f64, display_h: f64, origin: (f64, f64)) -> Walked {
         platform::uia::walk_window(hwnd, display_w, display_h, origin)
     }
+
+    fn pointer(&self) -> Option<(f64, f64, Option<f64>)> {
+        let (x, y) = platform::display::cursor_position();
+        Some((x as f64, y as f64, platform::input::idle_seconds()))
+    }
+
+    fn element_at(&self, x: f64, y: f64) -> Option<platform::uia::Under> {
+        platform::uia::element_at(x.round() as i32, y.round() as i32)
+    }
 }
 
 /// The URL among a window's text controls, given as (role, label, value): the omnibox by its
@@ -190,6 +208,18 @@ pub struct Survey {
     pub target: Option<WindowInfo>,
 }
 
+/// Which display a capture reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The display holding the foreground window: a goal is about the window being worked in.
+    Foreground,
+    /// The display under the mouse: a question is about what the user is pointing at.
+    Mouse,
+}
+
+/// The mouse counts as "being used" for this long after the last input.
+pub const RECENT_MOUSE_SECONDS: f64 = 10.0;
+
 /// The display holding the foreground window, and that window.
 ///
 /// The foreground is the handle Windows reports, looked up in the unranked inventory, never the
@@ -198,6 +228,43 @@ pub struct Survey {
 /// read is the top-ranked one someone else owns. The monitor comes from the record, which asked
 /// `monitor_of`, so a minimized window is placed on its real display, not at -32000.
 pub fn survey(desktop: &dyn Desktop) -> Survey {
+    survey_for(desktop, Focus::Foreground, None)
+}
+
+/// [`survey`], or with [`Focus::Mouse`] and a mouse point, the display under the mouse and the
+/// window being read there: the foreground one when it is on that display, else the top-ranked
+/// window on it that is not ours.
+pub fn survey_for(desktop: &dyn Desktop, focus: Focus, mouse: Option<(f64, f64)>) -> Survey {
+    let s = survey_foreground(desktop);
+    let (Focus::Mouse, Some((x, y))) = (focus, mouse) else {
+        return s;
+    };
+    if s.monitors.is_empty() {
+        return s;
+    }
+    let which = platform::display::index_at(&s.monitors, x.round() as i32, y.round() as i32);
+    if which == s.which || which >= s.monitors.len() {
+        return s;
+    }
+    let own = desktop.own_pid();
+    let target = top_window_on(&s.windows, which, own).cloned();
+    let m = &s.monitors[which];
+    Survey {
+        origin: (m.left as f64, m.top as f64),
+        which,
+        target,
+        ..s
+    }
+}
+
+/// The best-ranked window on one display that is not ours and not minimized.
+pub fn top_window_on(ranked: &[WindowInfo], monitor: usize, own_pid: u32) -> Option<&WindowInfo> {
+    ranked
+        .iter()
+        .find(|w| w.monitor == monitor && w.pid != own_pid && !w.minimized)
+}
+
+fn survey_foreground(desktop: &dyn Desktop) -> Survey {
     let monitors = desktop.monitors();
     let all = desktop.open_windows();
     let windows = rank(&all, MAX_WINDOWS);
@@ -280,9 +347,24 @@ pub fn window_bounds(window: &WindowInfo) -> Option<(f64, f64, f64, f64)> {
 pub fn capture(
     desktop: &dyn Desktop,
     browser: &str,
-    mut timing: Option<&mut Timing>,
+    timing: Option<&mut Timing>,
 ) -> Result<Screen, String> {
-    let s = phase(timing.as_deref_mut(), "world", || survey(desktop));
+    capture_at(desktop, browser, timing, Focus::Foreground)
+}
+
+/// [`capture`] with the display chosen by `focus`. Either way the mouse is recorded on the
+/// screen: where it is, what control it is over, and, when it moved recently on a display other
+/// than the one read, that display's top window.
+pub fn capture_at(
+    desktop: &dyn Desktop,
+    browser: &str,
+    mut timing: Option<&mut Timing>,
+    focus: Focus,
+) -> Result<Screen, String> {
+    let mouse = desktop.pointer();
+    let s = phase(timing.as_deref_mut(), "world", || {
+        survey_for(desktop, focus, mouse.map(|(x, y, _)| (x, y)))
+    });
     let shot = phase(timing.as_deref_mut(), "screenshot", || {
         desktop.screenshot(s.monitors.get(s.which))
     })
@@ -308,6 +390,7 @@ pub fn capture(
         }
         desktop.browser_url(w.hwnd, (shot.width as f64, shot.height as f64), origin)
     });
+    let pointer = mouse.map(|m| pointer_info(desktop, &s, m));
     Ok(Screen {
         bgra: shot.bgra,
         width: shot.width,
@@ -324,7 +407,32 @@ pub fn capture(
         monitors: s.monitors,
         ax_refs: HashMap::new(),
         offscreen: Vec::new(),
+        pointer,
     })
+}
+
+/// The mouse as a screen records it.
+fn pointer_info(
+    desktop: &dyn Desktop,
+    s: &Survey,
+    (x, y, idle): (f64, f64, Option<f64>),
+) -> PointerInfo {
+    let monitor = platform::display::index_at(&s.monitors, x.round() as i32, y.round() as i32);
+    let recent = idle.is_some_and(|i| i < RECENT_MOUSE_SECONDS);
+    let display_window = if recent && monitor != s.which {
+        top_window_on(&s.windows, monitor, desktop.own_pid())
+            .map(|w| (w.app.clone(), w.title.clone()))
+    } else {
+        None
+    };
+    PointerInfo {
+        x,
+        y,
+        monitor,
+        idle_seconds: idle,
+        under: desktop.element_at(x, y),
+        display_window,
+    }
 }
 
 /// Load a saved capture for replay. App and url are taken as given; nothing is asked of the
@@ -358,6 +466,7 @@ pub fn replay(path: &Path, app: &str, url: Option<String>) -> Result<Screen, Str
         monitors: Vec::new(),
         ax_refs: HashMap::new(),
         offscreen: Vec::new(),
+        pointer: None,
     })
 }
 
@@ -1312,6 +1421,7 @@ mod tests {
             monitors: Vec::new(),
             ax_refs: HashMap::new(),
             offscreen: Vec::new(),
+            pointer: None,
         }
     }
 
@@ -1767,9 +1877,23 @@ mod tests {
         ocr_calls: RefCell<Vec<(u32, u32)>>,
         lines: Vec<Line>,
         walked: RefCell<Vec<isize>>,
+        mouse: Option<(f64, f64, Option<f64>)>,
     }
 
     impl Desktop for Fake {
+        fn pointer(&self) -> Option<(f64, f64, Option<f64>)> {
+            self.mouse
+        }
+        fn element_at(&self, x: f64, y: f64) -> Option<platform::uia::Under> {
+            Some(platform::uia::Under {
+                role: "AXButton".into(),
+                label: "Save".into(),
+                x,
+                y,
+                w: 10.,
+                h: 10.,
+            })
+        }
         fn monitors(&self) -> Vec<Monitor> {
             self.monitors.clone()
         }
@@ -1850,6 +1974,7 @@ mod tests {
             ocr_calls: RefCell::new(Vec::new()),
             lines: Vec::new(),
             walked: RefCell::new(Vec::new()),
+            mouse: None,
         }
     }
 
@@ -1858,6 +1983,62 @@ mod tests {
             monitor(0, 0, 0, 1920, 1080),
             monitor(1, 1920, 0, 4480, 1440),
         ]
+    }
+
+    fn mouse_desk(mouse: (f64, f64, Option<f64>)) -> Fake {
+        let mut d = fake(
+            two_screens(),
+            vec![
+                window(2, "code", 99, 0, true),
+                window(3, "chrome", 4242, 1, false),
+            ],
+            2,
+        );
+        d.mouse = Some(mouse);
+        d
+    }
+
+    #[test]
+    fn a_question_reads_the_display_under_the_mouse() {
+        // VS Code is in front on display 0; the user points at Chrome on display 1.
+        let d = mouse_desk((2500., 300., Some(1.)));
+        let screen = capture_at(&d, "", None, Focus::Mouse).unwrap();
+        assert_eq!((screen.monitor, screen.origin), (1, (1920., 0.)));
+        assert_eq!((screen.app.as_str(), screen.pid), ("chrome", Some(4242)));
+        let p = screen.pointer.unwrap();
+        assert_eq!((p.x, p.y, p.monitor), (2500., 300., 1));
+        assert_eq!(p.under.map(|u| u.label), Some("Save".into()));
+        assert_eq!(
+            p.display_window, None,
+            "the display read is the mouse's own"
+        );
+        // The mouse on the foreground's display: the foreground window, as before.
+        let d = mouse_desk((100., 100., Some(1.)));
+        let screen = capture_at(&d, "", None, Focus::Mouse).unwrap();
+        assert_eq!((screen.monitor, screen.app.as_str()), (0, "code"));
+    }
+
+    #[test]
+    fn a_goal_keeps_the_foreground_display_and_notes_where_the_mouse_is_busy() {
+        let d = mouse_desk((2500., 300., Some(3.)));
+        let screen = capture(&d, "", None).unwrap();
+        assert_eq!((screen.monitor, screen.app.as_str()), (0, "code"));
+        let p = screen.pointer.unwrap();
+        assert_eq!(p.monitor, 1);
+        assert_eq!(
+            p.display_window,
+            Some(("chrome".into(), "chrome window".into()))
+        );
+        // A mouse left alone for a minute says nothing about where the user is looking.
+        let d = mouse_desk((2500., 300., Some(60.)));
+        let p = capture(&d, "", None).unwrap().pointer.unwrap();
+        assert_eq!(p.display_window, None);
+        // No mouse at all (the fakes' default): no pointer, nothing else changes.
+        let d = fake(two_screens(), vec![window(2, "code", 99, 0, true)], 2);
+        assert!(capture_at(&d, "", None, Focus::Mouse)
+            .unwrap()
+            .pointer
+            .is_none());
     }
 
     // Our own window has the foreground: its handle (77) is not in the inventory.

@@ -161,14 +161,7 @@ ipcMain.handle("call", async (_event, method, params) => {
   if ((method === "listen_start" || method === "listen_stop") && (await sttEngine()) === "chrome") {
     return method === "listen_start" ? speechStart() : speechStop();
   }
-  const reply = await call(method, params);
-  // Self-test only: a core built before `hotkeys` existed still lets the recorder be looked at.
-  if (process.env.POINTER_BAR_SELFTEST === "1" && !reply.ok && (method === "hotkeys" || method === "set_hotkeys")) {
-    const current = { bar: "rightalt", talk: "ctrl+alt+space", dictate: "ctrl+alt+d", goal: "ctrl+alt+g", pause: "ctrl+alt+p", abort: "ctrl+alt+x", quit: "ctrl+alt+q" };
-    if (method === "hotkeys") return { ok: true, result: { current, defaults: current } };
-    return { ok: true, result: { applied: params.values, refused: [] } };
-  }
-  return reply;
+  return call(method, params);
 });
 
 /* --------------------------------------------------------------- the panel */

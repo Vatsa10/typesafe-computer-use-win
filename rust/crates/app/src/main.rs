@@ -10,6 +10,7 @@
 
 mod daemon;
 mod emit;
+mod hotkeys;
 mod ipc;
 mod runner;
 mod settings;
@@ -20,48 +21,25 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use daemon::{Daemon, Modes, Paths};
+use daemon::{vk_slot, Daemon, Modes, Paths};
 use emit::Emitter;
+use hotkeys::{NoPump, Pumped, Rebind};
 
-const HOTKEY_NAMES: [&str; 7] = ["talk", "dictate", "bar", "goal", "pause", "abort", "quit"];
-
-enum Pumped {
-    Fired(String),
-    Refused(Vec<String>),
-}
-
-/// Register every hotkey on a thread of its own and pump it. Callbacks only send on a channel.
-fn start_hotkeys(daemon: Arc<Daemon>) {
+/// Start the pump on its own thread (registration and pumping both happen there) and the input
+/// worker that drains it. The pump's callbacks only send on the channel; `set_hotkeys` re-registers
+/// through the returned pump without a restart, feeding the same channel.
+fn start_pump(out: &Emitter) -> Option<(hotkeys::Pump, mpsc::Receiver<Pumped>)> {
     let (tx, rx) = mpsc::channel::<Pumped>();
-    let mut keys = platform::hotkeys::Hotkeys::new();
-    for name in HOTKEY_NAMES {
-        let Some(spec) = wcore::config::hotkey(name) else {
-            continue;
-        };
-        let sender = tx.clone();
-        let owned = name.to_string();
-        if let Err(e) = keys.add(name, &spec, move || {
-            let _ = sender.send(Pumped::Fired(owned.clone()));
-        }) {
-            daemon
-                .out
-                .line(format!("hotkey for {name} does not parse ({spec}): {e}"));
+    match hotkeys::Pump::start(hotkeys::current(), tx, out.clone()) {
+        Ok(pump) => Some((pump, rx)),
+        Err(e) => {
+            out.line(e);
+            None
         }
     }
-    let ready = tx;
-    let spawned = std::thread::Builder::new()
-        .name("hotkeys".into())
-        .spawn(move || {
-            keys.serve(move |refused| {
-                let _ = ready.send(Pumped::Refused(refused));
-            });
-        });
-    if let Err(e) = spawned {
-        daemon
-            .out
-            .line(format!("the hotkey pump would not start: {e}"));
-        return;
-    }
+}
+
+fn start_input_worker(daemon: Arc<Daemon>, rx: mpsc::Receiver<Pumped>) {
     let _ = std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
@@ -110,11 +88,17 @@ fn main() {
         out.line(format!("could not read .env: {e}"));
     }
 
-    let held_vk = |name: &str| {
-        wcore::config::hotkey(name)
-            .and_then(|spec| platform::hotkeys::parse_hotkey(&spec).ok())
-            .map(|(_, vk)| vk)
+    // CLICKER_NO_HOTKEYS=1 runs the protocol without touching the global keyboard: for smoke tests
+    // and for a second copy that must not fight the first over the keys.
+    let wanted = std::env::var("CLICKER_NO_HOTKEYS")
+        .map(|v| v != "1")
+        .unwrap_or(true);
+    let pumped = if wanted { start_pump(&out) } else { None };
+    let (rebinder, fired): (Box<dyn Rebind>, _) = match pumped {
+        Some((pump, rx)) => (Box::new(pump), Some(rx)),
+        None => (Box::new(NoPump), None),
     };
+    let specs = hotkeys::current();
     let daemon = Arc::new(Daemon {
         runner: Box::new(runner::Wired::live()),
         listener: Box::new(voice::Microphone::default()),
@@ -124,22 +108,19 @@ fn main() {
             runs: cwd.join("runs"),
             dotenv,
         },
-        hotkeys: daemon::hotkey_hint(),
-        talk_vk: held_vk("talk"),
-        dictate_vk: held_vk("dictate"),
+        hotkeys: Mutex::new(daemon::hotkey_hint()),
+        talk_vk: vk_slot(hotkeys::vk_of(&specs, "talk")),
+        dictate_vk: vk_slot(hotkeys::vk_of(&specs, "dictate")),
         typer: Box::new(daemon::Keyboard),
         modes: Mutex::new(Modes::default()),
+        rebinder,
+        rebinding: Mutex::new(()),
     });
 
     let screens = platform::display::monitors().len();
     out.line(format!("core ready: {screens} displays"));
-    // CLICKER_NO_HOTKEYS=1 runs the protocol without touching the global keyboard: for smoke tests
-    // and for a second copy that must not fight the first over the keys.
-    if std::env::var("CLICKER_NO_HOTKEYS")
-        .map(|v| v != "1")
-        .unwrap_or(true)
-    {
-        start_hotkeys(daemon.clone());
+    if let Some(rx) = fired {
+        start_input_worker(daemon.clone(), rx);
     }
     daemon.events().state(daemon.runner.state());
 

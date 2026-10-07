@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::config;
 use crate::dates::now_context;
 use crate::models::{Field, Item, Screen};
+use crate::worldmodel;
 
 /// The longest edge a vision model reads without shrinking the image itself.
 pub const ANSWER_IMAGE_EDGE: u32 = 1568;
@@ -174,8 +175,8 @@ pub fn near_field(screen: &Screen, items: &[Item], radius_pt: f64) -> Vec<String
 
 pub const COMPOSE_TEXT_SYSTEM: &str = "You fill in one text field on a user's screen. You receive the user's goal, recent actions, the focused field's label and placeholder, and nearby screen text. Decide the exact string to type. Never invent credentials, passwords, or personal data; for such fields, or when the field should not be filled, set fill to false.";
 pub const COMPOSE_URL_SYSTEM: &str = "Given a user's goal for their web browser, give the single best https URL to open first. Prefer the site's homepage or the most direct public page. If no website is implied, set ok to false.";
-pub const COMPOSE_ANSWER_SYSTEM: &str = "An agent drove a user's computer toward the user's goal and has now stopped. You receive the goal, the actions it took, why it stopped, a capture of the screen as it is now, and the text read from that screen. Tell the user the result. When the goal asks for information, lead with that information, taken only from the screen: never from memory, and never a guess. When the goal asks for something to be done, say whether the screen shows it done. When the screen does not hold the result, say so plainly, then say what is on screen and the one next step that would get there. Trust the capture over the text where the two disagree. Plain text, no markdown, four sentences at most. Set achieved to true only when the screen itself shows the goal reached.";
-pub const COMPOSE_EXPLANATION_SYSTEM: &str = "A user asked a question about the screen in front of them. You receive the question, a capture of their screen as it is now, and the text read from that screen. Answer from what is visible and nothing else: never from memory, and never a guess. When the screen does not contain the answer, say so plainly, then say what is on screen instead. When the user asks how to do something, do not do it and do not offer to: name the actual on-screen controls they should use, by the labels visible on the capture, in the order they would use them. You are teaching, not acting. Trust the capture over the text where the two disagree. Plain text, no markdown, five sentences at most.";
+pub const COMPOSE_ANSWER_SYSTEM: &str = "An agent drove a user's computer toward the user's goal and has now stopped. You receive the goal, the actions it took, why it stopped, a capture of the screen as it is now, and the text read from that screen. Tell the user the result. When the goal asks for information, lead with that information, taken only from the screen: never from memory, and never a guess. When the goal asks for something to be done, say whether the screen shows it done. When the screen does not hold the result, say so plainly, then say what is on screen and the one next step that would get there. Trust the capture over the text where the two disagree. Plain text, no markdown, four sentences at most. Set achieved to true only when the screen itself shows the goal reached. You may also receive where the mouse is and what it is over (pointer), with the item under it flagged under_mouse: 'this', 'here' and 'that' refer to what is under the mouse, because people point at what they ask about. You may also receive every display and the windows open on all of them; a question about another screen can be answered from those window titles, saying that only the titles are known.";
+pub const COMPOSE_EXPLANATION_SYSTEM: &str = "A user asked a question about the screen in front of them. You receive the question, a capture of their screen as it is now, and the text read from that screen. Answer from what is visible and nothing else: never from memory, and never a guess. When the screen does not contain the answer, say so plainly, then say what is on screen instead. When the user asks how to do something, do not do it and do not offer to: name the actual on-screen controls they should use, by the labels visible on the capture, in the order they would use them. You are teaching, not acting. Trust the capture over the text where the two disagree. Plain text, no markdown, five sentences at most. You may also receive where the mouse is and what it is over (pointer), with the item under it flagged under_mouse: 'this', 'here' and 'that' refer to what is under the mouse, because people point at what they ask about. You may also receive every display and the windows open on all of them; a question about another screen can be answered from those window titles, saying that only the titles are known.";
 
 /// The exact string to type into the focused field. Empty means the writer declined.
 pub fn compose_text(
@@ -253,6 +254,26 @@ pub struct Answer {
     pub achieved: bool,
 }
 
+/// What every answer is told about the machine beyond the capture: the mouse (and the item under
+/// it), every display, and the windows open on all of them, so "what is on my other screen" can be
+/// answered at least by window titles.
+fn add_world(packet: &mut Value, screen: &Screen, items: &[Item]) {
+    let under = screen.under_mouse(items);
+    if let Some(p) = &screen.pointer {
+        packet["pointer"] = worldmodel::pointer_record(p, screen.monitor, under);
+        if let Some(it) = under.and_then(|i| items.iter().find(|it| it.index == i)) {
+            packet["text_under_mouse"] = json!(it.text);
+        }
+    }
+    if !screen.monitors.is_empty() {
+        packet["displays"] = json!(worldmodel::monitor_summary(&screen.monitors));
+        packet["reading_display"] = json!(screen.monitor + 1);
+    }
+    if !screen.windows.is_empty() {
+        packet["open_windows_on_all_displays"] = json!(worldmodel::records(&screen.windows));
+    }
+}
+
 /// What to tell the user now that the run is over: the result when the screen holds it, where
 /// things stand when not. The writer reads the capture as well as its text.
 pub fn compose_answer(
@@ -264,7 +285,7 @@ pub fn compose_answer(
     stopped: &str,
 ) -> Result<Answer, WriterError> {
     let text: Vec<&str> = items.iter().map(|it| it.text.as_str()).collect();
-    let packet = json!({
+    let mut packet = json!({
         "goal": goal,
         "now": now_context(),
         "why_the_run_stopped": stopped,
@@ -273,6 +294,7 @@ pub fn compose_answer(
         "browser_active_tab_url": screen.url,
         "screen_text_in_reading_order": text,
     });
+    add_world(&mut packet, screen, items);
     let properties = json!({"achieved": {"type": "boolean"}, "answer": {"type": "string"}});
     let png = png_bytes(screen);
     let data = structured(
@@ -299,13 +321,14 @@ pub fn compose_explanation(
     items: &[Item],
 ) -> Result<String, WriterError> {
     let text: Vec<&str> = items.iter().map(|it| it.text.as_str()).collect();
-    let packet = json!({
+    let mut packet = json!({
         "question": question,
         "now": now_context(),
         "frontmost_app": screen.app,
         "browser_active_tab_url": screen.url,
         "screen_text_in_reading_order": text,
     });
+    add_world(&mut packet, screen, items);
     let properties = json!({"answer": {"type": "string"}});
     let png = png_bytes(screen);
     let data = structured(
@@ -320,7 +343,7 @@ pub fn compose_explanation(
     Ok(field_str(&data, "answer")?.trim().to_string())
 }
 
-pub const COMPOSE_TEACH_SYSTEM: &str = "A user asked a question about the screen in front of them, and you are teaching them, not acting: you never press anything yourself. You receive the question, a capture of their screen as it is now, and a numbered list of the items read from that screen (index, text, role, region). Answer briefly from what is visible and nothing else: never from memory, and never a guess; plain text, no markdown, two sentences at most. Then give up to 5 concrete next steps the user would take, in order, each one short sentence naming the on-screen control by its visible label. For each step set item to the index of the single numbered item from the provided list that the step uses, or null when no listed item applies (a keyboard shortcut, a control that is not on screen yet, or anything not in the list). Never invent items or indexes that are not in the list. When the question needs no steps, return an empty steps list. Trust the capture over the text where the two disagree.";
+pub const COMPOSE_TEACH_SYSTEM: &str = "A user asked a question about the screen in front of them, and you are teaching them, not acting: you never press anything yourself. You receive the question, a capture of their screen as it is now, and a numbered list of the items read from that screen (index, text, role, region). Answer briefly from what is visible and nothing else: never from memory, and never a guess; plain text, no markdown, two sentences at most. Then give up to 5 concrete next steps the user would take, in order, each one short sentence naming the on-screen control by its visible label. For each step set item to the index of the single numbered item from the provided list that the step uses, or null when no listed item applies (a keyboard shortcut, a control that is not on screen yet, or anything not in the list). Never invent items or indexes that are not in the list. When the question needs no steps, return an empty steps list. Trust the capture over the text where the two disagree. You may also receive where the mouse is and what it is over (pointer), with the item under it flagged under_mouse: 'this', 'here' and 'that' refer to what is under the mouse, because people point at what they ask about. You may also receive every display and the windows open on all of them; a question about another screen can be answered from those window titles, saying that only the titles are known.";
 
 /// The most steps a teach answer gives; anything past this is dropped.
 pub const MAX_TEACH_STEPS: usize = 5;
@@ -348,24 +371,30 @@ pub fn compose_teach(
     screen: &Screen,
     items: &[Item],
 ) -> Result<Teach, WriterError> {
+    let under = screen.under_mouse(items);
     let listed: Vec<Value> = items
         .iter()
         .map(|it| {
-            json!({
+            let mut row = json!({
                 "index": it.index,
                 "text": it.text,
                 "role": it.role,
                 "region": screen.region(it),
-            })
+            });
+            if under == Some(it.index) {
+                row["under_mouse"] = json!(true);
+            }
+            row
         })
         .collect();
-    let packet = json!({
+    let mut packet = json!({
         "question": question,
         "now": now_context(),
         "frontmost_app": screen.app,
         "browser_active_tab_url": screen.url,
         "items": listed,
     });
+    add_world(&mut packet, screen, items);
     let properties = json!({
         "answer": {"type": "string"},
         "steps": {
@@ -711,6 +740,60 @@ pub(crate) mod tests {
         let system = call.system.to_lowercase();
         assert!(system.contains("up to 5") && system.contains("never invent items"));
         assert!(system.contains("null"));
+    }
+
+    #[test]
+    fn answers_are_told_the_mouse_and_every_display() {
+        use crate::decide::tests::{pointed_items, pointed_screen};
+        let mut s = pointed_screen();
+        s.monitors = vec![
+            platform::display::Monitor {
+                index: 0,
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+                primary: true,
+            },
+            platform::display::Monitor {
+                index: 1,
+                left: 1,
+                top: -1440,
+                right: 2561,
+                bottom: 0,
+                primary: false,
+            },
+        ];
+        s.windows = vec![platform::winlist::WindowInfo {
+            hwnd: 5,
+            title: "Quarterly report - Excel".into(),
+            app: "EXCEL".into(),
+            pid: 9,
+            rect: (0, 0, 800, 600),
+            monitor: 0,
+            minimized: false,
+            foreground: false,
+        }];
+        let w = Fake::new(json!({"answer": "That is Settings.", "steps": []}));
+        compose_teach(&w, "what does this do?", &s, &pointed_items()).unwrap();
+        let w2 = Fake::new(json!({"answer": "x", "achieved": false}));
+        compose_answer(&w2, "g", &s, &pointed_items(), &[], "done").unwrap();
+        for call in [&w.calls.borrow()[0], &w2.calls.borrow()[0]] {
+            let packet = &call.packet;
+            assert_eq!(packet["pointer"]["item_under_mouse"], 1);
+            assert_eq!(packet["text_under_mouse"], "Settings");
+            assert_eq!(packet["displays"].as_array().unwrap().len(), 2);
+            assert_eq!(packet["reading_display"], 2);
+            assert!(packet["open_windows_on_all_displays"]
+                .to_string()
+                .contains("Quarterly report"));
+            assert!(call
+                .system
+                .contains("'this', 'here' and 'that' refer to what is under the mouse"));
+        }
+        let listed = &w.calls.borrow()[0].packet["items"];
+        assert_eq!(listed[1]["under_mouse"], true);
+        assert!(listed[0].get("under_mouse").is_none());
     }
 
     #[test]

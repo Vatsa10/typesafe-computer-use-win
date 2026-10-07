@@ -13,6 +13,8 @@ use platform::display::Monitor;
 use platform::winlist::WindowInfo;
 use serde_json::{json, Value};
 
+use crate::models::{role_word, PointerInfo};
+
 /// Options compete for probability mass, so this is a budget, not a limit.
 pub const MAX_WINDOWS: usize = 18;
 pub const TITLE_CHARS: usize = 70;
@@ -166,6 +168,52 @@ pub fn monitor_summary(monitors: &[Monitor]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// What a model is told about words like "this": they point at the mouse.
+pub const DEICTIC_NOTE: &str = "'this', 'here' and 'that' refer to what is under the mouse";
+
+/// The mouse for a model: where it is, which display, what it is over, and the item marked
+/// `under_mouse` when one is. `reading` is the display the capture came from.
+pub fn pointer_record(p: &PointerInfo, reading: usize, under_item: Option<usize>) -> Value {
+    let over = p.under.as_ref().map(|u| {
+        let label = u.label.trim();
+        let role = role_word(&u.role);
+        if label.is_empty() {
+            role.to_string()
+        } else {
+            format!("{role} '{label}'")
+        }
+    });
+    let mut sentence = format!(
+        "the mouse is at ({}, {}) on display {}",
+        p.x.round(),
+        p.y.round(),
+        p.monitor + 1
+    );
+    if let Some(over) = &over {
+        sentence.push_str(&format!(" over {over}"));
+    }
+    if p.monitor != reading {
+        sentence.push_str(", not the display being read");
+    }
+    let mut record = json!({
+        "summary": sentence,
+        "x": p.x.round(),
+        "y": p.y.round(),
+        "display": p.monitor + 1,
+        "on_display_being_read": p.monitor == reading,
+        "idle_seconds": p.idle_seconds.map(|s| (s * 10.0).round() / 10.0),
+        "over": over,
+        "note": DEICTIC_NOTE,
+    });
+    if let Some(i) = under_item {
+        record["item_under_mouse"] = json!(i);
+    }
+    if let Some((app, title)) = &p.display_window {
+        record["top_window_on_mouse_display"] = json!({ "app": app, "title": title });
+    }
+    record
 }
 
 /// The open window that best matches a name, or `None`.

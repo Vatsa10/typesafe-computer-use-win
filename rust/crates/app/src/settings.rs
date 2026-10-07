@@ -195,7 +195,8 @@ pub fn save(path: &Path, values: &Map<String, Value>) -> Result<Vec<String>, Str
     config::write_env(path, &pairs)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     for (key, value) in &pairs {
-        // So a key typed in just now works without a restart. Hotkeys still need one.
+        // So a key typed in just now works without a restart. Hotkeys saved here wait for one;
+        // `set_hotkeys` is the way to change them live.
         std::env::set_var(key, value);
     }
     Ok(pairs.into_iter().map(|(k, _)| k).collect())

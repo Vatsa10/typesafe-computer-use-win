@@ -824,6 +824,55 @@ pub fn focused_field() -> Option<Node> {
     .flatten()
 }
 
+/// The control under a point: its role, its label, and its frame in virtual-desktop pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Under {
+    pub role: String,
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// The control under a point, in physical pixels on the virtual desktop (where the cursor is).
+///
+/// None over Pointer's own windows (`winlist::is_own_window`): the buddy follows the cursor, so
+/// without the rule the thing "under the mouse" would nearly always be the buddy itself. The top
+/// level window at the point is checked first, then the element's own process, which catches an
+/// element UIA attributes to our process through a child window.
+pub fn element_at(x: i32, y: i32) -> Option<Under> {
+    let own = std::process::id();
+    let ui = crate::winlist::ui_pid();
+    if let Some((pid, title)) = crate::winlist::top_level_at(x, y) {
+        if crate::winlist::is_own_window(pid, &title, own, ui) {
+            return None;
+        }
+    }
+    with_automation(|automation| {
+        let point = windows::Win32::Foundation::POINT { x, y };
+        // SAFETY: a value argument; failure means nothing is there.
+        let element = unsafe { automation.ElementFromPoint(point) }.ok()?;
+        let pid = unsafe { element.CurrentProcessId() }.unwrap_or(0) as u32;
+        if crate::winlist::is_own_window(pid, "", own, ui) {
+            return None;
+        }
+        let control = unsafe { element.CurrentControlType() }
+            .map(|c| c.0)
+            .unwrap_or(0);
+        let (fx, fy, fw, fh) = frame_of(&element).unwrap_or((x as f64, y as f64, 0.0, 0.0));
+        Some(Under {
+            role: ax_role(control),
+            label: label_of(&element),
+            x: fx,
+            y: fy,
+            w: fw,
+            h: fh,
+        })
+    })
+    .flatten()
+}
+
 // ---------------------------------------------------------------- tests
 //
 // The pruning rules are pure, so they are tested against a plain in-memory tree with no desktop

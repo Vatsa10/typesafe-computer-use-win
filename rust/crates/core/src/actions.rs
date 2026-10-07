@@ -810,6 +810,7 @@ mod tests {
             monitors: Vec::new(),
             ax_refs: Default::default(),
             offscreen: Vec::new(),
+            pointer: None,
         }
     }
 

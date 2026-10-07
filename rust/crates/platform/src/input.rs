@@ -184,6 +184,39 @@ pub fn scroll(lines: i32) {
     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, lines * WHEEL_PER_LINE);
 }
 
+/// Let whichever process asks next take the foreground.
+///
+/// Windows' foreground lock refuses `SetForegroundWindow` from a process that did not receive the
+/// last input. A global hotkey is delivered to this core, not to the Electron shell, so the shell
+/// cannot focus the command bar it opens in answer to one: the bar appears behind the window the
+/// user was in, and what they type goes there instead. Granting the right to any process just
+/// before the shell hears about the hotkey is what lets the bar take focus. The grant lasts until
+/// the next input or the next foreground change, so it hands over nothing that lingers.
+pub fn allow_foreground_handoff() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+    // SAFETY: no pointers; fails only when this process holds no foreground right to give.
+    unsafe { AllowSetForegroundWindow(ASFW_ANY) }.is_ok()
+}
+
+/// Seconds between the last input's tick and now, across the 49.7-day wrap of the tick counter.
+pub fn idle_from(now_ms: u32, last_input_ms: u32) -> f64 {
+    now_ms.wrapping_sub(last_input_ms) as f64 / 1000.0
+}
+
+/// Seconds since the user last moved the mouse or pressed a key, system-wide.
+pub fn idle_seconds() -> Option<f64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: a correctly sized out struct.
+    let ok = unsafe { GetLastInputInfo(&mut info) }.as_bool();
+    // SAFETY: no preconditions.
+    ok.then(|| idle_from(unsafe { GetTickCount() }, info.dwTime))
+}
+
 /// True while a virtual key is physically down.
 ///
 /// Push-to-talk needs the release, and `RegisterHotKey` reports only presses, so this is the only
@@ -195,6 +228,13 @@ pub fn key_held(vk: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_survives_the_tick_counter_wrapping() {
+        assert_eq!(idle_from(5_000, 2_000), 3.0);
+        assert_eq!(idle_from(1_000, u32::MAX - 999), 2.0);
+        assert_eq!(idle_from(7, 7), 0.0);
+    }
 
     /// This machine: three monitors, the desktop spanning x from 0 and y from -1440.
     const THIS_MACHINE: VirtualDesktop = VirtualDesktop {
