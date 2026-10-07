@@ -7,7 +7,7 @@
 // already running its own loop. Separate processes mean neither has to give up its loop — and a
 // crash in the UI leaves a run that is already driving the machine able to finish or be aborted.
 
-const { app, BrowserWindow, ipcMain, nativeTheme, screen } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeTheme, screen, systemPreferences } = require("electron");
 const { spawn } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
@@ -123,6 +123,7 @@ function onEvent(message) {
   if (message.event === "stt") return onSttEvent(message);
   if (message.event === "hotkey" && message.name === "bar") return openBar();
   if (message.event === "hotkey" && message.name === "goal") showPanel();
+  if (message.event === "point") return point(message);
   if (message.event === "highlight") return draw(message.marks || [], message.seconds || 5);
   if (message.event === "state" && message.running && panelHidesWhileActing) hidePanelForRun();
   if (message.event === "state" && !message.running) showPanelAfterRun();
@@ -344,12 +345,138 @@ function clearOverlay() {
 
 ipcMain.handle("draw", (_event, marks, seconds) => draw(marks || [], seconds || 5));
 
+/* --------------------------------------------------------------- the buddy */
+
+// The cursor buddy (ADR-1 in docs/superpowers/specs/2026-10-07-buddy-teach-dictate-design.md): one
+// small click-through window that glides to whatever the core points at, while draw() boxes the
+// target. It is created by this process, so POINTER_UI_PID already keeps the core from reading it;
+// the title "Pointer buddy" is a second guard the core matches on.
+const BUDDY = { width: 300, height: 130, tipX: 8, tipY: 6, glideMs: 350 };
+let buddy = null;
+let buddyReady = null;
+let buddyVisible = false;
+let buddyTimer = null;
+let buddyGlide = null;
+
+function ensureBuddy() {
+  if (buddy && !buddy.isDestroyed()) return buddyReady;
+  buddy = new BrowserWindow({
+    width: BUDDY.width,
+    height: BUDDY.height,
+    title: "Pointer buddy",
+    frame: false,
+    transparent: true,
+    focusable: false, // never steals focus from the app being explained
+    skipTaskbar: true,
+    resizable: false,
+    hasShadow: false,
+    alwaysOnTop: true,
+    show: false,
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true },
+  });
+  buddy.setAlwaysOnTop(true, "screen-saver");
+  buddy.setIgnoreMouseEvents(true);
+  buddy.on("page-title-updated", (event) => event.preventDefault()); // the title is the core's guard
+  buddy.on("closed", () => (buddy = null));
+  buddyReady = new Promise((resolve) => buddy.webContents.once("did-finish-load", resolve));
+  buddy.loadFile(path.join(__dirname, "buddy.html"));
+  return buddyReady;
+}
+
+function prefersReducedMotion() {
+  try {
+    return systemPreferences.getAnimationSettings().prefersReducedMotion;
+  } catch {
+    return false;
+  }
+}
+
+// Where the window goes so the arrow's tip rests just inside the target's left edge, at its middle;
+// the bubble then hangs down-right of the tip. Kept inside the work area of the target's monitor.
+function parkFor(target) {
+  const tip = { x: target.x + Math.min(target.w * 0.25, 18), y: target.y + target.h / 2 };
+  const area = screen.getDisplayNearestPoint({ x: Math.round(tip.x), y: Math.round(tip.y) }).workArea;
+  const x = Math.min(Math.max(tip.x - BUDDY.tipX, area.x), area.x + area.width - BUDDY.width);
+  const y = Math.min(Math.max(tip.y - BUDDY.tipY, area.y), area.y + area.height - BUDDY.height);
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+function glideTo(to) {
+  if (buddyGlide) clearInterval(buddyGlide);
+  buddyGlide = null;
+  const size = { width: BUDDY.width, height: BUDDY.height };
+  let from;
+  if (buddyVisible) {
+    const b = buddy.getBounds();
+    from = { x: b.x, y: b.y };
+  } else {
+    const c = screen.getCursorScreenPoint(); // already DIP
+    from = { x: c.x - BUDDY.tipX, y: c.y - BUDDY.tipY };
+  }
+  if (prefersReducedMotion()) return buddy.setBounds({ ...to, ...size });
+  buddy.setBounds({ ...from, ...size });
+  const start = Date.now();
+  buddyGlide = setInterval(() => {
+    if (!buddy || buddy.isDestroyed()) return clearInterval(buddyGlide);
+    const t = Math.min(1, (Date.now() - start) / BUDDY.glideMs);
+    const e = 1 - Math.pow(1 - t, 3); // ease-out cubic
+    buddy.setBounds({ x: Math.round(from.x + (to.x - from.x) * e), y: Math.round(from.y + (to.y - from.y) * e), ...size });
+    if (t >= 1) {
+      clearInterval(buddyGlide);
+      buddyGlide = null;
+      buddy.setBounds({ ...to, ...size }); // a mixed-DPI crossing can rescale mid-glide; land exactly
+    }
+  }, 16);
+}
+
+async function point(message) {
+  if (message.clear) return hideBuddy();
+  const target = toDip(message);
+  const hold = Number(message.hold) > 0 ? Number(message.hold) : 5;
+  draw([{ x: message.x, y: message.y, w: message.w, h: message.h, tone: message.tone }], hold); // the box; the bubble carries the label
+  await ensureBuddy();
+  if (!buddy || buddy.isDestroyed()) return;
+  buddy.webContents.send("core", { event: "buddy", label: message.label, tone: message.tone, step: message.step, of: message.of });
+  glideTo(parkFor(target));
+  if (!buddyVisible) buddy.showInactive();
+  buddyVisible = true;
+  buddy.moveTop(); // above the box overlay that draw() just made
+  if (buddyTimer) clearTimeout(buddyTimer);
+  buddyTimer = setTimeout(hideBuddy, hold * 1000);
+}
+
+function hideBuddy() {
+  if (buddyTimer) clearTimeout(buddyTimer);
+  if (buddyGlide) clearInterval(buddyGlide);
+  buddyTimer = buddyGlide = null;
+  clearOverlay();
+  if (!buddy || buddy.isDestroyed() || !buddyVisible) return;
+  buddyVisible = false;
+  buddy.webContents.send("core", { event: "buddy-hide" });
+  buddy.hide();
+}
+
+// A development check (POINTER_BUDDY_SELFTEST=1): point at a spot on every monitor in turn, in
+// physical pixels, through the same handler the core's events take.
+function buddySelfTest() {
+  const displays = screen.getAllDisplays().sort((a, b) => a.bounds.x - b.bounds.x);
+  displays.forEach((d, i) => {
+    setTimeout(() => {
+      const dip = { x: d.workArea.x + Math.round(d.workArea.width * 0.4), y: d.workArea.y + Math.round(d.workArea.height * 0.35), width: 160, height: 40 };
+      const r = screen.dipToScreenRect(null, dip);
+      console.log(`[buddy-selftest] display ${i + 1} scale=${d.scaleFactor} dip=${JSON.stringify(dip)} physical=${JSON.stringify(r)}`);
+      onEvent({ event: "point", x: r.x, y: r.y, w: r.width, h: r.height, label: `Step on monitor ${i + 1}: this is the button to press`, tone: i === 1 ? "note" : "point", step: i + 1, of: displays.length, hold: 6 });
+    }, 1500 + i * 4000);
+  });
+}
+
 /* ---------------------------------------------------------------- lifecycle */
 
 app.whenReady().then(() => {
   startCore();
   createPanel();
   if (process.env.POINTER_STT_SELFTEST === "1") panel.webContents.once("did-finish-load", sttSelfTest);
+  if (process.env.POINTER_BUDDY_SELFTEST === "1") panel.webContents.once("did-finish-load", buddySelfTest);
 });
 
 // A development check (POINTER_STT_SELFTEST=1): click the panel's mic, wait, click it again, and
