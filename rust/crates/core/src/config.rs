@@ -182,8 +182,10 @@ pub fn email() -> Option<String> {
 
 /// The daemon's global hotkeys. Ctrl+Alt is the least contested corner of the Windows keyboard:
 /// Win+key belongs to the shell, and Ctrl+Shift+key to whatever app has focus.
-pub const DEFAULT_HOTKEYS: [(&str, &str); 6] = [
+pub const DEFAULT_HOTKEYS: [(&str, &str); 7] = [
     ("talk", "ctrl+alt+space"),
+    // Held like talk, but what is heard is typed into the focused field instead of obeyed.
+    ("dictate", "ctrl+alt+d"),
     // The bar is the one most people will use: press, speak, done. Right alt is free on a standard
     // layout, so it needs no chord; on a layout where it is AltGr, change it in Settings.
     ("bar", "rightalt"),
@@ -501,7 +503,10 @@ mod tests {
     fn test_every_daemon_hotkey_has_a_default() {
         let mut names: Vec<&str> = DEFAULT_HOTKEYS.iter().map(|(n, _)| *n).collect();
         names.sort();
-        assert_eq!(names, ["abort", "bar", "goal", "pause", "quit", "talk"]);
+        assert_eq!(
+            names,
+            ["abort", "bar", "dictate", "goal", "pause", "quit", "talk"]
+        );
         assert!(DEFAULT_HOTKEYS.contains(&("bar", "rightalt")));
     }
 

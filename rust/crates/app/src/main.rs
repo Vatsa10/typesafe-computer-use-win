@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use daemon::{Daemon, Modes, Paths};
 use emit::Emitter;
 
-const HOTKEY_NAMES: [&str; 6] = ["talk", "bar", "goal", "pause", "abort", "quit"];
+const HOTKEY_NAMES: [&str; 7] = ["talk", "dictate", "bar", "goal", "pause", "abort", "quit"];
 
 enum Pumped {
     Fired(String),
@@ -92,7 +92,9 @@ fn home() -> PathBuf {
     if cwd.join(".env").is_file() {
         return cwd;
     }
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("pointer")).unwrap_or(cwd)
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("pointer"))
+        .unwrap_or(cwd)
 }
 
 fn main() {
@@ -108,9 +110,11 @@ fn main() {
         out.line(format!("could not read .env: {e}"));
     }
 
-    let talk_vk = wcore::config::hotkey("talk")
-        .and_then(|spec| platform::hotkeys::parse_hotkey(&spec).ok())
-        .map(|(_, vk)| vk);
+    let held_vk = |name: &str| {
+        wcore::config::hotkey(name)
+            .and_then(|spec| platform::hotkeys::parse_hotkey(&spec).ok())
+            .map(|(_, vk)| vk)
+    };
     let daemon = Arc::new(Daemon {
         runner: Box::new(runner::Wired::live()),
         listener: Box::new(voice::Microphone::default()),
@@ -121,7 +125,9 @@ fn main() {
             dotenv,
         },
         hotkeys: daemon::hotkey_hint(),
-        talk_vk,
+        talk_vk: held_vk("talk"),
+        dictate_vk: held_vk("dictate"),
+        typer: Box::new(daemon::Keyboard),
         modes: Mutex::new(Modes::default()),
     });
 

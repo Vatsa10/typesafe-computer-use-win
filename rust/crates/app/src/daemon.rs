@@ -34,6 +34,63 @@ impl Default for Modes {
     }
 }
 
+/// Types dictated text into whatever has keyboard focus. Injected so tests never type.
+pub trait Typer: Send + Sync {
+    /// Type `text` into the focused field. Err when it would not be safe to type now.
+    fn type_text(&self, text: &str) -> Result<(), String>;
+}
+
+/// The real keyboard. Waits for the hotkey's modifiers to come up first: a dictated "a" typed
+/// while Ctrl+Alt is still down is a shortcut, not a letter.
+pub struct Keyboard;
+
+/// Shift, Ctrl, Alt and both Windows keys.
+const MODIFIERS: [u16; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
+
+impl Typer for Keyboard {
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        use std::time::{Duration, Instant};
+        // Settle: the key release that ended the hold has only just happened.
+        std::thread::sleep(Duration::from_millis(120));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while MODIFIERS.iter().any(|&vk| platform::input::key_held(vk)) {
+            if Instant::now() >= deadline {
+                return Err("a modifier key is still held, so nothing was typed".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        platform::input::type_text(text);
+        Ok(())
+    }
+}
+
+/// What a transcript is for: a command or goal (`talk`), or text for the focused field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Talk,
+    Dictate,
+}
+
+impl Purpose {
+    /// Anything but "dictate" is talk, so a shell that predates the tag keeps working.
+    pub fn from_param(value: Option<&str>) -> Purpose {
+        match value {
+            Some("dictate") => Purpose::Dictate,
+            _ => Purpose::Talk,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Purpose::Talk => "talk",
+            Purpose::Dictate => "dictate",
+        }
+    }
+}
+
+/// The refusal while a run is clicking and typing: our keystrokes would land among its own.
+pub const DICTATE_WHILE_ACTING: &str = "dictation is off while Pointer is acting";
+
 pub struct Paths {
     pub runs: PathBuf,
     pub dotenv: PathBuf,
@@ -48,6 +105,9 @@ pub struct Daemon {
     pub hotkeys: String,
     /// The push-to-talk key, when the talk hotkey parsed.
     pub talk_vk: Option<u32>,
+    /// The push-to-dictate key, when the dictate hotkey parsed.
+    pub dictate_vk: Option<u32>,
+    pub typer: Box<dyn Typer>,
     pub modes: Mutex<Modes>,
 }
 
@@ -63,7 +123,7 @@ fn safe_name(name: &str) -> Option<&str> {
 
 /// The hint for the corner of the window: every binding by name.
 pub fn hotkey_hint() -> String {
-    ["bar", "talk", "pause", "abort"]
+    ["bar", "talk", "dictate", "pause", "abort"]
         .iter()
         .filter_map(|n| wcore::config::hotkey(n).map(|k| format!("{k} {n}")))
         .collect::<Vec<_>>()
@@ -128,7 +188,15 @@ impl Daemon {
             }
             "listen_stop" => Ok(json!({ "heard": self.listener.stop()? })),
             "heard" => {
-                // What the shell's browser recognizer heard: routed exactly as `say`.
+                // What the shell's browser recognizer heard: routed exactly as `say`, unless it
+                // was dictation, which is typed and never read as a command.
+                if Purpose::from_param(param_str(params, "purpose")) == Purpose::Dictate {
+                    // A failure is a line too: the shell's reply is not where people look.
+                    let typed = self
+                        .dictate(param_str(params, "text").unwrap_or(""))
+                        .inspect_err(|e| self.out.line(format!("dictate: {e}")))?;
+                    return Ok(json!({ "typed": typed }));
+                }
                 let text = param_str(params, "text")
                     .map(str::trim)
                     .filter(|t| !t.is_empty());
@@ -247,6 +315,7 @@ impl Daemon {
                 })
             }),
             "talk" => self.talk(),
+            "dictate" => self.dictate_held(),
             _ => Ok(()), // bar and goal open windows, which is the shell's job
         };
         match result {
@@ -260,15 +329,9 @@ impl Daemon {
             return Err("voice is off".into());
         }
         let vk = self.talk_vk.ok_or("the talk hotkey did not parse")?;
-        if self.listener.engine() == "chrome" {
-            // The shell records on this engine: bracket the held key with start and stop, and the
-            // shell sends what it heard back as `heard`.
-            self.out.event("stt", json!({ "action": "start" }));
-            self.listener.hold(vk);
-            self.out.event("stt", json!({ "action": "stop" }));
+        let Some(said) = self.record_held(vk, Purpose::Talk)? else {
             return Ok(());
-        }
-        let said = self.listener.while_held(vk)?;
+        };
         if said.is_empty() {
             self.out.line("heard nothing");
             return Ok(());
@@ -277,6 +340,58 @@ impl Daemon {
         self.runner
             .route_said(&said, self.modes().act, self.events())
             .map(|_| ())
+    }
+
+    /// Hold the key on `purpose`'s behalf. None on chrome, where the shell records between the
+    /// `stt` start and stop and answers with `heard`; otherwise what the core heard.
+    fn record_held(&self, vk: u32, purpose: Purpose) -> Result<Option<String>, String> {
+        if self.listener.engine() == "chrome" {
+            let tag = purpose.name();
+            self.out
+                .event("stt", json!({ "action": "start", "purpose": tag }));
+            self.listener.hold(vk);
+            self.out
+                .event("stt", json!({ "action": "stop", "purpose": tag }));
+            return Ok(None);
+        }
+        self.listener.while_held(vk).map(Some)
+    }
+
+    /// Push-to-dictate: record while held, then type into the focused field.
+    fn dictate_held(&self) -> Result<(), String> {
+        if !self.modes().voice {
+            return Err("voice is off".into());
+        }
+        let vk = self.dictate_vk.ok_or("the dictate hotkey did not parse")?;
+        self.refuse_while_acting()?;
+        if let Some(said) = self.record_held(vk, Purpose::Dictate)? {
+            self.dictate(&said)?;
+        }
+        Ok(())
+    }
+
+    fn refuse_while_acting(&self) -> Result<(), String> {
+        if self.runner.state().running && self.modes().act {
+            return Err(DICTATE_WHILE_ACTING.into());
+        }
+        Ok(())
+    }
+
+    /// Type dictated text, never routing it. Returns how many characters went in. The text is
+    /// not echoed to the log: it may be private.
+    fn dictate(&self, text: &str) -> Result<usize, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            self.out.line("heard nothing to dictate");
+            return Ok(0);
+        }
+        self.refuse_while_acting()?;
+        // A trailing space, so the next dictation joins on as a new word.
+        let typed = format!("{text} ");
+        self.typer.type_text(&typed)?;
+        let count = typed.chars().count();
+        self.out.line(format!("dictated {count} characters"));
+        Ok(count)
     }
 }
 
@@ -326,6 +441,23 @@ mod tests {
     struct FakeRunner {
         calls: Mutex<Vec<String>>,
         paused: Mutex<bool>,
+        /// Inverted so the default fake reports a run in progress, as it always has.
+        idle: bool,
+    }
+
+    /// Records what would have been typed.
+    #[derive(Clone, Default)]
+    struct FakeTyper(Arc<Mutex<Vec<String>>>);
+    impl Typer for FakeTyper {
+        fn type_text(&self, text: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(text.into());
+            Ok(())
+        }
+    }
+    impl FakeTyper {
+        fn typed(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
     }
 
     impl Runner for FakeRunner {
@@ -355,7 +487,7 @@ mod tests {
         }
         fn state(&self) -> RunState {
             RunState {
-                running: true,
+                running: !self.idle,
                 paused: *self.paused.lock().unwrap(),
             }
         }
@@ -403,7 +535,13 @@ mod tests {
     }
 
     fn daemon(runner: Box<dyn Runner>, dir: &Path) -> (Daemon, Captured) {
+        let (d, captured, _) = daemon_typing(runner, dir);
+        (d, captured)
+    }
+
+    fn daemon_typing(runner: Box<dyn Runner>, dir: &Path) -> (Daemon, Captured, FakeTyper) {
         let captured = Captured::default();
+        let typer = FakeTyper::default();
         let d = Daemon {
             runner,
             listener: Box::new(FakeMic),
@@ -415,9 +553,170 @@ mod tests {
             },
             hotkeys: "rightalt bar".into(),
             talk_vk: Some(0x20),
+            dictate_vk: Some(0x44),
+            typer: Box::new(typer.clone()),
             modes: Mutex::new(Modes::default()),
         };
-        (d, captured)
+        (d, captured, typer)
+    }
+
+    fn idle_runner() -> Box<dyn Runner> {
+        Box::new(FakeRunner {
+            idle: true,
+            ..FakeRunner::default()
+        })
+    }
+
+    fn lines(captured: &Captured) -> Vec<String> {
+        captured
+            .messages()
+            .into_iter()
+            .filter(|m| m["event"] == "line")
+            .map(|m| m["text"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn dictated_text_is_typed_and_never_routed() {
+        let dir = tmp("dictate");
+        let (d, captured, typer) = daemon_typing(idle_runner(), &dir);
+        let reply = d
+            .dispatch(
+                "heard",
+                &json!({ "text": " hello there ", "purpose": "dictate" }),
+            )
+            .unwrap();
+        assert_eq!(reply, json!({ "typed": 12 }));
+        // "stop" dictated is words for the field, not a command for the run.
+        d.dispatch("heard", &json!({ "text": "stop", "purpose": "dictate" }))
+            .unwrap();
+        assert_eq!(typer.typed(), vec!["hello there ", "stop "]);
+        assert_eq!(
+            lines(&captured),
+            vec!["dictated 12 characters", "dictated 5 characters"]
+        );
+        assert!(
+            !captured
+                .messages()
+                .iter()
+                .any(|m| m.to_string().contains("hello")),
+            "the dictated text itself is never logged"
+        );
+    }
+
+    #[test]
+    fn talk_purpose_still_routes_and_types_nothing() {
+        let dir = tmp("talkpurpose");
+        let (d, _, typer) = daemon_typing(idle_runner(), &dir);
+        for params in [
+            json!({ "text": "stop", "purpose": "talk" }),
+            json!({ "text": "stop" }),
+        ] {
+            assert_eq!(
+                d.dispatch("heard", &params).unwrap(),
+                json!({ "command": "run_goal" })
+            );
+        }
+        assert!(typer.typed().is_empty());
+    }
+
+    #[test]
+    fn empty_dictation_types_nothing() {
+        let dir = tmp("dictempty");
+        let (d, _, typer) = daemon_typing(idle_runner(), &dir);
+        assert_eq!(
+            d.dispatch("heard", &json!({ "text": "  ", "purpose": "dictate" }))
+                .unwrap(),
+            json!({ "typed": 0 })
+        );
+        assert!(typer.typed().is_empty());
+    }
+
+    #[test]
+    fn dictation_is_refused_while_a_run_acts_but_not_in_dry_run() {
+        let dir = tmp("dictacting");
+        // The default fake reports a run in progress; the panel defaults to Act.
+        let (d, captured, typer) = daemon_typing(Box::new(FakeRunner::default()), &dir);
+        let err = d
+            .dispatch("heard", &json!({ "text": "hi", "purpose": "dictate" }))
+            .unwrap_err();
+        assert_eq!(err, DICTATE_WHILE_ACTING);
+        d.on_hotkey("dictate");
+        assert!(typer.typed().is_empty());
+        let said = lines(&captured);
+        assert!(said.contains(&format!("dictate: {DICTATE_WHILE_ACTING}")));
+        // A dry run touches nothing, so dictation goes ahead beside it.
+        d.dispatch("set_mode", &json!({ "act": false })).unwrap();
+        d.dispatch("heard", &json!({ "text": "hi", "purpose": "dictate" }))
+            .unwrap();
+        assert_eq!(typer.typed(), vec!["hi "]);
+    }
+
+    struct Shared(Arc<FakeRunner>);
+    impl Runner for Shared {
+        fn start(&self, g: &str, a: bool, e: Events) -> Result<bool, String> {
+            self.0.start(g, a, e)
+        }
+        fn pause(&self) -> Result<bool, String> {
+            self.0.pause()
+        }
+        fn abort(&self) -> Result<bool, String> {
+            self.0.abort()
+        }
+        fn route_said(&self, t: &str, a: bool, e: Events) -> Result<Value, String> {
+            self.0.route_said(t, a, e)
+        }
+        fn ask(&self, q: &str, e: Events) -> Result<String, String> {
+            self.0.ask(q, e)
+        }
+        fn state(&self) -> RunState {
+            self.0.state()
+        }
+    }
+
+    #[test]
+    fn the_dictate_hotkey_records_and_types_on_the_core_engines() {
+        let dir = tmp("dicthotkey");
+        let runner = Arc::new(FakeRunner {
+            idle: true,
+            ..FakeRunner::default()
+        });
+        let (d, _, typer) = daemon_typing(Box::new(Shared(runner.clone())), &dir);
+        // FakeMic hears "stop": typed, not obeyed.
+        d.on_hotkey("dictate");
+        assert_eq!(typer.typed(), vec!["stop "]);
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "nothing was routed"
+        );
+    }
+
+    #[test]
+    fn on_chrome_the_stt_events_carry_the_purpose() {
+        let dir = tmp("chromepurpose");
+        let (mut d, captured, typer) = daemon_typing(idle_runner(), &dir);
+        d.listener = Box::new(ShellMic);
+        d.on_hotkey("dictate");
+        d.on_hotkey("talk");
+        let stt: Vec<_> = captured
+            .messages()
+            .into_iter()
+            .filter(|m| m["event"] == "stt")
+            .map(|m| (m["action"].clone(), m["purpose"].clone()))
+            .collect();
+        assert_eq!(
+            stt,
+            vec![
+                (json!("start"), json!("dictate")),
+                (json!("stop"), json!("dictate")),
+                (json!("start"), json!("talk")),
+                (json!("stop"), json!("talk")),
+            ]
+        );
+        assert!(
+            typer.typed().is_empty(),
+            "the shell sends the text back as heard"
+        );
     }
 
     #[test]

@@ -112,9 +112,12 @@ async function onSttEvent(message) {
     if (!started.ok) toPanel({ event: "line", text: `voice: ${started.error}` });
   } else if (message.action === "stop") {
     const { result } = await speechStop();
+    // The purpose rides through untouched: dictation is typed into the focused field by the core and
+    // never routed. Dictated words may be private, so only talk is echoed into the feed.
+    const purpose = message.purpose === "dictate" ? "dictate" : "talk";
     if (!result.heard) return toPanel({ event: "line", text: "heard nothing" });
-    toPanel({ event: "line", text: `heard: ${result.heard}` });
-    const routed = await call("heard", { text: result.heard });
+    if (purpose === "talk") toPanel({ event: "line", text: `heard: ${result.heard}` });
+    const routed = await call("heard", { text: result.heard, purpose });
     if (!routed.ok) toPanel({ event: "line", text: `voice: ${routed.error}` });
   }
 }

@@ -65,6 +65,11 @@ pub fn catalog() -> Vec<Setting> {
             hotkey_default("talk"),
         ),
         row(
+            "CLICKER_HOTKEY_DICTATE",
+            "Hotkey: dictate",
+            hotkey_default("dictate"),
+        ),
+        row(
             "CLICKER_HOTKEY_GOAL",
             "Hotkey: typed goal",
             hotkey_default("goal"),

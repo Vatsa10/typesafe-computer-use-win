@@ -49,6 +49,7 @@ Every run is saved under `runs\` with a screenshot per step; **History** replays
 |---|---|
 | `Right Alt` | opens the command bar at the cursor; type a goal or just speak |
 | `Ctrl+Alt+Space` (hold) | push to talk: a goal, a question about the screen, or "stop" |
+| `Ctrl+Alt+D` (hold) | dictate: what you say is typed into the focused field (never obeyed as a command) |
 | `Ctrl+Alt+P` | pause or resume the run |
 | `Ctrl+Alt+X` | abort the run (so does the mouse in the top-left corner of the main display) |
 
