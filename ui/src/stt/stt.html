@@ -50,9 +50,14 @@
           post({ final: false, state: "listening" }); // the mic is open: no prompt stood in the way
         };
         r.onresult = (e) => {
+          let interim = "";
           for (let i = e.resultIndex; i < e.results.length; i++) {
             if (e.results[i].isFinal) finals.push(e.results[i][0].transcript);
+            else interim += e.results[i][0].transcript;
           }
+          // Live text for the command bar: everything settled so far plus the guess in progress.
+          const live = (finals.join(" ") + " " + interim).replace(/\s+/g, " ").trim();
+          if (live) post({ final: false, interim: live });
         };
         r.onerror = (e) => {
           // not-allowed, network, no-speech, audio-capture, aborted...
@@ -104,6 +109,20 @@
         else finish();
       }
 
+      // Drop the utterance: nothing is posted, so nothing is transcribed or routed.
+      function cancel() {
+        wanted = false;
+        finals = [];
+        error = "";
+        if (recognition && running) {
+          recognition.onend = null;
+          recognition.onresult = null;
+          recognition.abort();
+        }
+        running = false;
+        status.textContent = "idle";
+      }
+
       const events = new EventSource(base + "events");
       events.onmessage = (e) => {
         let msg;
@@ -114,6 +133,7 @@
         }
         if (msg.cmd === "start") start();
         else if (msg.cmd === "stop") stop();
+        else if (msg.cmd === "cancel") cancel();
       };
     </script>
   </body>

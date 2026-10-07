@@ -5,6 +5,7 @@ import { call } from "../lib/core.js";
 import { h, emptyState } from "../lib/dom.js";
 import { icon } from "../lib/icons.js";
 import { toast } from "./toast.js";
+import { createHotkeysSection } from "./hotkeys.js";
 
 const GROUPS = [
   { id: "keys", title: "API keys", match: (row) => row.secret },
@@ -27,6 +28,9 @@ export function createSettingsView() {
   const status = h("span", { class: "helper", "aria-live": "polite" });
   let rows = [];
   let inputs = new Map();
+  // With a core that answers `hotkeys`, the recorder replaces the free-text CLICKER_HOTKEY_ rows.
+  const hotkeys = createHotkeysSection();
+  let recorder = false;
 
   const element = h(
     "section",
@@ -91,6 +95,10 @@ export function createSettingsView() {
     }
     const taken = new Set();
     for (const group of GROUPS) {
+      if (group.id === "hotkeys" && recorder) {
+        scroll.append(hotkeys.element);
+        continue;
+      }
       const members = rows.filter((row) => !taken.has(row.key) && group.match(row));
       if (!members.length) continue;
       for (const row of members) taken.add(row.key);
@@ -113,7 +121,10 @@ export function createSettingsView() {
   }
 
   async function load() {
-    rows = (await call("settings")) || [];
+    const [all, hasRecorder] = await Promise.all([call("settings"), hotkeys.load()]);
+    recorder = hasRecorder;
+    // The recorder owns the hotkeys; Save never writes them as text alongside it.
+    rows = (all || []).filter((row) => !(recorder && row.key.startsWith("CLICKER_HOTKEY_")));
     render();
   }
 

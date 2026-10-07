@@ -11,6 +11,9 @@ contextBridge.exposeInMainWorld("core", {
 // the shell and handed over in the page URL, because a sandboxed page cannot read the environment.
 const listenOnOpen = new URLSearchParams(location.search).get("listen") === "1";
 contextBridge.exposeInMainWorld("bar", {
-  done: (text, spoken) => ipcRenderer.invoke("bar-done", text, spoken),
+  done: (text, spoken, purpose) => ipcRenderer.invoke("bar-done", text, spoken, purpose),
+  listen: (action) => ipcRenderer.invoke("bar-listen", action),
+  onInterim: (handler) => ipcRenderer.on("bar-interim", (_event, text) => handler(text)),
+  reportFocus: (report) => ipcRenderer.send("bar-focus-report", report),
   listenOnOpen,
 });

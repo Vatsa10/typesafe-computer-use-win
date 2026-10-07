@@ -80,7 +80,13 @@ function call(method, params) {
 // CLICKER_STT=chrome (the default): the core cannot record on this engine, so the shell does,
 // through Google's recognizer in a dedicated, hidden Chrome or Edge window (src/stt/bridge.js).
 // Started on first use, kept alive, killed on quit. Transcripts are never logged here.
-const speech = createBridge({ log: (text) => toPanel({ event: "line", text }) });
+const speech = createBridge({
+  log: (text) => toPanel({ event: "line", text }),
+  // Live words while someone speaks to the command bar; they go to the bar only, never to a log.
+  onInterim: (text) => {
+    if (bar && !bar.isDestroyed()) bar.webContents.send("bar-interim", text);
+  },
+});
 
 async function sttEngine() {
   const reply = await call("state");
@@ -107,6 +113,7 @@ async function speechStop() {
 // Push-to-talk on the chrome engine: the core brackets the held key with start and stop, and what
 // was heard goes back as `heard`, which routes exactly like `say`.
 async function onSttEvent(message) {
+  if (message.action === "start" && recordingHotkeys) return; // Settings is capturing a combo
   if (message.action === "start") {
     const started = await speechStart();
     if (!started.ok) toPanel({ event: "line", text: `voice: ${started.error}` });
@@ -122,8 +129,12 @@ async function onSttEvent(message) {
   }
 }
 
+// While Settings records a new combo, pressing an existing one must not open the bar or the panel.
+let recordingHotkeys = false;
+
 function onEvent(message) {
   if (message.event === "stt") return onSttEvent(message);
+  if (message.event === "hotkey" && recordingHotkeys && (message.name === "bar" || message.name === "goal")) return;
   if (message.event === "hotkey" && message.name === "bar") return openBar();
   if (message.event === "hotkey" && message.name === "goal") showPanel();
   if (message.event === "point") return point(message);
@@ -138,6 +149,10 @@ function toPanel(message) {
 }
 
 ipcMain.handle("call", async (_event, method, params) => {
+  if (method === "ui_recording_hotkeys") {
+    recordingHotkeys = Boolean(params && params.on);
+    return { ok: true, result: { recording: recordingHotkeys } };
+  }
   if (method === "set_mode" && params) {
     panelHidesWhileActing = params.hide !== false;
     if (typeof params.voice === "boolean") voiceOn = params.voice;
@@ -146,7 +161,14 @@ ipcMain.handle("call", async (_event, method, params) => {
   if ((method === "listen_start" || method === "listen_stop") && (await sttEngine()) === "chrome") {
     return method === "listen_start" ? speechStart() : speechStop();
   }
-  return call(method, params);
+  const reply = await call(method, params);
+  // Self-test only: a core built before `hotkeys` existed still lets the recorder be looked at.
+  if (process.env.POINTER_BAR_SELFTEST === "1" && !reply.ok && (method === "hotkeys" || method === "set_hotkeys")) {
+    const current = { bar: "rightalt", talk: "ctrl+alt+space", dictate: "ctrl+alt+d", goal: "ctrl+alt+g", pause: "ctrl+alt+p", abort: "ctrl+alt+x", quit: "ctrl+alt+q" };
+    if (method === "hotkeys") return { ok: true, result: { current, defaults: current } };
+    return { ok: true, result: { applied: params.values, refused: [] } };
+  }
+  return reply;
 });
 
 /* --------------------------------------------------------------- the panel */
@@ -244,7 +266,7 @@ function atCursor() {
 
 function openBar() {
   if (bar && !bar.isDestroyed()) {
-    bar.focus();
+    focusBar();
     return;
   }
   const { x, y } = atCursor();
@@ -265,24 +287,168 @@ function openBar() {
     },
   });
   bar.setAlwaysOnTop(true, "screen-saver");
-  bar.loadFile(path.join(__dirname, "bar.html"), { query: { listen: process.env.CLICKER_BAR_LISTEN === "0" ? "0" : "1" } });
-  bar.once("ready-to-show", () => {
-    bar.show();
-    bar.focus();
-  });
+  const listen = process.env.CLICKER_BAR_LISTEN === "0" || !voiceOn ? "0" : "1";
+  bar.loadFile(path.join(__dirname, "bar.html"), { query: { listen } });
+  bar.once("ready-to-show", focusBar);
   bar.on("blur", () => {
+    if (!bar || bar.isDestroyed()) return;
+    // The first listen launches the speech browser, whose window can take the foreground for a
+    // moment. That is not the user clicking away: take the focus back instead of closing.
+    if (Date.now() < barHoldOpenUntil) {
+      barLog("blurred while the speech browser started; taking focus back");
+      setTimeout(focusBar, 100);
+      return;
+    }
     // Clicking away is a cancel. A bar left floating over the work is a bar in the way.
-    if (bar && !bar.isDestroyed()) bar.close();
+    bar.close();
+  });
+  bar.on("closed", () => {
+    // Whatever was being heard for the bar is dropped with it.
+    if (barListening) cancelBarSpeech();
+    bar = null;
   });
 }
 
-ipcMain.handle("bar-done", async (_event, text, spoken) => {
+const BAR_DEBUG = process.env.POINTER_BAR_DEBUG === "1" || process.env.POINTER_BAR_SELFTEST === "1";
+
+function barLog(text) {
+  if (BAR_DEBUG) console.log(`[bar] ${text}`);
+}
+
+// Windows refuses SetForegroundWindow to a process that is not already in front, so a window
+// opened from a global hotkey can appear without the keyboard. The core calls
+// AllowSetForegroundWindow before it emits the hotkey; here we ask for focus, and if Windows still
+// said no, ask once more, harder, 50 ms later.
+function focusBar() {
+  if (!bar || bar.isDestroyed()) return;
+  bar.show();
+  bar.focus();
+  bar.webContents.focus();
+  barLog(`shown, isFocused=${bar.isFocused()}`);
+  if (!bar.isFocused()) {
+    setTimeout(() => {
+      if (!bar || bar.isDestroyed()) return;
+      app.focus({ steal: true });
+      bar.focus();
+      bar.webContents.focus();
+      barLog(`retried with app.focus({steal:true}), isFocused=${bar.isFocused()}`);
+    }, 50);
+  }
+}
+
+let barListening = false;
+let barHoldOpenUntil = 0; // until then a blur is the speech browser starting, not a click away
+let barEngineLive = false; // the bar's speech is on the chrome bridge, so it can be cancelled
+
+function cancelBarSpeech() {
+  barListening = false;
+  if (barEngineLive) speech.cancel();
+  else call("listen_stop"); // the other engines have no cancel; the answer is ignored
+}
+
+function closeBar() {
   if (bar && !bar.isDestroyed()) bar.close();
+}
+
+ipcMain.handle("bar-listen", async (_event, action) => {
+  if (action === "start") {
+    if (!voiceOn) return { ok: false, error: "voice is off" };
+    barEngineLive = (await sttEngine()) === "chrome";
+    barHoldOpenUntil = Date.now() + 30000;
+    const started = barEngineLive ? await speechStart() : await call("listen_start");
+    barHoldOpenUntil = Date.now() + 1000;
+    barListening = Boolean(started.ok);
+    return { ...started, live: barEngineLive }; // live: interim words stream, so silence can submit
+  }
+  if (!barListening) return { ok: true, result: { heard: "" } };
+  if (action === "stop") {
+    barListening = false;
+    return barEngineLive ? speechStop() : call("listen_stop");
+  }
+  // cancel: the user started typing. Drop the utterance; nothing is transcribed or routed.
+  cancelBarSpeech();
+  return { ok: true };
+});
+
+ipcMain.on("bar-focus-report", (_event, report) => barLog(`renderer reports ${JSON.stringify(report)}`));
+
+ipcMain.handle("bar-done", async (_event, text, spoken, purpose) => {
+  if (barListening) cancelBarSpeech();
+  closeBar();
   if (!text) return { ok: true };
+  if (purpose === "dictate") {
+    // Dictation types into the focused field, and the bar had the focus: it is closed now, so give
+    // Windows a moment to hand focus back to the window underneath, then let the core type.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return call("heard", { text, purpose: "dictate" });
+  }
   // Typed or spoken, the bar is classified: a goal runs, a question is taught, "stop" stops. Typed
   // text was not misheard, so it goes in as `heard` (fully heard); speech goes through `say`.
   return spoken ? call("say", { text }) : call("heard", { text, purpose: "talk" });
 });
+
+// A development check (POINTER_BAR_SELFTEST=1): open the bar directly, report whether it has the
+// keyboard, and only if it is the focused window type into it (sendInputEvent goes to the bar's own
+// page, never to another app). Esc closes it without submitting, so nothing runs. Then open Settings
+// and start the hotkey recorder. Window captures go to POINTER_BAR_SELFTEST_DIR when it is set.
+function barSelfTest() {
+  const fs = require("node:fs");
+  const dir = process.env.POINTER_BAR_SELFTEST_DIR;
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const shot = async (win, name) => {
+    if (!dir || !win || win.isDestroyed()) return;
+    fs.mkdirSync(dir, { recursive: true });
+    const image = await win.webContents.capturePage();
+    fs.writeFileSync(path.join(dir, name), image.toPNG());
+    console.log(`[bar-selftest] saved ${name}`);
+  };
+  const barState = () =>
+    bar.webContents.executeJavaScript(
+      `({ hasFocus: document.hasFocus(), active: document.activeElement && document.activeElement.id, mode: document.getElementById("mode").textContent, value: document.getElementById("barGoal").value })`,
+    );
+  setTimeout(async () => {
+    openBar();
+    await wait(Number(process.env.POINTER_BAR_SELFTEST_MS || 6000)); // the first listen launches the speech browser
+    if (!bar || bar.isDestroyed()) return console.log("[bar-selftest] the bar closed before the check");
+    const state = await barState();
+    console.log(`[bar-selftest] after open: isFocused=${bar.isFocused()} listening=${barListening} ${JSON.stringify(state)}`);
+    await shot(bar, "bar-open.png");
+    if (!bar || bar.isDestroyed()) return console.log("[bar-selftest] the bar closed during the capture");
+    // The guard: type only when the bar is the focused window and its page has the focus.
+    if (bar.isFocused() && state.hasFocus) {
+      for (const ch of "what is on my screen") {
+        const keyCode = ch === " " ? "Space" : ch;
+        bar.webContents.sendInputEvent({ type: "keyDown", keyCode });
+        bar.webContents.sendInputEvent({ type: "char", keyCode: ch });
+        bar.webContents.sendInputEvent({ type: "keyUp", keyCode });
+        await wait(25);
+      }
+      await wait(300);
+      console.log(`[bar-selftest] after typing: listening=${barListening} ${JSON.stringify(await barState())}`);
+      await shot(bar, "bar-typing.png");
+      bar.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      await wait(400);
+      console.log(`[bar-selftest] after Esc: bar open=${Boolean(bar && !bar.isDestroyed())}`);
+    } else {
+      console.log("[bar-selftest] the bar is not the focused window; not typing");
+      closeBar();
+    }
+    showPanel();
+    await panel.webContents.executeJavaScript(`document.querySelectorAll(".nav-item")[2].click()`);
+    await wait(1500);
+    const clicked = await panel.webContents.executeJavaScript(`(() => { const b = document.querySelector(".hk-change"); if (b) b.click(); return Boolean(b); })()`);
+    await wait(300);
+    console.log(`[bar-selftest] recorder started=${clicked} recordingHotkeys=${recordingHotkeys}`);
+    await shot(panel, "settings-recording.png");
+    // A combo into the recorder (the panel's own page only), to show a captured, unapplied value.
+    if (panel.isFocused()) {
+      panel.webContents.sendInputEvent({ type: "keyDown", keyCode: "K", modifiers: ["control", "alt"] });
+      await wait(400);
+    }
+    await shot(panel, "settings-hotkeys.png");
+    console.log("[bar-selftest] done");
+  }, 2500);
+}
 
 /* ------------------------------------------------------------- the overlay */
 
@@ -480,6 +646,7 @@ app.whenReady().then(() => {
   startCore();
   createPanel();
   if (process.env.POINTER_STT_SELFTEST === "1") panel.webContents.once("did-finish-load", sttSelfTest);
+  if (process.env.POINTER_BAR_SELFTEST === "1") panel.webContents.once("did-finish-load", barSelfTest);
   if (process.env.POINTER_BUDDY_SELFTEST === "1") panel.webContents.once("did-finish-load", buddySelfTest);
 });
 

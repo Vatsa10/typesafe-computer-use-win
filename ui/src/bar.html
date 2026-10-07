@@ -190,6 +190,90 @@
         white-space: nowrap;
       }
 
+      /* What the bar is doing right now: listening, typing or thinking. */
+      .chip {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: var(--radius-pill);
+        background: var(--control);
+        border: 1px solid var(--stroke);
+        font: 600 11px/16px var(--font-text);
+        color: var(--text-secondary);
+        white-space: nowrap;
+      }
+
+      .chip::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--text-tertiary);
+      }
+
+      .chip[data-mode="listening"] {
+        color: var(--accent);
+        background: var(--accent-subtle);
+      }
+
+      .chip[data-mode="listening"]::before {
+        background: var(--accent);
+        animation: pulse 1.2s var(--ease-standard) infinite;
+      }
+
+      .chip[data-mode="typing"]::before {
+        background: var(--text-primary);
+      }
+
+      .chip[data-mode="thinking"]::before {
+        background: var(--warning);
+        animation: pulse 0.8s var(--ease-standard) infinite;
+      }
+
+      @keyframes pulse {
+        50% {
+          opacity: 0.25;
+        }
+      }
+
+      .toggle {
+        flex: 0 0 auto;
+        height: 28px;
+        padding: 0 10px;
+        border-radius: var(--radius-control);
+        border: 1px solid var(--stroke);
+        background: transparent;
+        color: var(--text-secondary);
+        font: 400 12px/16px var(--font-text);
+        cursor: default;
+      }
+
+      .toggle:hover {
+        background: var(--subtle-hover);
+        color: var(--text-primary);
+      }
+
+      .toggle[aria-pressed="true"] {
+        background: var(--accent);
+        border-color: transparent;
+        color: var(--text-on-accent);
+      }
+
+      .toggle:focus-visible {
+        outline: 2px solid var(--focus-ring);
+        outline-offset: 1px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .chip::before,
+        .mic.live::before,
+        .flyout {
+          animation: none !important;
+        }
+      }
+
       kbd {
         display: inline-block;
         padding: 2px 6px;
@@ -210,6 +294,8 @@
       <div class="input-wrap">
         <input id="barGoal" type="text" autocomplete="off" spellcheck="false" aria-label="Goal for Pointer" placeholder="Ask Pointer to do something" />
       </div>
+      <span class="chip" id="mode" data-mode="typing" role="status" aria-live="polite">Typing</span>
+      <button class="toggle" id="dictate" type="button" aria-pressed="false" title="Tab: the next words are typed where you were, not run">Dictate</button>
       <span class="hint" id="hint" aria-live="polite"><kbd>Esc</kbd></span>
       <button class="mic" id="mic" type="button" aria-label="Speak the goal" title="Click, speak, click again">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg>
@@ -217,22 +303,53 @@
     </div>
 
     <script>
+      // One bar, three ways in. Speak and it listens, shows the words as they come, and submits
+      // after a short silence. Type anything and listening stops at once: what was half-heard is
+      // dropped and the line is a typed request. Tab (or the Dictate button) makes the next words
+      // dictation, typed into the window underneath instead of run.
       const input = document.getElementById("barGoal");
       const mic = document.getElementById("mic");
       const hint = document.getElementById("hint");
+      const chip = document.getElementById("mode");
+      const dictate = document.getElementById("dictate");
       const MIC = mic.innerHTML;
       const SPINNER = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9" /></svg>';
       const IDLE_HINT = "<kbd>Esc</kbd>";
-      let listening = false;
-      let closing = false;
+      const SILENCE_MS = 1200;
+      const PLACEHOLDER = { talk: "Ask Pointer to do something", dictate: "Speak or type the words to dictate" };
 
-      function finish(submit, spoken) {
+      let listening = false;
+      let live = false; // the engine streams words as they are spoken, so silence can submit
+      let heardSpeech = false;
+      let silenceTimer = null;
+      let closing = false;
+      let purpose = "talk";
+      let starting = false; // a start is in flight
+      let typedWhileStarting = false;
+
+      function setMode(mode) {
+        chip.dataset.mode = mode;
+        chip.textContent = { listening: "Listening…", typing: "Typing", thinking: "Thinking…" }[mode];
+      }
+
+      function setPurpose(next) {
+        purpose = next;
+        dictate.setAttribute("aria-pressed", String(purpose === "dictate"));
+        input.placeholder = PLACEHOLDER[purpose];
+        input.setAttribute("aria-label", purpose === "dictate" ? "Words to dictate" : "Goal for Pointer");
+      }
+
+      function clearSilence() {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+
+      function finish(text, spoken) {
         if (closing) return;
         closing = true;
-        const value = submit ? input.value.trim() : "";
-        // A typed line is a goal. A spoken one is classified first, because "stop" and "never mind"
-        // arrive as text too, and only one of those is work.
-        window.bar.done(value, Boolean(spoken));
+        clearSilence();
+        if (text) setMode("thinking");
+        window.bar.done(text || "", Boolean(spoken), purpose);
       }
 
       function flash(text) {
@@ -240,57 +357,138 @@
         setTimeout(() => (hint.innerHTML = IDLE_HINT), 1800);
       }
 
-      async function toggleMic() {
-        if (listening) {
-          // Second click: stop, transcribe, and run what it heard.
-          listening = false;
-          mic.classList.remove("live");
-          mic.classList.add("busy");
-          mic.innerHTML = SPINNER;
-          mic.setAttribute("aria-label", "Transcribing");
-          hint.textContent = "Transcribing";
-          const reply = await window.core.call("listen_stop");
-          mic.classList.remove("busy");
-          mic.innerHTML = MIC;
-          mic.setAttribute("aria-label", "Speak the goal");
-          const heard = reply && reply.ok ? reply.result.heard : "";
-          if (heard) {
-            input.value = heard;
-            finish(true, true); // speaking is the whole instruction; there is nothing left to confirm
-          } else {
-            flash("Nothing heard");
-          }
+      function micIdle() {
+        mic.classList.remove("live", "busy");
+        mic.innerHTML = MIC;
+        mic.setAttribute("aria-label", "Speak the goal");
+      }
+
+      async function startListening() {
+        if (listening || closing || starting) return;
+        starting = true;
+        typedWhileStarting = false;
+        const reply = await window.bar.listen("start");
+        starting = false;
+        if (typedWhileStarting || closing) {
+          // They began typing before the mic was even open: never listen for this bar.
+          if (reply && reply.ok) window.bar.listen("cancel");
           return;
         }
-        const reply = await window.core.call("listen_start");
-        const started = reply && reply.ok && reply.result.listening;
-        if (!started) {
-          flash("No mic");
+        if (!(reply && reply.ok)) {
+          flash(reply && /voice is off/.test(reply.error || "") ? "Voice off" : "No mic");
+          setMode("typing");
           return;
         }
         listening = true;
+        live = Boolean(reply.live);
+        heardSpeech = false;
         mic.classList.add("live");
-        mic.setAttribute("aria-label", "Stop listening");
-        hint.textContent = "Listening";
+        mic.setAttribute("aria-label", "Stop listening and submit");
+        setMode("listening");
+        if (!live) hint.innerHTML = "<kbd>Enter</kbd>";
       }
 
-      mic.addEventListener("click", toggleMic);
+      // Typing wins: stop listening instantly and throw away whatever was half-heard.
+      function cancelListening() {
+        if (!listening) return;
+        listening = false;
+        clearSilence();
+        if (heardSpeech) input.value = "";
+        heardSpeech = false;
+        micIdle();
+        hint.innerHTML = IDLE_HINT;
+        window.bar.listen("cancel");
+        setMode("typing");
+      }
 
-      input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") finish(true, false);
-        if (e.key === "Escape") {
-          if (listening) {
-            toggleMic();
-          } else {
-            finish(false);
-          }
+      async function submitSpeech() {
+        if (!listening || closing) return;
+        listening = false;
+        clearSilence();
+        mic.classList.remove("live");
+        mic.classList.add("busy");
+        mic.innerHTML = SPINNER;
+        mic.setAttribute("aria-label", "Transcribing");
+        setMode("thinking");
+        const partial = input.value.trim();
+        const reply = await window.bar.listen("stop");
+        const heard = ((reply && reply.ok && reply.result && reply.result.heard) || partial || "").trim();
+        if (heard) {
+          input.value = heard;
+          finish(heard, true); // speaking is the whole instruction; there is nothing left to confirm
+        } else {
+          micIdle();
+          setMode("typing");
+          flash("Nothing heard");
         }
+      }
+
+      window.bar.onInterim((text) => {
+        if (!listening || closing) return;
+        heardSpeech = true;
+        input.value = text;
+        clearSilence();
+        silenceTimer = setTimeout(submitSpeech, SILENCE_MS);
       });
 
-      window.addEventListener("DOMContentLoaded", () => {
+      mic.addEventListener("click", () => {
+        if (listening) submitSpeech();
+        else startListening();
         input.focus();
+      });
+
+      dictate.addEventListener("click", () => {
+        setPurpose(purpose === "dictate" ? "talk" : "dictate");
+        input.focus();
+      });
+
+      // Capture phase, so every key reaches this first whichever control has focus.
+      document.addEventListener(
+        "keydown",
+        (e) => {
+          if (closing) return;
+          if (e.key === "Escape") {
+            e.preventDefault();
+            finish("", false);
+            return;
+          }
+          if (e.key === "Tab") {
+            e.preventDefault();
+            setPurpose(purpose === "dictate" ? "talk" : "dictate");
+            input.focus();
+            return;
+          }
+          if (e.key === "Enter") {
+            if (document.activeElement !== input) return; // Enter on a button is that button's click
+            e.preventDefault();
+            if (listening) submitSpeech();
+            else finish(input.value.trim(), false);
+            return;
+          }
+          const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+          if (starting && printable) typedWhileStarting = true;
+          if (listening && (printable || e.key === "Backspace" || e.key === "Delete")) {
+            cancelListening();
+            if (document.activeElement !== input) input.focus();
+          }
+        },
+        true,
+      );
+
+      function reportFocus(when) {
+        window.bar.reportFocus({ when, hasFocus: document.hasFocus(), active: document.activeElement && document.activeElement.id });
+      }
+
+      window.addEventListener("focus", () => reportFocus("window focus"));
+
+      window.addEventListener("DOMContentLoaded", () => {
+        setPurpose("talk");
+        setMode("typing");
+        input.focus();
+        reportFocus("loaded");
+        setTimeout(() => reportFocus("after 300ms"), 300);
         // Opening straight into listening is the point of the hotkey: press it, speak, done.
-        if (window.bar.listenOnOpen) toggleMic();
+        if (window.bar.listenOnOpen) startListening();
       });
     </script>
   </body>

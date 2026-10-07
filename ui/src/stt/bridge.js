@@ -61,7 +61,7 @@ function browserArgs(url, profile) {
   ];
 }
 
-function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-US", log = () => {} } = {}) {
+function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-US", log = () => {}, onInterim = () => {} } = {}) {
   let lang = initialLang;
   let sweptOrphans = false;
   const token = crypto.randomBytes(24).toString("hex");
@@ -108,6 +108,8 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
       lastError = String(msg.error);
       log(`speech: ${lastError}`); // an error code such as no-speech, never a transcript
     }
+    // Live text goes to whoever asked (the command bar), never to a log.
+    if (!msg.final && typeof msg.interim === "string" && listening) onInterim(msg.interim);
     if (msg.final) settleFinal(typeof msg.text === "string" ? msg.text.trim() : "");
   }
 
@@ -253,6 +255,13 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
     });
   }
 
+  /** Drop the current utterance: the page posts no transcript and any pending stop resolves "". */
+  function cancel() {
+    listening = false;
+    send("cancel");
+    settleFinal("");
+  }
+
   /** Kill the browser this bridge spawned (its process tree only) and close the server. */
   function shutdown() {
     quitting = true;
@@ -279,6 +288,7 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
     setLang,
     start,
     stop,
+    cancel,
     available,
     shutdown,
     lastError: () => lastError,
