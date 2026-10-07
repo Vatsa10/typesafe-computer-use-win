@@ -73,6 +73,31 @@ impl Events {
         self.out
             .event("highlight", json!({ "marks": marks, "seconds": seconds }));
     }
+
+    /// Point the buddy at one box, in physical virtual-desktop pixels, for `hold` seconds.
+    /// `step` is (i, n) for a teach step and absent otherwise.
+    pub fn point(&self, mark: &Mark, tone: &str, step: Option<(usize, usize)>, hold: f64) {
+        let mut v = json!({
+            "x": mark.x, "y": mark.y, "w": mark.w, "h": mark.h,
+            "label": mark.label.clone().unwrap_or_default(),
+            "tone": tone, "hold": hold,
+        });
+        if let Some((i, n)) = step {
+            v["step"] = json!(i);
+            v["of"] = json!(n);
+        }
+        self.out.event("point", v);
+    }
+
+    /// Stop pointing.
+    pub fn clear_point(&self) {
+        self.out.event("point", json!({ "clear": true }));
+    }
+
+    /// Read a line aloud (a teach step) without it being the answer. Returns whether it was.
+    pub fn speak(&self, text: &str) -> bool {
+        (self.speaker)(text)
+    }
 }
 
 /// The loop, as the daemon sees it. Every method returns at once: a run happens on the runner's
@@ -150,6 +175,26 @@ impl wcore::runner::Events for Bridge<'_> {
     fn state(&self, running: bool, paused: bool) {
         self.0.state(RunState { running, paused });
     }
+    fn point(&self, m: wcore::runner::Mark, step: Option<(usize, usize)>, hold: f64) {
+        let tone = match m.tone {
+            wcore::runner::Tone::Point => "point",
+            wcore::runner::Tone::Note => "note",
+        };
+        let mark = Mark {
+            x: m.x,
+            y: m.y,
+            w: m.w,
+            h: m.h,
+            label: Some(m.label),
+        };
+        self.0.point(&mark, tone, step, hold);
+    }
+    fn clear_point(&self) {
+        self.0.clear_point();
+    }
+    fn speak(&self, text: &str) {
+        self.0.speak(text);
+    }
 }
 
 /// One queued goal.
@@ -165,8 +210,10 @@ pub type Execute = Box<dyn Fn(&Job, &wcore::runner::Control) + Send>;
 /// Classifies one spoken line: (text, running, paused).
 pub type Classify =
     Box<dyn Fn(&str, bool, bool) -> Result<wcore::intent::Intent, String> + Send + Sync>;
-/// Looks at the screen and answers, emitting `answer` itself. Touches nothing.
-pub type Answerer = Box<dyn Fn(&str, &Events) -> Result<String, String> + Send + Sync>;
+/// Looks at the screen and answers, emitting `answer` itself, then teaches the steps until done
+/// or the control is aborted. Touches nothing.
+pub type Answerer =
+    Box<dyn Fn(&str, &Events, &wcore::runner::Control) -> Result<String, String> + Send + Sync>;
 
 /// The loop behind the daemon: one dedicated run thread and one shared control, which the hotkeys
 /// reach through [`Runner::pause`] and [`Runner::abort`].
@@ -176,6 +223,9 @@ pub struct Wired {
     jobs: Mutex<mpsc::Sender<Job>>,
     classify: Classify,
     answer: Answerer,
+    /// Teaching's own stop, apart from the run's: a question can be answered while a run goes.
+    teach_control: wcore::runner::Control,
+    teaching: Arc<AtomicBool>,
 }
 
 impl Wired {
@@ -231,6 +281,8 @@ impl Wired {
             jobs: Mutex::new(tx),
             classify,
             answer,
+            teach_control: wcore::runner::Control::new(),
+            teaching: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -262,7 +314,13 @@ impl Wired {
                 Ok(_) => "answered".into(),
                 Err(e) => format!("could not answer: {e}"),
             },
+            // A spoken stop while teaching ends the teaching; a run, if any, stops too below.
+            "stop_run" if self.teaching.load(Ordering::SeqCst) && !running => {
+                self.teach_control.abort("asked to stop");
+                "stopping the teaching".into()
+            }
             "quit_daemon" => {
+                self.teach_control.abort("quitting");
                 if running {
                     self.control.abort("quitting");
                 }
@@ -275,6 +333,7 @@ impl Wired {
                 other.split('_').next().unwrap_or(other)
             ),
             "stop_run" => {
+                self.teach_control.abort("asked to stop");
                 self.control.abort("asked to stop");
                 "aborting the run".into()
             }
@@ -330,6 +389,9 @@ impl Runner for Wired {
     }
 
     fn abort(&self) -> Result<bool, String> {
+        if self.teaching.load(Ordering::SeqCst) {
+            self.teach_control.abort("asked to stop");
+        }
         if !self.running() {
             return Ok(false);
         }
@@ -346,7 +408,11 @@ impl Runner for Wired {
     }
 
     fn ask(&self, question: &str, events: Events) -> Result<String, String> {
-        (self.answer)(question, &events)
+        self.teach_control.reset();
+        self.teaching.store(true, Ordering::SeqCst);
+        let said = (self.answer)(question, &events, &self.teach_control);
+        self.teaching.store(false, Ordering::SeqCst);
+        said
     }
 
     fn state(&self) -> RunState {
@@ -401,7 +467,11 @@ fn classify_live(text: &str, running: bool, paused: bool) -> Result<wcore::inten
         .map_err(|e| format!("could not classify that: {e}"))
 }
 
-fn answer_live(question: &str, events: &Events) -> Result<String, String> {
+fn answer_live(
+    question: &str,
+    events: &Events,
+    control: &wcore::runner::Control,
+) -> Result<String, String> {
     let scribe = wcore::writer::make_writer();
     wcore::runner::answer_screen(
         question,
@@ -411,6 +481,7 @@ fn answer_live(question: &str, events: &Events) -> Result<String, String> {
             .map(|w| w as &dyn wcore::writer::StructuredWriter),
         &wcore::config::browser(),
         &Bridge(events),
+        control,
     )
     .map_err(|e| e.to_string())
 }
@@ -488,8 +559,20 @@ mod tests {
     fn wired(command: &'static str, heard: f64) -> (Wired, Events, Captured) {
         let captured = Captured::default();
         let events = Events::new(Emitter::new(captured.clone()), Arc::new(|_| false), "keys");
-        let answer: Answerer = Box::new(|q: &str, e: &Events| {
+        let answer: Answerer = Box::new(|q: &str, e: &Events, c: &wcore::runner::Control| {
             e.answer(&format!("about {q}"));
+            // "teach slowly" holds like a long lesson until a stop reaches the control.
+            if q == "teach slowly" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while c.checkpoint().is_ok() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                e.line(if c.aborting() {
+                    "teaching stopped"
+                } else {
+                    "taught"
+                });
+            }
             Ok(format!("about {q}"))
         });
         (
@@ -607,6 +690,69 @@ mod tests {
             .iter()
             .any(|m| m["event"] == "state" && m["paused"] == true));
         w.abort().unwrap();
+    }
+
+    #[test]
+    fn point_maps_core_marks_to_physical_pixels_with_step_and_hold_and_clears() {
+        let captured = Captured::default();
+        let events = Events::new(Emitter::new(captured.clone()), Arc::new(|_| true), "");
+        let bridge = Bridge(&events);
+        bridge.point(
+            wcore::runner::Mark {
+                x: 41.0,
+                y: -1440.0,
+                w: 20.0,
+                h: 20.0,
+                label: "Click Settings".into(),
+                tone: wcore::runner::Tone::Point,
+            },
+            Some((2, 3)),
+            2.5,
+        );
+        bridge.point(
+            wcore::runner::Mark {
+                x: 1.0,
+                y: 2.0,
+                w: 3.0,
+                h: 4.0,
+                label: "would press: Send".into(),
+                tone: wcore::runner::Tone::Point,
+            },
+            None,
+            5.0,
+        );
+        bridge.clear_point();
+        let m = captured.messages();
+        assert_eq!(
+            m[0],
+            json!({ "event": "point", "x": 41.0, "y": -1440.0, "w": 20.0, "h": 20.0,
+                    "label": "Click Settings", "tone": "point", "step": 2, "of": 3, "hold": 2.5 })
+        );
+        assert_eq!(
+            m[1],
+            json!({ "event": "point", "x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0,
+                    "label": "would press: Send", "tone": "point", "hold": 5.0 })
+        );
+        assert_eq!(m[2], json!({ "event": "point", "clear": true }));
+    }
+
+    #[test]
+    fn a_spoken_stop_ends_teaching_even_with_no_run() {
+        let (w, events, captured) = wired("stop_run", 1.0);
+        let w = Arc::new(w);
+        let (w2, e2) = (w.clone(), events.clone());
+        let teacher = std::thread::spawn(move || w2.ask("teach slowly", e2));
+        wait_until(|| w.teaching.load(Ordering::SeqCst));
+        assert_eq!(
+            w.route_said("stop", true, events).unwrap()["routed"],
+            "stopping the teaching"
+        );
+        teacher.join().unwrap().unwrap();
+        assert!(captured
+            .messages()
+            .iter()
+            .any(|m| m["text"] == "teaching stopped"));
+        assert!(!w.teaching.load(Ordering::SeqCst));
     }
 
     #[test]

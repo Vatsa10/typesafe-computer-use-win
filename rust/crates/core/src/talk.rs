@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::config::MAX_OPTIONS;
 use crate::models::{Item, Screen};
-use crate::writer::{compose_explanation, StructuredWriter, WriterError};
+use crate::writer::{compose_explanation, compose_teach, StructuredWriter, Teach, WriterError};
 
 /// How talk mode sees: a capture, then the items read from it. Read-only by contract.
 pub trait Eyes {
@@ -67,6 +67,32 @@ pub fn answer_question(
     };
     log(&answer);
     Ok(answer)
+}
+
+/// Teach mode: look at the screen once, answer briefly, and list the next steps, each naming the
+/// numbered item it uses. The capture and items come back with it, so the caller can show where
+/// each step is: the steps are about this one capture. Still read-only; showing is the caller's.
+///
+/// An unavailable writer comes back as a sentence with no steps, as in `answer_question`.
+pub fn teach_question(
+    writer: &dyn StructuredWriter,
+    eyes: &dyn Eyes,
+    question: &str,
+    browser: &str,
+) -> Result<(Screen, Vec<Item>, Teach), TalkError> {
+    let screen = eyes.capture(browser).map_err(TalkError::Look)?;
+    let items = eyes
+        .perceive(&screen, MAX_OPTIONS, question)
+        .map_err(TalkError::Look)?;
+    let teach = match compose_teach(writer, question, &screen, &items) {
+        Ok(t) => t,
+        Err(WriterError::Unavailable(why)) => Teach {
+            answer: format!("I could not answer that: the writer is unavailable ({why})."),
+            steps: Vec::new(),
+        },
+        Err(e) => return Err(TalkError::Writer(e)),
+    };
+    Ok((screen, items, teach))
 }
 
 #[cfg(test)]
@@ -205,6 +231,21 @@ mod tests {
         let got = answer_question(&w, &Blind, "q", "", &mut quiet());
         assert_eq!(got, Err(TalkError::Look("no display".into())));
         assert!(w.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn teach_returns_the_capture_the_items_and_the_steps() {
+        let w = Fake::new(
+            json!({"answer": "Use Export.", "steps": [{"text": "Click Export", "item": 0}]}),
+        );
+        let (s, items, t) = teach_question(&w, &eyes(), "how do I export", "").unwrap();
+        assert_eq!(s.app, "Chrome");
+        assert_eq!(items.len(), 2);
+        assert_eq!(t.answer, "Use Export.");
+        assert_eq!(t.steps[0].item, Some(0));
+        let w = Fake::failing("Your credit balance is too low to access the API");
+        let (_, _, t) = teach_question(&w, &eyes(), "how", "").unwrap();
+        assert!(t.answer.contains("out of credit") && t.steps.is_empty());
     }
 
     /// The safety property, pinned: talk mode cannot act. Its only inputs are a read-only `Eyes`

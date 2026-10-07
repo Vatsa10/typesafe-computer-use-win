@@ -91,6 +91,15 @@ fn is_speech_window(title: &str) -> bool {
     title == SPEECH_WINDOW_TITLE
 }
 
+/// The title of the shell's buddy window, the cursor companion that points at things.
+pub const BUDDY_WINDOW_TITLE: &str = "Pointer buddy";
+
+/// The shell's buddy window, skipped by its exact title like the speech window: a run must never
+/// read the thing doing the pointing as an app on screen.
+fn is_buddy_window(title: &str) -> bool {
+    title == BUDDY_WINDOW_TITLE
+}
+
 /// Foreground first, then by monitor, then z-order. `z` is the position `EnumWindows` gave it,
 /// which is front-to-back within a monitor.
 fn order_key(info: &WindowInfo, z: usize) -> (u8, usize, usize) {
@@ -205,6 +214,7 @@ pub fn open_windows(min_side: i32) -> Vec<WindowInfo> {
         let minimized = minimized_from(unsafe { IsIconic(hwnd) }.as_bool(), rect);
         if Some(pid) == ui_pid
             || is_speech_window(&title)
+            || is_buddy_window(&title)
             || !is_real_window(visible, &title, pid, own_pid, minimized, rect, min_side)
         {
             continue;
@@ -362,6 +372,14 @@ mod tests {
         assert!(!is_speech_window("Pointer speech - Google Chrome"));
         assert!(!is_speech_window("pointer speech"));
         assert!(!is_speech_window("Pointer"));
+    }
+
+    #[test]
+    fn the_buddy_window_is_skipped_by_its_exact_title_only() {
+        assert!(is_buddy_window("Pointer buddy"));
+        assert!(!is_buddy_window("Pointer buddy - Notes"));
+        assert!(!is_buddy_window("pointer buddy"));
+        assert!(!is_buddy_window("Pointer speech"));
     }
 
     #[test]

@@ -279,8 +279,9 @@ function openBar() {
 ipcMain.handle("bar-done", async (_event, text, spoken) => {
   if (bar && !bar.isDestroyed()) bar.close();
   if (!text) return { ok: true };
-  // A typed line is a goal. A spoken one is classified first: "stop" arrives as text too.
-  return spoken ? call("say", { text }) : call("start", { goal: text, act: null });
+  // Typed or spoken, the bar is classified: a goal runs, a question is taught, "stop" stops. Typed
+  // text was not misheard, so it goes in as `heard` (fully heard); speech goes through `say`.
+  return spoken ? call("say", { text }) : call("heard", { text, purpose: "talk" });
 });
 
 /* ------------------------------------------------------------- the overlay */

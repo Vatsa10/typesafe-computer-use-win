@@ -26,7 +26,7 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `capture` | `{ monitor? }` (default 0) | `{ width, height, origin: [x, y], bytes }` |
 | `start` | `{ goal, act }` | `{ queued: bool }`; `act: null` uses the mode from `set_mode` |
 | `say` | `{ text }` | `{ command, goal, confidence, heard, actionable, routed }` — what the runner made of a spoken line and what it did with it |
-| `heard` | `{ text }` | as `say` — a final transcript from the shell's browser recognizer (chrome engine), which counts as fully heard (`heard: 1.0`) |
+| `heard` | `{ text, purpose? }` | `purpose` is `"talk"` (the default when absent) or `"dictate"`, echoed from the `stt` event that started the recording. Talk: as `say` — a final transcript from the shell's browser recognizer (chrome engine), which counts as fully heard (`heard: 1.0`). Dictate: `{ typed: n }` — the text is typed into the focused field plus a trailing space and never routed ("stop" is typed, not obeyed); empty text types nothing (`typed: 0`); refused with `dictation is off while Pointer is acting` while a run is going in Act mode |
 | `ask` | `{ question }` | `{ answer: string }` — talk mode, touches nothing |
 | `pause` | — | `{ paused: bool }` — toggles; also emits `state` |
 | `abort` | — | `{ ok: bool }` — whether there was a run; also emits `state` |
@@ -79,19 +79,57 @@ prompt naming Claude Code, VS Code, Chrome and the commands, so "Claude" is not 
 |---|---|---|
 | `line` | `{ text }` | anything the run would have printed |
 | `state` | `{ running, paused, hotkeys }` | at startup, and when a run starts, pauses, resumes or ends |
-| `hotkey` | `{ name }` | a global hotkey fired: `bar`, `talk`, `goal`, `pause`, `abort` or `quit` (the bar opens on `bar`) |
+| `hotkey` | `{ name }` | a global hotkey fired: `bar`, `talk`, `dictate`, `goal`, `pause`, `abort` or `quit` (the bar opens on `bar`) |
 | `highlight` | `{ marks: [ { x, y, w, h, label? } ], seconds }` | point at something on screen for `seconds` |
-| `stt` | `{ action: "start" \| "stop" }` | chrome engine only: the talk key went down / up; the shell records and replies with `heard` |
+| `stt` | `{ action: "start" \| "stop", purpose: "talk" \| "dictate" }` | chrome engine only: the talk or dictate key went down / up; the shell records and replies with `heard`, passing the same `purpose` back |
 | `answer` | `{ text, spoken }` | an answer is ready, and whether it was read aloud (`CLICKER_SPEAK`) |
+| `point` | `{ x, y, w, h, label, tone, step?, of?, hold }` or `{ clear: true }` | the buddy points at one box for `hold` seconds; see below |
 
 `highlight` marks are in PHYSICAL pixels on the virtual desktop — what the core captures and clicks
 in, and negative on a monitor above or left of the primary. The shell converts each one to DIPs
 for the monitor it is on (`screen.screenToDipRect`); one global scale factor is wrong on a desk
 with mixed scaling.
 
+### `point`
+
+One event for every kind of pointing. `x, y, w, h` are the target's box in PHYSICAL virtual-desktop
+pixels, the captured display's origin added once (the same coordinates as `highlight` and as a
+click). `label` is what to show beside it, `tone` is `point` (the thing to use) or `note`, `hold` is
+seconds to stay, and `step` / `of` (1-based) appear only for a teach step. `{ "clear": true }` ends
+pointing. Who points:
+
+- **Dry run:** besides the `highlight` box, `point` at the chosen target, label `would press: <text>`,
+  hold 5 s.
+- **Act preview:** before pressing an on-screen item the core sends `point` (label `press: <text>`;
+  `type into: <label>` before typing into a focused field with a box), then waits
+  `CLICKER_POINT_LEAD_MS` (default 350, 0 disables) so the buddy gets there first. No
+  acknowledgement is awaited. Actions with nothing on screen (open a URL, launch an app, scroll,
+  keys) are neither pointed at nor delayed.
+- **Teach (`ask`, or a spoken question):** one capture, then `answer` with a short answer, then for
+  each of up to 5 steps: `point` at the step's item (`step` i `of` n, label = the step, hold = the
+  pause below), a `line` `step i/n: <text>`, the step read aloud, and a pause of 60 ms a character
+  (1.5–6 s) so the voice finishes before the next. A step naming no listed item is only said, with
+  no `point`. Teaching ends with `{ clear: true }`. A spoken "stop" (or the abort hotkey) ends it
+  between steps; the steps are about the capture taken when the question was asked.
+
+The shell's buddy window is titled exactly `Pointer buddy`; the core's window survey skips that
+title, as it does `Pointer speech`.
+
 The core handles `pause`, `abort` and `quit` hotkeys itself (quit aborts the run; closing the app
 is the shell's call) and `talk` records while the key is held and routes what it heard, as `say`
 does. `bar` and `goal` only open windows, which is the shell's job.
+
+## Dictation
+
+`dictate` (default `ctrl+alt+d`, `CLICKER_HOTKEY_DICTATE`) is held like `talk`, but what is heard is
+typed into whatever field has focus when the key comes up, with a trailing space so consecutive
+dictations join. It never reaches intent routing. On openai/windows the core records and types; on
+chrome the core emits `stt` with `purpose: "dictate"` and the shell must send the transcript back as
+`heard { text, purpose: "dictate" }` (the shell should not focus any of its windows meanwhile). The
+core waits ~120 ms after release and for Ctrl/Alt/Shift/Win to be up before typing, so the hotkey's
+modifiers do not turn letters into shortcuts. The log gets `dictated N characters`, never the text.
+Dictation works beside a dry run but is refused, with the line `dictation is off while Pointer is
+acting`, while a run is going in Act mode, since its keystrokes would land among the run's.
 
 All output is UTF-8, one object per line, written under one lock so an event never splits a reply.
 Set `CLICKER_NO_HOTKEYS=1` to run the protocol without registering global hotkeys.

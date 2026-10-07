@@ -320,6 +320,98 @@ pub fn compose_explanation(
     Ok(field_str(&data, "answer")?.trim().to_string())
 }
 
+pub const COMPOSE_TEACH_SYSTEM: &str = "A user asked a question about the screen in front of them, and you are teaching them, not acting: you never press anything yourself. You receive the question, a capture of their screen as it is now, and a numbered list of the items read from that screen (index, text, role, region). Answer briefly from what is visible and nothing else: never from memory, and never a guess; plain text, no markdown, two sentences at most. Then give up to 5 concrete next steps the user would take, in order, each one short sentence naming the on-screen control by its visible label. For each step set item to the index of the single numbered item from the provided list that the step uses, or null when no listed item applies (a keyboard shortcut, a control that is not on screen yet, or anything not in the list). Never invent items or indexes that are not in the list. When the question needs no steps, return an empty steps list. Trust the capture over the text where the two disagree.";
+
+/// The most steps a teach answer gives; anything past this is dropped.
+pub const MAX_TEACH_STEPS: usize = 5;
+
+/// One thing for the user to do, and the item on screen it uses, when there is one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub text: String,
+    /// An `Item::index` from the list the writer was given; never an index outside it.
+    pub item: Option<usize>,
+}
+
+/// A short answer, then the steps that would get the user there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Teach {
+    pub answer: String,
+    pub steps: Vec<Step>,
+}
+
+/// Answer a question about the screen and teach the next steps, naming the numbered item each
+/// step uses. An index the list does not hold becomes `None`: the writer cannot invent a target.
+pub fn compose_teach(
+    writer: &dyn StructuredWriter,
+    question: &str,
+    screen: &Screen,
+    items: &[Item],
+) -> Result<Teach, WriterError> {
+    let listed: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            json!({
+                "index": it.index,
+                "text": it.text,
+                "role": it.role,
+                "region": screen.region(it),
+            })
+        })
+        .collect();
+    let packet = json!({
+        "question": question,
+        "now": now_context(),
+        "frontmost_app": screen.app,
+        "browser_active_tab_url": screen.url,
+        "items": listed,
+    });
+    let properties = json!({
+        "answer": {"type": "string"},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text", "item"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "item": {"type": ["integer", "null"]},
+                },
+            },
+        },
+    });
+    let png = png_bytes(screen);
+    let data = structured(
+        writer,
+        &answer_model(),
+        COMPOSE_TEACH_SYSTEM,
+        &packet,
+        &properties,
+        1024,
+        png.as_deref(),
+    )?;
+    let answer = field_str(&data, "answer")?.trim().to_string();
+    let raw = data
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WriterError::BadReply("no array \"steps\"".into()))?;
+    let mut steps = Vec::new();
+    for s in raw.iter().take(MAX_TEACH_STEPS) {
+        let text = field_str(s, "text")?.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let item = s
+            .get("item")
+            .and_then(Value::as_u64)
+            .map(|i| i as usize)
+            .filter(|i| items.iter().any(|it| it.index == *i));
+        steps.push(Step { text, item });
+    }
+    Ok(Teach { answer, steps })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -566,6 +658,68 @@ pub(crate) mod tests {
         assert_eq!(call.packet["question"], "what does this say");
         assert!(call.png.is_some());
         assert_eq!(call.properties, json!({"answer": {"type": "string"}}));
+    }
+
+    #[test]
+    fn teach_sends_the_numbered_items_and_the_capture_and_drops_invented_indexes() {
+        let w = Fake::new(json!({"answer": " Settings is top right. ", "steps": [
+            {"text": "Click Settings", "item": 1},
+            {"text": "Press Ctrl+, instead", "item": null},
+            {"text": "Click the ghost", "item": 99},
+            {"text": "a", "item": 0}, {"text": "b", "item": 0}, {"text": "c", "item": 0},
+        ]}));
+        let mut settings = make_item(1, "Settings", 100.0, 130.0);
+        settings.role = "button".into();
+        let items = vec![make_item(0, "File", 10.0, 30.0), settings];
+        let got = compose_teach(&w, "how do I open settings?", &screen(), &items).unwrap();
+        assert_eq!(got.answer, "Settings is top right.");
+        assert_eq!(got.steps.len(), MAX_TEACH_STEPS);
+        assert_eq!(
+            got.steps[..3],
+            [
+                Step {
+                    text: "Click Settings".into(),
+                    item: Some(1)
+                },
+                Step {
+                    text: "Press Ctrl+, instead".into(),
+                    item: None
+                },
+                Step {
+                    text: "Click the ghost".into(),
+                    item: None
+                },
+            ]
+        );
+        let call = &w.calls.borrow()[0];
+        assert_eq!(call.system, COMPOSE_TEACH_SYSTEM);
+        assert_eq!(call.max_tokens, 1024);
+        assert!(call.png.as_ref().unwrap().starts_with(b"\x89PNG"));
+        assert_eq!(call.packet["question"], "how do I open settings?");
+        let listed = &call.packet["items"][1];
+        assert_eq!(listed["index"], 1);
+        assert_eq!(listed["text"], "Settings");
+        assert_eq!(listed["role"], "button");
+        assert!(listed["region"].is_string());
+        let step = &call.properties["steps"]["items"];
+        assert_eq!(step["additionalProperties"], false);
+        assert_eq!(step["required"], json!(["text", "item"]));
+        assert_eq!(
+            step["properties"]["item"]["type"],
+            json!(["integer", "null"])
+        );
+        let system = call.system.to_lowercase();
+        assert!(system.contains("up to 5") && system.contains("never invent items"));
+        assert!(system.contains("null"));
+    }
+
+    #[test]
+    fn teach_without_steps_is_a_bad_reply() {
+        let w = Fake::new(json!({"answer": "x"}));
+        assert!(matches!(
+            compose_teach(&w, "q", &screen(), &[]),
+            Err(WriterError::BadReply(_))
+        ));
     }
 
     #[test]

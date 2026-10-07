@@ -220,6 +220,33 @@ pub trait Events {
     /// The final answer, or talk mode's explanation.
     fn answer(&self, text: &str);
     fn state(&self, running: bool, paused: bool);
+    /// Point the buddy at one box for about `hold` seconds: a dry run's target, the item an
+    /// acting run is about to press, or a teach step (`step` is (i, n), 1-based). The mark is in
+    /// physical virtual-desktop pixels, origin added once, like [`Events::highlight`].
+    fn point(&self, _mark: Mark, _step: Option<(usize, usize)>, _hold: f64) {}
+    /// Stop pointing.
+    fn clear_point(&self) {}
+    /// Read a line aloud without it being the answer (a teach step). Need not block.
+    fn speak(&self, _text: &str) {}
+}
+
+pub const DEFAULT_POINT_LEAD_MS: u64 = 350;
+
+/// How long an acting run points at an item before pressing it, so the buddy gets there first:
+/// `CLICKER_POINT_LEAD_MS`, default 350; 0 points without waiting.
+pub fn point_lead() -> Duration {
+    let ms = std::env::var("CLICKER_POINT_LEAD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_POINT_LEAD_MS);
+    Duration::from_millis(ms)
+}
+
+/// How long to give one spoken teach line before the next: 60 ms a character, 1.5 s to 6 s. The
+/// voice does not report when it is done, so this estimates it.
+pub fn speech_pause(text: &str) -> Duration {
+    let ms = (text.chars().count() as u64 * 60).clamp(1500, 6000);
+    Duration::from_millis(ms)
 }
 
 // ---------------------------------------------------------------- adapters
@@ -413,28 +440,89 @@ pub fn run_goal<A: actions::Desktop<Handle = PressHandle>>(
     result
 }
 
-/// Look at the screen and answer a question about it, acting on nothing (`talk`).
+/// Look at the screen and answer a question about it, acting on nothing (`talk`), then teach:
+/// for each next step, point at the item it uses, say it, and give the voice time before the next.
+/// A step with no item is only said. `control` aborting (a spoken "stop") ends the teaching.
 pub fn answer_screen(
     question: &str,
     eyes: &dyn perception::Desktop,
     writer: Option<&dyn StructuredWriter>,
     browser: &str,
     events: &dyn Events,
+    control: &Control,
+) -> Result<String, TalkError> {
+    answer_screen_paced(
+        question,
+        eyes,
+        writer,
+        browser,
+        events,
+        control,
+        &speech_pause,
+    )
+}
+
+/// [`answer_screen`] with the pause per spoken line given, so tests need not wait for a voice.
+pub fn answer_screen_paced(
+    question: &str,
+    eyes: &dyn perception::Desktop,
+    writer: Option<&dyn StructuredWriter>,
+    browser: &str,
+    events: &dyn Events,
+    control: &Control,
+    pace: &dyn Fn(&str) -> Duration,
 ) -> Result<String, TalkError> {
     let Some(writer) = writer else {
         let said = "I could not answer that: no writer is configured (set OPENAI_API_KEY).";
         events.answer(said);
         return Ok(said.to_string());
     };
-    let said = talk::answer_question(
-        writer,
-        &PerceptionEyes(eyes),
-        question,
-        browser,
-        &mut |_| {},
-    )?;
-    events.answer(&said);
-    Ok(said)
+    let (screen, items, teach) =
+        talk::teach_question(writer, &PerceptionEyes(eyes), question, browser)?;
+    events.answer(&teach.answer);
+    if teach.steps.is_empty() {
+        return Ok(teach.answer);
+    }
+    let n = teach.steps.len();
+    let taught = (|| -> Result<(), Abort> {
+        wait_watching(control, pace(&teach.answer))?;
+        for (i, step) in teach.steps.iter().enumerate() {
+            control.checkpoint()?;
+            let pause = pace(&step.text);
+            let target = step
+                .item
+                .and_then(|k| items.iter().find(|it| it.index == k));
+            if let Some(item) = target {
+                events.point(
+                    item_mark(&screen, item, step.text.clone()),
+                    Some((i + 1, n)),
+                    pause.as_secs_f64(),
+                );
+            }
+            events.line(&format!("step {}/{n}: {}", i + 1, step.text));
+            events.speak(&step.text);
+            wait_watching(control, pause)?;
+        }
+        Ok(())
+    })();
+    events.clear_point();
+    if let Err(Abort(why)) = taught {
+        events.line(&format!("teaching stopped ({why})"));
+    }
+    Ok(teach.answer)
+}
+
+/// Wait, returning early with the abort when `control` is aborted.
+fn wait_watching(control: &Control, d: Duration) -> Result<(), Abort> {
+    let end = Instant::now() + d;
+    loop {
+        control.checkpoint()?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        std::thread::sleep(POLL.min(end - now));
+    }
 }
 
 struct Runner<'r, 'a, A> {
@@ -804,7 +892,8 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
                     if let Some(mark) = point_at(screen, items, decision) {
                         let events = self.events;
                         let _ = catch_unwind(AssertUnwindSafe(|| {
-                            events.highlight(vec![mark], HIGHLIGHT_SECONDS)
+                            events.highlight(vec![mark.clone()], HIGHLIGHT_SECONDS);
+                            events.point(mark, None, HIGHLIGHT_SECONDS);
                         }));
                     }
                 }
@@ -817,6 +906,7 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
             .view
             .take()
             .ok_or_else(|| Stop::Crash("no capture to act on".into()))?;
+        self.preview(&chosen, &screen, &items)?;
         let hands = self.deps.hands;
         let what = phase(Some(timing), "act", || {
             perform(
@@ -847,6 +937,34 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
             self.consecutive_noops = 0;
         }
         Ok(true)
+    }
+
+    /// Act preview: point at what is about to be pressed or typed into, then give the buddy
+    /// [`point_lead`] to get there. Actions with nothing on screen to point at are not delayed.
+    fn preview(&self, chosen: &str, screen: &Screen, items: &[Item]) -> Result<(), Abort> {
+        let mark = if let Some(item) = items.iter().find(|it| it.index.to_string() == chosen) {
+            item_mark(screen, item, format!("press: {}", short(&item.text)))
+        } else if matches!(chosen, "type_text" | "type_email") {
+            match screen.field.as_ref().filter(|f| f.w > 0.0 && f.h > 0.0) {
+                Some(f) => Mark {
+                    x: f.x,
+                    y: f.y,
+                    w: f.w,
+                    h: f.h,
+                    label: format!("type into: {}", short(&f.label)),
+                    tone: Tone::Point,
+                },
+                None => return Ok(()),
+            }
+        } else {
+            return Ok(());
+        };
+        let lead = point_lead();
+        let events = self.events;
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            events.point(mark, None, lead.as_secs_f64() + 1.0)
+        }));
+        self.sleep_watching(lead.as_secs_f64())
     }
 
     fn log_decision(&self, step: u32, screen: &Screen, items: &[Item], decision: &Decision) {
@@ -975,19 +1093,29 @@ fn criteria_json(criteria: Criteria) -> Value {
 pub fn point_at(screen: &Screen, items: &[Item], decision: &Decision) -> Option<Mark> {
     let chosen = decision.chosen();
     let target = items.iter().find(|it| it.index.to_string() == chosen)?;
+    Some(item_mark(
+        screen,
+        target,
+        format!("would press: {}", short(&target.text)),
+    ))
+}
+
+/// An item's box on the virtual desktop, the origin added exactly once, as `Screen::to_points`.
+pub fn item_mark(screen: &Screen, item: &Item, label: String) -> Mark {
     let (left, top) = screen.origin;
     let s = screen.scale;
-    Some(Mark {
-        x: left + target.x1 / s,
-        y: top + target.y1 / s,
-        w: (target.x2 - target.x1) / s,
-        h: (target.y2 - target.y1) / s,
-        label: format!(
-            "would press: {}",
-            target.text.chars().take(40).collect::<String>()
-        ),
+    Mark {
+        x: left + item.x1 / s,
+        y: top + item.y1 / s,
+        w: (item.x2 - item.x1) / s,
+        h: (item.y2 - item.y1) / s,
+        label,
         tone: Tone::Point,
-    })
+    }
+}
+
+fn short(text: &str) -> String {
+    text.chars().take(40).collect()
 }
 
 /// What the classifier returned for this step. The caller fills in the step's `timing`.
@@ -1082,12 +1210,20 @@ mod tests {
 
     // ------------------------------------------------------------ fakes
 
+    /// One point: the mark, the teach step, the hold.
+    type Pointed = (Mark, Option<(usize, usize)>, f64);
+
     #[derive(Default)]
     struct Recorder {
         lines: RefCell<Vec<String>>,
         marks: RefCell<Vec<(Vec<Mark>, f64)>>,
         answers: RefCell<Vec<String>>,
         states: RefCell<Vec<(bool, bool)>>,
+        points: RefCell<Vec<Pointed>>,
+        clears: Cell<usize>,
+        spoken: RefCell<Vec<String>>,
+        /// Aborted at the first point, as a spoken "stop" would.
+        stop_at_point: Option<Control>,
     }
 
     impl Events for Recorder {
@@ -1102,6 +1238,18 @@ mod tests {
         }
         fn state(&self, running: bool, paused: bool) {
             self.states.borrow_mut().push((running, paused));
+        }
+        fn point(&self, mark: Mark, step: Option<(usize, usize)>, hold: f64) {
+            self.points.borrow_mut().push((mark, step, hold));
+            if let Some(c) = &self.stop_at_point {
+                c.abort("asked to stop");
+            }
+        }
+        fn clear_point(&self) {
+            self.clears.set(self.clears.get() + 1);
+        }
+        fn speak(&self, text: &str) {
+            self.spoken.borrow_mut().push(text.to_string());
         }
     }
 
@@ -1712,6 +1860,126 @@ mod tests {
         assert_eq!(m.label, "would press: TICKETS");
         assert_eq!(m.tone, Tone::Point);
         assert_eq!(*events.states.borrow(), vec![(true, false), (false, false)]);
+        // The buddy points at the same box, origin added once, and nothing else is pointed at.
+        let points = events.points.borrow();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0], (m.clone(), None, HIGHLIGHT_SECONDS));
+    }
+
+    // ------------------------------------------------------------ act preview
+
+    /// Records each point with how many desktop calls had happened by then.
+    struct Ordered<'a> {
+        hands: &'a Hands,
+        points: RefCell<Vec<(Mark, usize)>>,
+    }
+
+    impl Events for Ordered<'_> {
+        fn line(&self, _: &str) {}
+        fn highlight(&self, _: Vec<Mark>, _: f64) {}
+        fn answer(&self, _: &str) {}
+        fn state(&self, _: bool, _: bool) {}
+        fn point(&self, mark: Mark, step: Option<(usize, usize)>, _: f64) {
+            assert!(step.is_none());
+            self.points
+                .borrow_mut()
+                .push((mark, self.hands.calls.borrow().len()));
+        }
+    }
+
+    fn act_on_item(lead_ms: &str) -> (Vec<(Mark, usize)>, Vec<String>, Duration) {
+        let _g = crate::writer::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLICKER_POINT_LEAD_MS", lead_ms);
+        let (eyes, hands, brain) = (Eyes2::new(), Hands::default(), Brain::kind("wait", 0.9));
+        let d = deps(&eyes, &hands, &brain, None, scratch());
+        let events = Ordered {
+            hands: &hands,
+            points: RefCell::new(Vec::new()),
+        };
+        let control = Control::new();
+        let verifier = VerifierAdapter(d.classifier);
+        let ctx = Context {
+            goal: GOAL.into(),
+            browser: d.browser.clone(),
+            email: None,
+            writer: None,
+            verifier: &verifier,
+            history: Vec::new(),
+            sites: Vec::new(),
+            apps: Vec::new(),
+        };
+        let mut r = Runner::new(GOAL, true, &control, &events, &d, scratch(), ctx);
+        let mut s = screen();
+        s.scale = 1.0;
+        s.origin = (1.0, -1440.0);
+        let mut item = make_item(0, "Sign in", 0.0, 20.0);
+        item.x1 = 40.0;
+        item.x2 = 60.0;
+        r.view = Some((s, vec![item]));
+        let mut dec = decision("click_item", 0.9);
+        dec.item = Some(ca("0", 0.9));
+        let t = Instant::now();
+        assert!(r.resolve(&dec, &mut Timing::new()).unwrap());
+        let took = t.elapsed();
+        std::env::remove_var("CLICKER_POINT_LEAD_MS");
+        let points = events.points.into_inner();
+        let calls = hands.calls.borrow().clone();
+        (points, calls, took)
+    }
+
+    #[test]
+    fn an_acting_run_points_at_the_item_before_it_clicks_and_waits_the_lead() {
+        let (points, calls, took) = act_on_item("300");
+        assert_eq!(points.len(), 1);
+        let (m, calls_before) = &points[0];
+        assert_eq!(*calls_before, 0, "pointed after the desktop was touched");
+        assert_eq!((m.x, m.y, m.w, m.h), (41.0, -1440.0, 20.0, 20.0));
+        assert_eq!(m.label, "press: Sign in");
+        assert_eq!(calls, vec!["click_at (51.0, -1430.0)".to_string()]);
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+    }
+
+    #[test]
+    fn a_zero_lead_still_points_but_does_not_wait() {
+        let (points, calls, took) = act_on_item("0");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].1, 0);
+        assert_eq!(calls.len(), 1);
+        assert!(took < Duration::from_millis(250), "{took:?}");
+    }
+
+    #[test]
+    fn an_action_with_nothing_on_screen_is_not_pointed_at() {
+        let (eyes, hands, brain) = (Eyes2::new(), Hands::default(), Brain::kind("wait", 0.9));
+        let d = deps(&eyes, &hands, &brain, None, scratch());
+        let events = Recorder::default();
+        with_runner(&d, true, &events, |r| {
+            r.view = Some((screen(), Vec::new()));
+            r.resolve(&decision("scroll_down", 0.9), &mut Timing::new())
+                .unwrap();
+        });
+        assert!(events.points.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_lead_defaults_to_350_ms() {
+        let _g = crate::writer::tests::ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CLICKER_POINT_LEAD_MS");
+        assert_eq!(point_lead(), Duration::from_millis(350));
+        std::env::set_var("CLICKER_POINT_LEAD_MS", "junk");
+        assert_eq!(point_lead(), Duration::from_millis(350));
+        std::env::remove_var("CLICKER_POINT_LEAD_MS");
+    }
+
+    #[test]
+    fn a_spoken_line_gets_60_ms_a_character_within_bounds() {
+        assert_eq!(speech_pause("hi"), Duration::from_millis(1500));
+        assert_eq!(speech_pause(&"x".repeat(50)), Duration::from_millis(3000));
+        assert_eq!(speech_pause(&"x".repeat(500)), Duration::from_millis(6000));
     }
 
     #[test]
@@ -1820,23 +2088,165 @@ mod tests {
     #[test]
     fn answer_screen_explains_and_never_acts() {
         let eyes = Eyes2::new();
-        let fake = FakeWriter::new(json!({"answer": " Press TICKETS. "}));
+        let fake = FakeWriter::new(json!({"answer": " Press TICKETS. ", "steps": []}));
         let events = Recorder::default();
-        let said = answer_screen("how do I buy tickets?", &eyes, Some(&fake), "", &events).unwrap();
+        let said = answer_screen(
+            "how do I buy tickets?",
+            &eyes,
+            Some(&fake),
+            "",
+            &events,
+            &Control::new(),
+        )
+        .unwrap();
         assert_eq!(said, "Press TICKETS.");
         assert_eq!(*events.answers.borrow(), vec![said]);
+        assert_eq!(fake.calls.borrow()[0].packet["items"][0]["text"], "TICKETS");
+        assert!(events.points.borrow().is_empty());
+    }
+
+    fn teach_reply() -> Value {
+        json!({"answer": "Tickets are on this page.", "steps": [
+            {"text": "Click TICKETS", "item": 0},
+            {"text": "Pick a date", "item": null},
+            {"text": "Click TICKETS again", "item": 0},
+        ]})
+    }
+
+    fn no_pause(_: &str) -> Duration {
+        Duration::ZERO
+    }
+
+    #[test]
+    fn teaching_points_at_each_step_in_order_and_says_every_step() {
+        let eyes = Eyes2::new();
+        let fake = FakeWriter::new(teach_reply());
+        let events = Recorder::default();
+        let said = answer_screen_paced(
+            "how do I buy tickets?",
+            &eyes,
+            Some(&fake),
+            "",
+            &events,
+            &Control::new(),
+            &no_pause,
+        )
+        .unwrap();
+        assert_eq!(said, "Tickets are on this page.");
+        assert_eq!(*events.answers.borrow(), vec![said]);
+        let points = events.points.borrow();
+        // The step with no item is said but not pointed at.
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].1, Some((1, 3)));
+        assert_eq!(points[1].1, Some((3, 3)));
+        assert_eq!(points[0].0.label, "Click TICKETS");
+        assert_eq!(points[1].0.label, "Click TICKETS again");
+        // On the display at (1, -1440): the origin is added once.
+        assert!(points[0].0.y >= -1440.0 && points[0].0.y < -840.0);
+        assert!(points[0].0.x >= 1.0 && points[0].0.x < 801.0);
         assert_eq!(
-            fake.calls.borrow()[0].packet["screen_text_in_reading_order"],
-            json!(["TICKETS"])
+            *events.spoken.borrow(),
+            vec!["Click TICKETS", "Pick a date", "Click TICKETS again"]
         );
+        let lines = events.lines.borrow();
+        assert_eq!(
+            *lines,
+            vec![
+                "step 1/3: Click TICKETS",
+                "step 2/3: Pick a date",
+                "step 3/3: Click TICKETS again"
+            ]
+        );
+        assert_eq!(events.clears.get(), 1);
+    }
+
+    #[test]
+    fn a_spoken_stop_ends_the_teaching_after_the_current_step() {
+        let eyes = Eyes2::new();
+        let fake = FakeWriter::new(teach_reply());
+        let control = Control::new();
+        let events = Recorder {
+            stop_at_point: Some(control.clone()),
+            ..Recorder::default()
+        };
+        answer_screen_paced(
+            "how do I buy tickets?",
+            &eyes,
+            Some(&fake),
+            "",
+            &events,
+            &control,
+            &no_pause,
+        )
+        .unwrap();
+        assert_eq!(events.points.borrow().len(), 1);
+        assert_eq!(events.spoken.borrow().len(), 1);
+        assert_eq!(events.clears.get(), 1);
+        assert!(events
+            .lines
+            .borrow()
+            .last()
+            .unwrap()
+            .contains("teaching stopped"));
     }
 
     #[test]
     fn answer_screen_without_a_writer_says_why() {
         let events = Recorder::default();
-        let said = answer_screen("what is this?", &Eyes2::new(), None, "", &events).unwrap();
+        let said = answer_screen(
+            "what is this?",
+            &Eyes2::new(),
+            None,
+            "",
+            &events,
+            &Control::new(),
+        )
+        .unwrap();
         assert!(said.contains("no writer"));
         assert_eq!(events.answers.borrow().len(), 1);
+    }
+
+    /// Teach on the real screen: reads it and asks OpenAI, never acts. Prints the steps.
+    #[test]
+    #[ignore = "network: reads the real screen and makes one OpenAI call"]
+    fn live_teach_prints_the_steps() {
+        struct Print;
+        impl Events for Print {
+            fn line(&self, text: &str) {
+                println!("{text}");
+            }
+            fn highlight(&self, marks: Vec<Mark>, seconds: f64) {
+                println!("highlight {marks:?} for {seconds}s");
+            }
+            fn answer(&self, text: &str) {
+                println!("answer: {text}");
+            }
+            fn state(&self, _: bool, _: bool) {}
+            fn point(&self, mark: Mark, step: Option<(usize, usize)>, hold: f64) {
+                println!(
+                    "point {step:?} at ({:.0}, {:.0}, {:.0}x{:.0}) for {hold:.1}s: {}",
+                    mark.x, mark.y, mark.w, mark.h, mark.label
+                );
+            }
+            fn clear_point(&self) {
+                println!("clear point");
+            }
+        }
+        let env = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.env");
+        let _ = crate::config::load_dotenv(Path::new(env));
+        let ai = writer::make_writer().expect("OPENAI_API_KEY");
+        let t = Instant::now();
+        let said = answer_screen_paced(
+            "how do I open settings here?",
+            &perception::LiveDesktop,
+            Some(&ai),
+            &crate::config::browser(),
+            &Print,
+            &Control::new(),
+            &no_pause,
+        );
+        println!("{said:?} in {} ms", t.elapsed().as_millis());
+        assert!(said.is_ok());
     }
 
     /// A real dry run on the real desktop: looks, decides, prints, never acts. Needs TypeSafe.
