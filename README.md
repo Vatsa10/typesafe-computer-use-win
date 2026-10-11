@@ -36,8 +36,7 @@
                ➜ then to Export as PDF          (step 2/2)
 ```
 
-Pointer is a Windows take on heyclicky: one hotkey, and it knows what's on
-all your screens and what's under your mouse. Ask it something and it **teaches** you, pointing at
+Pointer is one hotkey that knows what's on all your screens and what's under your mouse. Ask it something and it **teaches** you, pointing at
 each thing as it talks. Give it a goal and it **does** it, clicking and typing for you. Hold a key
 and it **types what you say** into whatever you're writing in.
 
@@ -59,8 +58,8 @@ screenshot to a frontier model to plan a click.
 
 ## Install
 
-1. **Get the installer.** [Build it](#build-from-source) (`npm run dist` writes `ui\dist\Pointer Setup 0.1.0.exe`); a
-   download on [Releases](https://github.com/Vatsa10/typesafe-computer-use-win/releases) is coming.
+1. **Build the installer.** Pointer isn't released yet, so [build it from source](#build-from-source):
+   `npm run dist` writes `ui\dist\Pointer Setup 0.1.0.exe`.
    The installer isn't code-signed yet, so SmartScreen will ask: **More info → Run anyway**.
 2. **Add your keys.** Pointer opens on Settings the first time.
 
