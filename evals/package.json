@@ -1,0 +1,12 @@
+{
+  "name": "pointer-evals",
+  "private": true,
+  "type": "module",
+  "description": "Headless checks that every live task is solvable and scored correctly.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
