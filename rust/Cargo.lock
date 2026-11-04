@@ -1633,6 +1633,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "testkit"
+version = "0.1.0"
+dependencies = [
+ "api",
+ "base64 0.22.1",
+ "core",
+ "image",
+ "platform",
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,24 @@
+[package]
+name = "testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Test-only backends for Pointer. Nothing in core or pointer-core depends on this crate."
+
+[lib]
+name = "testkit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "headless_task"
+path = "src/bin/headless_task.rs"
+
+[dependencies]
+wcore = { package = "core", path = "../core" }
+platform = { path = "../platform", features = ["remote-handle"] }
+api = { path = "../api" }
+serde_json = { workspace = true }
+image = { workspace = true }
+base64 = { workspace = true }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
