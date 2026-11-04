@@ -97,6 +97,11 @@ impl Gate {
         }
     }
 
+    /// The decision model the gate asks; the fast path asks the same one.
+    pub fn classifier(&self) -> Arc<dyn Classifier + Send + Sync> {
+        self.classifier.clone()
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

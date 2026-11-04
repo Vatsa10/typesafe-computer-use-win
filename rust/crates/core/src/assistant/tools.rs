@@ -49,13 +49,14 @@ pub struct ToolEnv<'a> {
     pub ctx: &'a mut TurnCtx,
 }
 
-const FOREGROUND: [&str; 26] = [
+const FOREGROUND: [&str; 27] = [
     "interact",
     "observe",
     "locate",
     "world",
     "open_app",
     "switch_tab",
+    "switch_window",
     "pointer_run",
     "read_file",
     "list_dir",
@@ -160,6 +161,14 @@ fn schema_of(name: &str) -> Value {
              selects the tab. In Dry mode it presses nothing and reports which tab it would select: \
              call it anyway and tell the user.",
             json!({"title": {"type": "string", "description": "The tab's title, or enough of it to be unique."}}),
+            &["title"],
+        ),
+        "switch_window" => func(
+            "switch_window",
+            "Bring an open window forward by its title (from the world tool's windows). It only \
+             focuses the window. In Dry mode it does nothing and reports which window it would \
+             focus: call it anyway and tell the user.",
+            json!({"title": {"type": "string", "description": "The window's title, or enough of it to be unique."}}),
             &["title"],
         ),
         "pointer_run" => func(
@@ -336,6 +345,7 @@ pub fn dispatch(env: &mut ToolEnv, name: &str, args: &Value) -> String {
         "world" => world_tool(env, args),
         "open_app" => open_app(env, args),
         "switch_tab" => switch_tab(env, args),
+        "switch_window" => switch_window(env, args),
         "pointer_run" => pointer_run(env, args),
         "read_file" => read_file(env, args),
         "list_dir" => list_dir(env, args),
@@ -649,7 +659,7 @@ pub fn refresh_world(svc: &Arc<Services>, memory: &Mutex<Memory>, force: bool) {
 pub fn changes_world(name: &str) -> bool {
     matches!(
         name,
-        "pointer_run" | "open_app" | "switch_tab" | "run_shell" | "write_file"
+        "pointer_run" | "open_app" | "switch_tab" | "switch_window" | "run_shell" | "write_file"
     )
 }
 
@@ -722,6 +732,34 @@ fn switch_tab(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
         );
     }
     Ok(json!({ "acted": true, "selected": chosen }).to_string())
+}
+
+fn switch_window(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let title = need_str(args, "title")?;
+    refresh_world(env.svc, env.memory, false);
+    let (hwnd, full) = {
+        let m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = m.world.snapshot().ok_or("the windows have not been read")?;
+        let titles: Vec<String> = snap.windows.iter().map(|w| w.title.clone()).collect();
+        let i = platform::uia::pick_tab(&titles, title).map_err(|e| e.replace("tab", "window"))?;
+        (snap.windows[i].hwnd, snap.windows[i].title.clone())
+    };
+    if !(env.svc.act_mode)() {
+        return Ok(json!({ "acted": false, "dry_mode": true,
+            "would_focus": { "window": full },
+            "note": "Dry mode: no window was focused." })
+        .to_string());
+    }
+    env.svc.senses.focus_window(hwnd)?;
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action(
+            &format!("brought forward the window {}", clip(&full, 60)),
+            "brought a window forward",
+            Instant::now(),
+        );
+    }
+    Ok(json!({ "acted": true, "focused": full }).to_string())
 }
 
 fn pointer_run(env: &mut ToolEnv, args: &Value) -> Result<String, String> {

@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod answers;
 pub mod control;
+pub mod fastpath;
 pub mod forms;
 pub mod gate;
 pub mod pending;
@@ -204,6 +205,11 @@ pub trait Senses: Send + Sync {
         Err("pages cannot be clicked here".into())
     }
 
+    /// Bring the window `hwnd` forward. Only called in Act mode.
+    fn focus_window(&self, _hwnd: isize) -> Result<(), String> {
+        Err("focusing windows is not available here".into())
+    }
+
     /// Press the browser tab matching `title`. Only called in Act mode.
     fn switch_tab(&self, _title: &str) -> Result<String, String> {
         Err("switching tabs is not available here".into())
@@ -349,6 +355,8 @@ pub struct Assistant {
     gate: Gate,
     memory: Mutex<Memory>,
     busy: AtomicUsize,
+    classifier: Arc<dyn crate::decide::Classifier + Send + Sync>,
+    fast: Mutex<fastpath::FastCfg>,
 }
 
 impl Assistant {
@@ -356,7 +364,10 @@ impl Assistant {
         let conv = Conversation::load_latest(&svc.conversations_dir())
             .unwrap_or_else(|| Conversation::new(&svc.conversations_dir()));
         let tasks = Tasks::load(svc.clone());
+        let classifier = gate.classifier();
         Arc::new(Self {
+            classifier,
+            fast: Mutex::new(fastpath::FastCfg::from_env()),
             svc,
             conv: Mutex::new(conv),
             turn: Mutex::new(TurnSlot {
@@ -367,6 +378,11 @@ impl Assistant {
             memory: Mutex::new(Memory::default()),
             busy: AtomicUsize::new(0),
         })
+    }
+
+    /// Replace the fast path's settings (tests and the shell).
+    pub fn set_fast(&self, cfg: fastpath::FastCfg) {
+        *self.fast.lock().unwrap_or_else(|p| p.into_inner()) = cfg;
     }
 
     pub fn services(&self) -> &Arc<Services> {
@@ -431,6 +447,25 @@ impl Assistant {
         let _ = source; // voice and typed lines are handled alike
         conv.messages
             .push(json!({ "role": "user", "content": text }));
+        let fast_cfg = self.fast.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if fast_cfg.enabled {
+            let env = fastpath::FastEnv {
+                svc: &self.svc,
+                tasks: &self.tasks,
+                memory: &self.memory,
+                classifier: self.classifier.clone(),
+                cfg: &fast_cfg,
+                cancel,
+            };
+            if fastpath::try_fast(&env, text, &mut conv.messages) {
+                store::strip_images(&mut conv.messages);
+                store::save(&self.svc.conversations_dir(), &conv.id, &conv.messages);
+                if !cancel.is_cancelled() {
+                    self.svc.assistant_state("idle", "");
+                }
+                return;
+            }
+        }
         let chat = match (self.svc.chat)() {
             Ok(c) => c,
             Err(e) => {
