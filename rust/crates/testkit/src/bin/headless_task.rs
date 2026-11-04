@@ -83,10 +83,17 @@ fn main() {
         eprintln!("could not open {url}: {e}");
         std::process::exit(1);
     }
+    if args.iter().any(|a| a == "--assistant") {
+        run_assistant(desk, &goal, &args, &results_url, classifier);
+        return;
+    }
     let out = std::env::temp_dir().join(format!("pointer-headless-run-{}", std::process::id()));
     let mut options = runner::RunOptions { out: Some(out.clone()), ..Default::default() };
     if let Some(n) = arg(&args, "--steps").and_then(|s| s.parse().ok()) {
         options.steps = n;
+    }
+    if let Some(c) = arg(&args, "--min-confidence").and_then(|s| s.parse().ok()) {
+        options.min_confidence = c;
     }
     // The run loop has no time budget of its own: a watchdog aborts it.
     let control = Control::new();
@@ -133,4 +140,86 @@ fn main() {
         Ok(body) => println!("results: {body}"),
         Err(e) => println!("results: unavailable ({e})"),
     }
+}
+
+/// The real assistant (agent model, safety guards, fast path, pursuit, form tools) on the page.
+fn run_assistant(desk: HeadlessDesktop, goal: &str, args: &[String], results_url: &str, classifier: api::typesafe::TypeSafe) {
+    use std::sync::{Arc, Mutex};
+    use testkit::assistant::{HeadlessHands, HeadlessSenses};
+    use wcore::assistant::gate::Gate;
+    use wcore::assistant::pending::Pending;
+    use wcore::assistant::testing::{FakeEmit, FakeShell, FakeVoice};
+    use wcore::assistant::{Assistant, Limits, Services};
+
+    let desk = Arc::new(Mutex::new(desk));
+    // A fresh home each run, so no earlier conversation leaks in; the user's saved answers (if any)
+    // are copied in, since "answers from what it knows about the user" is part of the test.
+    let real = std::env::var_os("POINTER_HOME").map(PathBuf::from);
+    let home = std::env::temp_dir().join(format!("pointer-headless-home-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&home);
+    if let Some(r) = real {
+        let _ = std::fs::copy(r.join("my-answers.json"), home.join("my-answers.json"));
+    }
+    let profile = std::env::temp_dir().join(format!("pointer-headless-profile-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&profile);
+    let emit = Arc::new(FakeEmit::default());
+    let svc = Arc::new(Services {
+        chat: Arc::new(|| {
+            api::chat::ChatClient::from_env()
+                .map(|c| Arc::new(c) as Arc<dyn api::chat::Chat>)
+                .ok_or_else(|| "no agent key".to_string())
+        }),
+        emit: emit.clone(),
+        voice: Arc::new(FakeVoice::default()),
+        senses: Arc::new(HeadlessSenses { desk: desk.clone() }),
+        hands: Arc::new(HeadlessHands { desk: desk.clone() }),
+        shell: Arc::new(FakeShell::default()),
+        act_mode: Arc::new(|| true),
+        camera_enabled: Arc::new(|| false),
+        home: home.clone(),
+        // Documents: no roots, so nothing of the user's is ever indexed or read.
+        profile: profile.clone(),
+        limits: Limits::default(),
+        confirms: Pending::new(),
+        cameras: Pending::new(),
+        documents: Arc::new(wcore::documents::Documents::new(home, Vec::new(), "")),
+        writer: Arc::new(|| {
+            wcore::writer::make_writer()
+                .map(|w| Box::new(w) as Box<dyn wcore::writer::StructuredWriter>)
+                .ok_or_else(|| "no writer key".to_string())
+        }),
+        autonomy_full: Arc::new(|| true),
+    });
+    let assistant = Assistant::new(svc, Gate::new(Arc::new(classifier)));
+    let started = std::time::Instant::now();
+    println!("goal: {goal}
+mode: assistant  provider: {}", std::env::var("POINTER_LLM").unwrap_or_else(|_| "default".into()));
+    let cancel = api::chat::Cancel::new();
+    let max = arg(args, "--max-seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(300);
+    let c2 = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(max));
+        c2.cancel();
+    });
+    assistant.run_turn(goal, "typed", &cancel);
+    let events = emit.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mut tools = 0;
+    for (name, payload) in &events {
+        let text = payload.to_string();
+        match name.as_str() {
+            "reply" => println!("reply: {}", text.chars().take(400).collect::<String>()),
+            "line" | "point" | "speech" => {}
+            other => {
+                tools += 1;
+                println!("event {other}: {}", text.chars().take(160).collect::<String>());
+            }
+        }
+    }
+    println!("events: {}  other: {tools}", events.len());
+    println!("seconds: {:.1}", started.elapsed().as_secs_f64());
+    match get(results_url) {
+        Ok(body) => println!("results: {body}"),
+        Err(e) => println!("results: unavailable ({e})"),
+    }
+    let _ = std::fs::remove_dir_all(&profile);
 }

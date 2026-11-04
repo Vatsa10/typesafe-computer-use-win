@@ -930,6 +930,23 @@ impl HeadlessDesktop {
             .is_ok()
     }
 
+    /// Run a page script and return its JSON value.
+    pub fn eval(&self, expr: &str) -> R<Value> {
+        self.inner.borrow_mut().eval(expr)
+    }
+
+    /// Tap the space bar (toggles a focused checkbox or radio).
+    pub fn press_space(&self) {
+        let mut i = self.inner.borrow_mut();
+        let down = json!({"type": "keyDown", "key": " ", "code": "Space", "text": " ",
+            "windowsVirtualKeyCode": 32, "nativeVirtualKeyCode": 32, "modifiers": 0});
+        let up = json!({"type": "keyUp", "key": " ", "code": "Space",
+            "windowsVirtualKeyCode": 32, "nativeVirtualKeyCode": 32, "modifiers": 0});
+        let _ = i.cdp("Input.dispatchKeyEvent", down);
+        let _ = i.cdp("Input.dispatchKeyEvent", up);
+        i.pump(Duration::from_millis(30));
+    }
+
     pub fn url(&self) -> String {
         self.inner.borrow_mut().eval("location.href").ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
     }
