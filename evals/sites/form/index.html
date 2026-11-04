@@ -1,0 +1,14 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Pointer form test</title>
+<style>body{font:18px Segoe UI,sans-serif;max-width:640px;margin:40px auto;padding:0 16px}label{display:block;margin:14px 0 4px;font-weight:600}input,select,textarea{font:inherit;padding:8px;width:100%;box-sizing:border-box}.row{display:flex;gap:16px;align-items:center}.row input{width:auto}button{font:inherit;padding:10px 24px;margin-top:20px}#out{white-space:pre-wrap;background:#eef;padding:12px;margin-top:20px}</style></head><body>
+<h1>Event registration</h1>
+<form id="f">
+<label for="name">Full name</label><input id="name" name="name" required>
+<label for="email">Email</label><input id="email" name="email" type="email" required>
+<label for="company">Company</label><input id="company" name="company">
+<label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option>India</option><option>United States</option><option>Germany</option></select>
+<fieldset><legend>Ticket type</legend><div class="row"><input type="radio" id="t1" name="ticket" value="Standard"><label for="t1">Standard</label><input type="radio" id="t2" name="ticket" value="VIP"><label for="t2">VIP</label></div></fieldset>
+<div class="row"><input type="checkbox" id="news" name="news" value="yes"><label for="news">Send me updates</label></div>
+<label for="notes">Dietary notes</label><textarea id="notes" name="notes" rows="3"></textarea>
+<button type="submit">Register</button></form><div id="out"></div>
+<script>f.onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(f));out.textContent='SUBMITTED '+JSON.stringify(d);document.title='SUBMITTED '+JSON.stringify(d)}</script>
+<script src="/_report.js"></script></body></html>

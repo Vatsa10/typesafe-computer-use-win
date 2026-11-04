@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Software Engineer Application - Google Forms style test</title>
+<style>body{background:#f0ebf8;font:16px Roboto,Segoe UI,sans-serif;margin:0}.w{max-width:680px;margin:20px auto;padding:0 12px}.c{background:#fff;border-radius:8px;border:1px solid #dadce0;padding:22px;margin-bottom:12px}.h{border-top:10px solid #673ab7}h1{font-size:30px;font-weight:400;margin:0 0 8px}.q{display:block;margin-bottom:14px}.r{color:#d93025}input[type=text],input[type=email],input[type=tel],input[type=url],textarea{width:100%;border:0;border-bottom:1px solid #bbb;font:inherit;padding:6px 0;outline:0}input:focus,textarea:focus{border-bottom:2px solid #673ab7}.o{display:block;margin:8px 0}button{background:#673ab7;color:#fff;border:0;border-radius:4px;font:inherit;padding:9px 24px}#out{white-space:pre-wrap}</style></head><body><div class="w">
+<div class="c h"><h1>Software Engineer Application</h1><div>Please fill in your details. <span class="r">* Required</span></div></div>
+<form id="f">
+<div class="c"><label class="q" for="a1">Full name <span class="r">*</span></label><input id="a1" name="full_name" type="text" placeholder="Your answer" required></div>
+<div class="c"><label class="q" for="a2">Email <span class="r">*</span></label><input id="a2" name="email" type="email" placeholder="Your answer" required></div>
+<div class="c"><label class="q" for="a3">Phone number</label><input id="a3" name="phone" type="tel" placeholder="Your answer"></div>
+<div class="c"><label class="q" for="a4">LinkedIn or GitHub profile</label><input id="a4" name="profile_url" type="url" placeholder="Your answer"></div>
+<div class="c"><label class="q" for="a5">Current or most recent company <span class="r">*</span></label><input id="a5" name="company" type="text" placeholder="Your answer" required></div>
+<div class="c"><label class="q" for="a6">Highest degree and college <span class="r">*</span></label><input id="a6" name="education" type="text" placeholder="Your answer" required></div>
+<div class="c"><div class="q">Years of experience <span class="r">*</span></div>
+<label class="o"><input type="radio" name="years" value="0-1" required> 0-1</label><label class="o"><input type="radio" name="years" value="2-4"> 2-4</label><label class="o"><input type="radio" name="years" value="5+"> 5+</label></div>
+<div class="c"><div class="q">Which of these do you know?</div>
+<label class="o"><input type="checkbox" name="skills" value="Python"> Python</label><label class="o"><input type="checkbox" name="skills" value="Rust"> Rust</label><label class="o"><input type="checkbox" name="skills" value="React"> React</label><label class="o"><input type="checkbox" name="skills" value="COBOL"> COBOL</label></div>
+<div class="c"><label class="q" for="a7">Why do you want this role? (2 sentences)</label><textarea id="a7" name="why" rows="3" placeholder="Your answer"></textarea></div>
+<div class="c"><label class="q" for="a8">Expected salary</label><input id="a8" name="salary" type="text" placeholder="Your answer"></div>
+<div class="c"><div class="q">Do you need visa sponsorship?</div><label class="o"><input type="radio" name="visa" value="Yes"> Yes</label><label class="o"><input type="radio" name="visa" value="No"> No</label></div>
+<div class="c"><label class="o"><input type="checkbox" name="attest" value="yes"> I certify that everything above is true</label></div>
+<button type="submit">Submit</button></form><div class="c" id="out" hidden></div></div>
+<script>f.onsubmit=e=>{e.preventDefault();const d={};for(const[k,v]of new FormData(f))d[k]=d[k]?[].concat(d[k],v):v;out.hidden=false;out.textContent='SUBMITTED '+JSON.stringify(d,null,1);document.title='SUBMITTED'}</script><script src="/_report.js"></script></body></html>
