@@ -48,6 +48,32 @@ pub fn catalog() -> Vec<Setting> {
     vec![
         secret("OPENAI_API_KEY", "OpenAI API key"),
         secret("TYPESAFE_API_KEY", "TypeSafe API key"),
+        row(
+            "POINTER_MODE",
+            "Mode: assistant or quick",
+            "assistant (quick when there is no agent key)",
+        ),
+        row(
+            "POINTER_AGENT_BASE_URL",
+            "Agent base URL (any OpenAI-compatible server)",
+            api::chat::DEFAULT_BASE_URL,
+        ),
+        row(
+            "POINTER_AGENT_MODEL",
+            "Agent model",
+            api::chat::DEFAULT_MODEL,
+        ),
+        secret("POINTER_AGENT_API_KEY", "Agent API key"),
+        row(
+            "POINTER_CAMERA",
+            "Camera for the assistant",
+            "off (on to allow)",
+        ),
+        row(
+            "CLICKER_TURN_GATE",
+            "Ignore stray speech while the assistant talks",
+            "on (off interrupts on any speech)",
+        ),
         row("CLICKER_BROWSER", "Browser", config::DEFAULT_BROWSER),
         row(
             "CLICKER_EMAIL",
@@ -158,7 +184,17 @@ pub fn rows(current: &BTreeMap<String, String>) -> Vec<Value> {
             if s.secret {
                 let set = current.get(s.key).is_some_and(|v| !v.is_empty())
                     || std::env::var(s.key).is_ok_and(|v| !v.is_empty());
-                let fallback = if set { "set (hidden; type to replace)" } else { "not set" };
+                let borrowed = s.key == "POINTER_AGENT_API_KEY"
+                    && !set
+                    && (current.get("OPENAI_API_KEY").is_some_and(|v| !v.is_empty())
+                        || std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty()));
+                let fallback = if set {
+                    "set (hidden; type to replace)"
+                } else if borrowed {
+                    "not set (the OpenAI key is used)"
+                } else {
+                    "not set"
+                };
                 json!({ "key": s.key, "label": s.label, "value": "", "fallback": fallback, "secret": true })
             } else {
                 let value = current.get(s.key).cloned().unwrap_or_default();
@@ -222,6 +258,50 @@ mod tests {
         assert_eq!(key["value"], "");
         assert_eq!(key["secret"], true);
         assert!(key["fallback"].as_str().unwrap().starts_with("set"));
+    }
+
+    #[test]
+    fn the_assistant_rows_exist_and_the_agent_key_is_a_masked_secret() {
+        let rows = rows(&BTreeMap::from([(
+            "POINTER_AGENT_API_KEY".to_string(),
+            "sk-agent-hush".to_string(),
+        )]));
+        let text = serde_json::to_string(&rows).unwrap();
+        assert!(!text.contains("sk-agent-hush"));
+        let key = rows
+            .iter()
+            .find(|r| r["key"] == "POINTER_AGENT_API_KEY")
+            .unwrap();
+        assert_eq!(
+            (key["secret"].clone(), key["value"].clone()),
+            (json!(true), json!(""))
+        );
+        assert!(key["fallback"].as_str().unwrap().starts_with("set"));
+        for k in [
+            "POINTER_MODE",
+            "POINTER_AGENT_BASE_URL",
+            "POINTER_AGENT_MODEL",
+            "POINTER_CAMERA",
+            "CLICKER_TURN_GATE",
+        ] {
+            let r = rows.iter().find(|r| r["key"] == k).unwrap();
+            assert_eq!(r["secret"], false, "{k}");
+        }
+        // Saving an empty agent key leaves the stored one alone; a new one replaces it.
+        let values = json!({ "POINTER_AGENT_API_KEY": "", "POINTER_AGENT_MODEL": "gpt-4.1-mini" });
+        let pairs = to_write(values.as_object().unwrap());
+        assert_eq!(
+            pairs,
+            vec![(
+                "POINTER_AGENT_MODEL".to_string(),
+                "gpt-4.1-mini".to_string()
+            )]
+        );
+        let values = json!({ "POINTER_AGENT_API_KEY": " sk-new " });
+        assert_eq!(
+            to_write(values.as_object().unwrap()),
+            vec![("POINTER_AGENT_API_KEY".to_string(), "sk-new".to_string())]
+        );
     }
 
     #[test]

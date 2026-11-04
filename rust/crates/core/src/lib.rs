@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod apps;
+pub mod assistant;
 pub mod catalog;
 pub mod config;
 pub mod dates;

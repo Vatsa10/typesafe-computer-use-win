@@ -343,7 +343,7 @@ pub fn compose_explanation(
     Ok(field_str(&data, "answer")?.trim().to_string())
 }
 
-pub const COMPOSE_TEACH_SYSTEM: &str = "A user asked a question about the screen in front of them, and you are teaching them, not acting: you never press anything yourself. You receive the question, a capture of their screen as it is now, and a numbered list of the items read from that screen (index, text, role, region). Answer briefly from what is visible and nothing else: never from memory, and never a guess; plain text, no markdown, two sentences at most. Then give up to 5 concrete next steps the user would take, in order, each one short sentence naming the on-screen control by its visible label. For each step set item to the index of the single numbered item from the provided list that the step uses, or null when no listed item applies (a keyboard shortcut, a control that is not on screen yet, or anything not in the list). Never invent items or indexes that are not in the list. When the question needs no steps, return an empty steps list. Trust the capture over the text where the two disagree. You may also receive where the mouse is and what it is over (pointer), with the item under it flagged under_mouse: 'this', 'here' and 'that' refer to what is under the mouse, because people point at what they ask about. You may also receive every display and the windows open on all of them; a question about another screen can be answered from those window titles, saying that only the titles are known.";
+pub const COMPOSE_TEACH_SYSTEM: &str = "A user asked a question about the screen in front of them, and you are teaching them, not acting: you never press anything yourself. You receive the question, a capture of their screen as it is now, and a numbered list of the items read from that screen (index, text, role, region). Answer briefly from what is visible and nothing else: never from memory, and never a guess; plain text, no markdown, two sentences at most. Then give up to 5 concrete next steps the user would take, in order, each one short sentence naming the on-screen control by its visible label. For each step set item to the index of the single numbered item from the provided list that the step uses, or null when no listed item applies (a keyboard shortcut, a control that is not on screen yet, or anything not in the list). Never invent items or indexes that are not in the list. For each step also set shape to how the item should be marked: box (the default), circle (a thing to find among many), arrow (a place to go or look), underline (a line of text), note (context, not a control) or step (one in a sequence). When unsure use box. When the question needs no steps, return an empty steps list. Trust the capture over the text where the two disagree. You may also receive where the mouse is and what it is over (pointer), with the item under it flagged under_mouse: 'this', 'here' and 'that' refer to what is under the mouse, because people point at what they ask about. You may also receive every display and the windows open on all of them; a question about another screen can be answered from those window titles, saying that only the titles are known.";
 
 /// The most steps a teach answer gives; anything past this is dropped.
 pub const MAX_TEACH_STEPS: usize = 5;
@@ -354,6 +354,21 @@ pub struct Step {
     pub text: String,
     /// An `Item::index` from the list the writer was given; never an index outside it.
     pub item: Option<usize>,
+    /// How to mark the item: one of [`SHAPES`]. Anything else became `box`.
+    pub shape: String,
+}
+
+/// The ways a mark can be drawn. The shell draws an unknown one as a box, and so do we.
+pub const SHAPES: [&str; 6] = ["box", "circle", "arrow", "underline", "note", "step"];
+
+/// `shape` if it is a known shape (any case, trimmed), else `box`.
+pub fn shape_or_box(shape: &str) -> &'static str {
+    let wanted = shape.trim().to_lowercase();
+    SHAPES
+        .iter()
+        .find(|s| **s == wanted)
+        .copied()
+        .unwrap_or("box")
 }
 
 /// A short answer, then the steps that would get the user there.
@@ -402,10 +417,11 @@ pub fn compose_teach(
             "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["text", "item"],
+                "required": ["text", "item", "shape"],
                 "properties": {
                     "text": {"type": "string"},
                     "item": {"type": ["integer", "null"]},
+                    "shape": {"type": "string"},
                 },
             },
         },
@@ -436,7 +452,13 @@ pub fn compose_teach(
             .and_then(Value::as_u64)
             .map(|i| i as usize)
             .filter(|i| items.iter().any(|it| it.index == *i));
-        steps.push(Step { text, item });
+        let shape = s
+            .get("shape")
+            .and_then(Value::as_str)
+            .map(shape_or_box)
+            .unwrap_or("box")
+            .to_string();
+        steps.push(Step { text, item, shape });
     }
     Ok(Teach { answer, steps })
 }
@@ -692,9 +714,9 @@ pub(crate) mod tests {
     #[test]
     fn teach_sends_the_numbered_items_and_the_capture_and_drops_invented_indexes() {
         let w = Fake::new(json!({"answer": " Settings is top right. ", "steps": [
-            {"text": "Click Settings", "item": 1},
-            {"text": "Press Ctrl+, instead", "item": null},
-            {"text": "Click the ghost", "item": 99},
+            {"text": "Click Settings", "item": 1, "shape": "circle"},
+            {"text": "Press Ctrl+, instead", "item": null, "shape": "sparkle"},
+            {"text": "Click the ghost", "item": 99, "shape": " ARROW "},
             {"text": "a", "item": 0}, {"text": "b", "item": 0}, {"text": "c", "item": 0},
         ]}));
         let mut settings = make_item(1, "Settings", 100.0, 130.0);
@@ -708,15 +730,18 @@ pub(crate) mod tests {
             [
                 Step {
                     text: "Click Settings".into(),
-                    item: Some(1)
+                    item: Some(1),
+                    shape: "circle".into()
                 },
                 Step {
                     text: "Press Ctrl+, instead".into(),
-                    item: None
+                    item: None,
+                    shape: "box".into()
                 },
                 Step {
                     text: "Click the ghost".into(),
-                    item: None
+                    item: None,
+                    shape: "arrow".into()
                 },
             ]
         );
@@ -732,7 +757,8 @@ pub(crate) mod tests {
         assert!(listed["region"].is_string());
         let step = &call.properties["steps"]["items"];
         assert_eq!(step["additionalProperties"], false);
-        assert_eq!(step["required"], json!(["text", "item"]));
+        assert_eq!(step["required"], json!(["text", "item", "shape"]));
+        assert_eq!(step["properties"]["shape"]["type"], "string");
         assert_eq!(
             step["properties"]["item"]["type"],
             json!(["integer", "null"])

@@ -8,10 +8,12 @@
 //! a transcription never holds up an abort; the hotkey pump registers and pumps and only enqueues;
 //! the input worker drains that queue. All output goes through one locked writer.
 
+mod brain;
 mod daemon;
 mod emit;
 mod hotkeys;
 mod ipc;
+mod live;
 mod runner;
 mod settings;
 mod voice;
@@ -37,6 +39,26 @@ fn start_pump(out: &Emitter) -> Option<(hotkeys::Pump, mpsc::Receiver<Pumped>)> 
             None
         }
     }
+}
+
+/// Double-Escape stops an acting run. It polls the Escape key's state only while Pointer is acting
+/// in Act mode, and never registers a hotkey or a hook, so Escape still reaches every app; see
+/// `wcore::assistant::control`.
+fn start_escape_watcher(daemon: Arc<Daemon>) {
+    let _ = std::thread::Builder::new()
+        .name("escape".into())
+        .spawn(move || {
+            let mut watch = wcore::assistant::control::DoubleEscape::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let armed = daemon.escape_armed();
+                // Not armed: the key is not even read.
+                let down = armed && platform::input::key_held(0x1B);
+                if watch.poll(armed, down, std::time::Instant::now()) {
+                    daemon.stop_everything("stopped: Esc pressed twice");
+                }
+            }
+        });
 }
 
 fn start_input_worker(daemon: Arc<Daemon>, rx: mpsc::Receiver<Pumped>) {
@@ -99,8 +121,15 @@ fn main() {
         None => (Box::new(NoPump), None),
     };
     let specs = hotkeys::current();
+    let runner: Arc<dyn runner::Runner> = Arc::new(runner::Wired::live());
+    let modes = Arc::new(Mutex::new(Modes::default()));
+    let services = live::services(out.clone(), runner.clone(), modes.clone(), cwd.clone());
+    let assistant = wcore::assistant::Assistant::new(
+        services,
+        wcore::assistant::gate::Gate::new(Arc::new(live::LiveClassifier)),
+    );
     let daemon = Arc::new(Daemon {
-        runner: Box::new(runner::Wired::live()),
+        runner,
         listener: Box::new(voice::Microphone::default()),
         out: out.clone(),
         speaker: Arc::new(runner::speak),
@@ -112,15 +141,19 @@ fn main() {
         talk_vk: vk_slot(hotkeys::vk_of(&specs, "talk")),
         dictate_vk: vk_slot(hotkeys::vk_of(&specs, "dictate")),
         typer: Box::new(daemon::Keyboard),
-        modes: Mutex::new(Modes::default()),
+        modes,
         rebinder,
         rebinding: Mutex::new(()),
+        brain: brain::Brain::live(assistant),
     });
 
     let screens = platform::display::monitors().len();
     out.line(format!("core ready: {screens} displays"));
     if let Some(rx) = fired {
         start_input_worker(daemon.clone(), rx);
+    }
+    if wanted {
+        start_escape_watcher(daemon.clone());
     }
     daemon.events().state(daemon.runner.state());
 

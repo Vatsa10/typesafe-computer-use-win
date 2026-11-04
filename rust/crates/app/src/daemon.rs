@@ -5,12 +5,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use serde_json::{json, Value};
 use wcore::runs_index;
 
+use crate::brain::Brain;
 use crate::emit::Emitter;
 use crate::hotkeys::{self, Rebind};
 use crate::ipc::{Reply, Request};
@@ -99,7 +100,7 @@ pub struct Paths {
 }
 
 pub struct Daemon {
-    pub runner: Box<dyn Runner>,
+    pub runner: Arc<dyn Runner>,
     pub listener: Box<dyn Listener>,
     pub out: Emitter,
     pub speaker: Speaker,
@@ -111,11 +112,13 @@ pub struct Daemon {
     /// The push-to-dictate key, 0 when the dictate hotkey did not parse.
     pub dictate_vk: AtomicU32,
     pub typer: Box<dyn Typer>,
-    pub modes: Mutex<Modes>,
+    pub modes: Arc<Mutex<Modes>>,
     /// Re-registers the global hotkeys on the pump thread.
     pub rebinder: Box<dyn Rebind>,
     /// One `set_hotkeys` at a time: the file, the environment and the pump change together.
     pub rebinding: Mutex<()>,
+    /// The assistant layer, and which mode is in force.
+    pub brain: Brain,
 }
 
 /// A held key as the atomics store it: 0 for none.
@@ -166,6 +169,7 @@ impl Daemon {
         let s = self.runner.state();
         json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hint(),
                 "stt": self.listener.engine(),
+                "mode": self.brain.mode().name(),
                 "stt_lang": std::env::var("CLICKER_STT_LANG").ok().filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "en-US".into()) })
     }
@@ -226,6 +230,9 @@ impl Daemon {
                     .map(str::trim)
                     .filter(|t| !t.is_empty());
                 let text = text.ok_or("heard needs text")?;
+                if self.brain.active().is_some() {
+                    return self.brain.chat(text, "voice");
+                }
                 self.runner
                     .route_heard(text, self.modes().act, self.events())
             }
@@ -257,8 +264,53 @@ impl Daemon {
                     .map(str::trim)
                     .filter(|t| !t.is_empty());
                 let text = text.ok_or("say needs text")?;
+                if self.brain.active().is_some() {
+                    return self.brain.chat(text, "voice");
+                }
                 self.runner
                     .route_said(text, self.modes().act, self.events())
+            }
+            "chat" => self.chat(params),
+            "gate" => {
+                let heard = param_str(params, "heard").unwrap_or("");
+                let speaking = params
+                    .get("speaking")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                Ok(self.brain.gate(heard, speaking))
+            }
+            "interrupt" => Ok(self.brain.interrupt()),
+            "stop_all" => {
+                self.stop_everything("stopped");
+                Ok(json!({ "ok": true }))
+            }
+            "new_conversation" => Ok(self.brain.new_conversation()),
+            "tasks" => Ok(self.brain.tasks()),
+            "task_stop" => {
+                let id = param_str(params, "id").ok_or("task_stop needs an id")?;
+                self.brain.task_stop(id)
+            }
+            "confirm_reply" => {
+                let id = param_str(params, "id").ok_or("confirm_reply needs an id")?;
+                let allow = params
+                    .get("allow")
+                    .and_then(Value::as_bool)
+                    .ok_or("confirm_reply needs allow: true or false")?;
+                Ok(self.brain.confirm_reply(id, allow))
+            }
+            "camera_frames" => {
+                let id = param_str(params, "id").ok_or("camera_frames needs an id")?;
+                let images: Vec<String> = params
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let error = param_str(params, "error").map(str::to_string);
+                Ok(self.brain.camera_frames(id, images, error))
             }
             "ask" => {
                 let question = param_str(params, "question")
@@ -271,6 +323,43 @@ impl Daemon {
             }
             other => Err(format!("no method {other}")),
         }
+    }
+
+    /// A line from the user. In assistant mode the parent agent takes it; in quick mode it is
+    /// routed as a spoken line always was, and the reply says which mode answered.
+    fn chat(&self, params: &Value) -> Result<Value, String> {
+        let text = param_str(params, "text")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or("chat needs text")?;
+        let source = match param_str(params, "source") {
+            None | Some("typed") => "typed",
+            Some("voice") => "voice",
+            Some(other) => return Err(format!("chat source must be voice or typed, not {other}")),
+        };
+        if self.brain.active().is_some() {
+            return self.brain.chat(text, source);
+        }
+        let mut routed = self
+            .runner
+            .route_said(text, self.modes().act, self.events())?;
+        if let Some(o) = routed.as_object_mut() {
+            o.insert("mode".into(), json!("quick"));
+        }
+        Ok(routed)
+    }
+
+    /// Whether the double-Escape watcher should be looking: Act mode, and something going on.
+    pub fn escape_armed(&self) -> bool {
+        self.modes().act && (self.brain.busy() || self.runner.state().running)
+    }
+
+    /// Stop everything: the assistant's turn, its run, its speech, its tasks, and any run.
+    pub fn stop_everything(&self, why: &str) {
+        self.brain.stop_all();
+        let _ = self.runner.abort();
+        self.out.line(why);
+        self.emit_state();
     }
 
     /// Validate, write `.env`, update the environment, re-register on the pump, and say so. A
@@ -399,6 +488,10 @@ impl Daemon {
             return Err("voice is off".into());
         }
         let vk = vk_read(&self.talk_vk).ok_or("the talk hotkey did not parse")?;
+        if self.brain.active().is_some() {
+            self.out
+                .event("assistant", json!({ "state": "listening", "detail": "" }));
+        }
         let Some(said) = self.record_held(vk, Purpose::Talk)? else {
             return Ok(());
         };
@@ -407,6 +500,9 @@ impl Daemon {
             return Ok(());
         }
         self.out.line(format!("heard: {said}"));
+        if self.brain.active().is_some() {
+            return self.brain.chat(&said, "voice").map(|_| ());
+        }
         self.runner
             .route_said(&said, self.modes().act, self.events())
             .map(|_| ())
@@ -636,7 +732,7 @@ mod tests {
         let typer = FakeTyper::default();
         let rebinds = FakeRebind::default();
         let d = Daemon {
-            runner,
+            runner: Arc::from(runner),
             listener: Box::new(FakeMic),
             out: Emitter::new(captured.clone()),
             speaker: Arc::new(|_| false),
@@ -648,9 +744,10 @@ mod tests {
             talk_vk: vk_slot(Some(0x20)),
             dictate_vk: vk_slot(Some(0x44)),
             typer: Box::new(typer.clone()),
-            modes: Mutex::new(Modes::default()),
+            modes: Arc::new(Mutex::new(Modes::default())),
             rebinder: Box::new(rebinds.clone()),
             rebinding: Mutex::new(()),
+            brain: Brain::quick(),
         };
         (d, captured, typer)
     }
@@ -833,7 +930,7 @@ mod tests {
         let state = d.dispatch("state", &Value::Null).unwrap();
         assert_eq!(
             state,
-            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai",
+            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai", "mode": "quick",
                     "stt_lang": std::env::var("CLICKER_STT_LANG").unwrap_or_else(|_| "en-US".into()) })
         );
     }
@@ -1073,5 +1170,186 @@ mod tests {
         assert!(!saved.to_string().contains("Edge"), "values are not echoed");
         let text = std::fs::read_to_string(dir.join(".env")).unwrap();
         assert!(text.contains("TYPESAFE_API_KEY=ts-hush") && text.contains("CLICKER_BROWSER=Edge"));
+    }
+
+    // ------------------------------------------------------------ the assistant layer
+
+    fn assistant_daemon(
+        tag: &str,
+        script: Vec<wcore::assistant::testing::Script>,
+        runner: Box<dyn Runner>,
+    ) -> (Daemon, Captured, wcore::assistant::testing::Harness) {
+        let dir = tmp(tag);
+        let (mut d, captured) = daemon(runner, &dir);
+        let h = wcore::assistant::testing::Harness::new(tag, script);
+        d.brain = Brain {
+            assistant: Some(h.assistant()),
+            mode: Box::new(|| wcore::assistant::Mode::Assistant),
+        };
+        (d, captured, h)
+    }
+
+    #[test]
+    fn chat_in_quick_mode_routes_exactly_as_a_spoken_line_does() {
+        let dir = tmp("chatquick");
+        let runner = Arc::new(FakeRunner {
+            idle: true,
+            ..FakeRunner::default()
+        });
+        let (d, _) = daemon(Box::new(Shared(runner.clone())), &dir);
+        let reply = d
+            .dispatch(
+                "chat",
+                &json!({ "text": " open youtube ", "source": "typed" }),
+            )
+            .unwrap();
+        assert_eq!(reply["command"], "run_goal");
+        assert_eq!(reply["mode"], "quick");
+        assert_eq!(*runner.calls.lock().unwrap(), vec!["said open youtube"]);
+        assert!(d.dispatch("chat", &json!({ "text": "  " })).is_err());
+        assert!(d
+            .dispatch("chat", &json!({ "text": "hi", "source": "carrier pigeon" }))
+            .is_err());
+        assert_eq!(d.dispatch("state", &Value::Null).unwrap()["mode"], "quick");
+        // The rest of the surface is inert in quick mode, not an error.
+        assert_eq!(d.dispatch("tasks", &Value::Null).unwrap(), json!([]));
+        assert!(d.dispatch("task_stop", &json!({ "id": "t1" })).is_err());
+        assert_eq!(
+            d.dispatch("gate", &json!({ "heard": "the kettle", "speaking": true }))
+                .unwrap(),
+            json!({ "interrupt": true, "confidence": 1.0 })
+        );
+        assert_eq!(
+            d.dispatch("confirm_reply", &json!({ "id": "c-1", "allow": true }))
+                .unwrap(),
+            json!({ "ok": false })
+        );
+    }
+
+    #[test]
+    fn chat_in_assistant_mode_goes_to_the_agent_and_not_to_the_router() {
+        use wcore::assistant::testing::saying;
+        let runner = Arc::new(FakeRunner {
+            idle: true,
+            ..FakeRunner::default()
+        });
+        let (d, _, h) = assistant_daemon(
+            "chatassist",
+            vec![saying("first"), saying("second"), saying("third")],
+            Box::new(Shared(runner.clone())),
+        );
+        assert_eq!(
+            d.dispatch(
+                "chat",
+                &json!({ "text": "what is this", "source": "typed" })
+            )
+            .unwrap(),
+            json!({ "queued": true, "mode": "assistant" })
+        );
+        h.emit.wait_for(|e| !e.of("reply").is_empty());
+        assert_eq!(h.emit.of("reply")[0]["text"], "first");
+        // Heard and said lines go the same way, as voice.
+        d.dispatch("heard", &json!({ "text": "and this" })).unwrap();
+        d.dispatch("say", &json!({ "text": "and that" })).unwrap();
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "nothing was routed"
+        );
+        assert_eq!(
+            d.dispatch("state", &Value::Null).unwrap()["mode"],
+            "assistant"
+        );
+        // Dictation still never reaches the agent.
+        d.dispatch(
+            "heard",
+            &json!({ "text": "typed words", "purpose": "dictate" }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gate_confirm_and_camera_replies_reach_the_assistant() {
+        let (d, _, h) = assistant_daemon("gatemethods", vec![], idle_runner());
+        let gate = |heard: &str, speaking: bool| {
+            d.dispatch("gate", &json!({ "heard": heard, "speaking": speaking }))
+                .unwrap()
+        };
+        assert_eq!(
+            gate("no, the other one", true),
+            json!({ "interrupt": true, "confidence": 1.0 })
+        );
+        // Not speaking: nothing to protect.
+        assert_eq!(gate("hmm", false)["interrupt"], true);
+        assert_eq!(
+            d.dispatch(
+                "confirm_reply",
+                &json!({ "id": "confirm-9", "allow": false })
+            )
+            .unwrap(),
+            json!({ "ok": false }),
+            "an unknown id is refused, not applied"
+        );
+        assert!(d.dispatch("confirm_reply", &json!({ "id": "x" })).is_err());
+        let id = h.svc.confirms.open("confirm");
+        assert_eq!(
+            d.dispatch("confirm_reply", &json!({ "id": id, "allow": true }))
+                .unwrap(),
+            json!({ "ok": true })
+        );
+        let cam = h.svc.cameras.open("cam");
+        assert_eq!(
+            d.dispatch(
+                "camera_frames",
+                &json!({ "id": cam, "images": ["QUJD"], "error": null })
+            )
+            .unwrap(),
+            json!({ "ok": true })
+        );
+        assert!(d.dispatch("camera_frames", &json!({})).is_err());
+        assert_eq!(d.dispatch("tasks", &Value::Null).unwrap(), json!([]));
+        assert_eq!(
+            d.dispatch("interrupt", &Value::Null).unwrap(),
+            json!({ "ok": true })
+        );
+        assert_eq!(
+            d.dispatch("new_conversation", &Value::Null).unwrap(),
+            json!({ "ok": true })
+        );
+    }
+
+    #[test]
+    fn stop_all_aborts_the_run_and_the_assistant() {
+        let runner = Arc::new(FakeRunner::default());
+        let (d, captured, h) = assistant_daemon(
+            "stopall",
+            vec![wcore::assistant::testing::Script::Hang],
+            Box::new(Shared(runner.clone())),
+        );
+        d.dispatch("chat", &json!({ "text": "go" })).unwrap();
+        while h.chat.calls().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(d.brain.busy());
+        d.dispatch("stop_all", &Value::Null).unwrap();
+        assert!(runner.calls.lock().unwrap().contains(&"abort".to_string()));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while d.brain.busy() {
+            assert!(std::time::Instant::now() < end, "the turn did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(lines(&captured).contains(&"stopped".to_string()));
+    }
+
+    #[test]
+    fn the_escape_watcher_is_armed_only_while_acting_in_act_mode() {
+        let dir = tmp("armed");
+        // The default fake reports a run in progress.
+        let (d, _) = daemon(Box::new(FakeRunner::default()), &dir);
+        assert!(d.escape_armed(), "Act mode with a run going");
+        d.dispatch("set_mode", &json!({ "act": false })).unwrap();
+        assert!(!d.escape_armed(), "Dry mode: not even looking");
+        d.dispatch("set_mode", &json!({ "act": true })).unwrap();
+        let (idle, _) = daemon(idle_runner(), &dir);
+        assert!(!idle.escape_armed(), "Act mode but nothing running");
     }
 }

@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::emit::Emitter;
+pub use wcore::assistant::RunSummary;
 
 #[cfg(test)]
 pub const NOT_WIRED: &str = "runner not wired yet";
@@ -39,6 +40,9 @@ pub struct Events {
     out: Emitter,
     speaker: Speaker,
     hotkeys: Arc<str>,
+    /// A run the assistant started: nothing is read aloud and no `answer` event is sent, because
+    /// only `interact` reaches the user then. The answer goes to the log and back to the agent.
+    quiet: bool,
 }
 
 impl Events {
@@ -47,7 +51,14 @@ impl Events {
             out,
             speaker,
             hotkeys: Arc::from(hotkeys),
+            quiet: false,
         }
+    }
+
+    /// The same events with speech and the `answer` event muted.
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     pub fn line(&self, text: impl Into<String>) {
@@ -64,6 +75,10 @@ impl Events {
 
     /// An answer is ready: read it aloud when that is on, and tell the shell whether it was.
     pub fn answer(&self, text: &str) {
+        if self.quiet {
+            self.out.line(format!("answer: {text}"));
+            return;
+        }
         let spoken = (self.speaker)(text);
         self.out
             .event("answer", json!({ "text": text, "spoken": spoken }));
@@ -96,6 +111,9 @@ impl Events {
 
     /// Read a line aloud (a teach step) without it being the answer. Returns whether it was.
     pub fn speak(&self, text: &str) -> bool {
+        if self.quiet {
+            return false;
+        }
         (self.speaker)(text)
     }
 }
@@ -119,6 +137,17 @@ pub trait Runner: Send + Sync {
     /// Talk mode: look at the screen and answer. Touches nothing.
     fn ask(&self, question: &str, events: Events) -> Result<String, String>;
     fn state(&self) -> RunState;
+    /// Run one goal to its end on the run thread and wait for the result: the assistant's
+    /// `pointer_run`. `cancel` aborts it. Runners that cannot say so.
+    fn run_blocking(
+        &self,
+        _goal: &str,
+        _act: bool,
+        _events: Events,
+        _cancel: &api::chat::Cancel,
+    ) -> Result<RunSummary, String> {
+        Err("this runner cannot run goals for the assistant".into())
+    }
 }
 
 /// The placeholder the dispatch tests use: every action says so plainly.
@@ -202,11 +231,13 @@ pub struct Job {
     pub goal: String,
     pub act: bool,
     pub events: Events,
+    /// Where to send the outcome, for a caller that waits (`run_blocking`).
+    pub done: Option<mpsc::Sender<RunSummary>>,
 }
 
 /// Drives one job to its end on the run thread. The real one builds the screen, the hands and the
 /// clients right there, because the screen's handles are bound to the thread that fetched them.
-pub type Execute = Box<dyn Fn(&Job, &wcore::runner::Control) + Send>;
+pub type Execute = Box<dyn Fn(&Job, &wcore::runner::Control) -> Option<RunSummary> + Send>;
 /// Classifies one spoken line: (text, running, paused).
 pub type Classify =
     Box<dyn Fn(&str, bool, bool) -> Result<wcore::intent::Intent, String> + Send + Sync>;
@@ -266,6 +297,9 @@ impl Wired {
                     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         execute(&job, &c)
                     }));
+                    if let (Ok(Some(summary)), Some(tx)) = (&ran, &job.done) {
+                        let _ = tx.send(summary.clone());
+                    }
                     r.store(false, Ordering::SeqCst);
                     if ran.is_err() {
                         job.events.line("the run crashed");
@@ -293,6 +327,42 @@ impl Wired {
             Box::new(classify_live),
             Box::new(answer_live),
         )
+    }
+
+    /// Queue a job: refused while a run is going.
+    fn enqueue(
+        &self,
+        goal: &str,
+        act: bool,
+        events: Events,
+        done: Option<mpsc::Sender<RunSummary>>,
+    ) -> Result<bool, String> {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("a run is already going: abort it before starting another".into());
+        }
+        // Here, not on the run thread: an abort that lands before the thread picks the job up
+        // must survive. The previous run is over, so nothing else reads these flags now.
+        self.control.reset();
+        let job = Job {
+            goal: goal.to_string(),
+            act,
+            events,
+            done,
+        };
+        let sent = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .send(job);
+        if sent.is_err() {
+            self.running.store(false, Ordering::SeqCst);
+            return Err("the run thread is gone".into());
+        }
+        Ok(true)
     }
 
     fn running(&self) -> bool {
@@ -354,31 +424,7 @@ impl Wired {
 
 impl Runner for Wired {
     fn start(&self, goal: &str, act: bool, events: Events) -> Result<bool, String> {
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("a run is already going: abort it before starting another".into());
-        }
-        // Here, not on the run thread: an abort that lands before the thread picks the job up
-        // must survive. The previous run is over, so nothing else reads these flags now.
-        self.control.reset();
-        let job = Job {
-            goal: goal.to_string(),
-            act,
-            events,
-        };
-        let sent = self
-            .jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .send(job);
-        if sent.is_err() {
-            self.running.store(false, Ordering::SeqCst);
-            return Err("the run thread is gone".into());
-        }
-        Ok(true)
+        self.enqueue(goal, act, events, None)
     }
 
     fn pause(&self) -> Result<bool, String> {
@@ -415,6 +461,41 @@ impl Runner for Wired {
         said
     }
 
+    fn run_blocking(
+        &self,
+        goal: &str,
+        act: bool,
+        events: Events,
+        cancel: &api::chat::Cancel,
+    ) -> Result<RunSummary, String> {
+        let (tx, rx) = mpsc::channel();
+        self.enqueue(goal, act, events, Some(tx))?;
+        let mut aborted_at: Option<std::time::Instant> = None;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(40)) {
+                Ok(summary) => return Ok(summary),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(if cancel.is_cancelled() {
+                        "the run was stopped".into()
+                    } else {
+                        "the run ended without a result".into()
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if cancel.is_cancelled() {
+                let since = *aborted_at.get_or_insert_with(|| {
+                    self.control.abort("asked to stop");
+                    std::time::Instant::now()
+                });
+                // The run lands at its next checkpoint; do not wait on it forever.
+                if since.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err("the run was stopped".into());
+                }
+            }
+        }
+    }
+
     fn state(&self) -> RunState {
         let running = self.running();
         RunState {
@@ -424,11 +505,11 @@ impl Runner for Wired {
     }
 }
 
-fn execute_live(job: &Job, control: &wcore::runner::Control) {
+fn execute_live(job: &Job, control: &wcore::runner::Control) -> Option<RunSummary> {
     use wcore::{actions, config, perception, runner, sitepick, writer};
     let Some(classifier) = api::typesafe::TypeSafe::from_env() else {
         job.events.line("a run needs TYPESAFE_API_KEY (Settings)");
-        return;
+        return None;
     };
     let scribe = writer::make_writer();
     if scribe.is_none() {
@@ -457,6 +538,15 @@ fn execute_live(job: &Job, control: &wcore::runner::Control) {
         result.seconds,
         result.out.display()
     ));
+    Some(RunSummary {
+        outcome: result.outcome.clone(),
+        answer: result
+            .answer
+            .as_ref()
+            .map(|a| a.text.clone())
+            .unwrap_or_default(),
+        seconds: result.seconds,
+    })
 }
 
 fn classify_live(text: &str, running: bool, paused: bool) -> Result<wcore::intent::Intent, String> {
@@ -549,6 +639,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             bridge.answer("stopped");
+            None
         })
     }
 
@@ -770,5 +861,82 @@ mod tests {
             .filter(|m| m["event"] == "answer")
             .collect();
         assert_eq!(answers[0]["text"], "about what is this error");
+    }
+
+    #[test]
+    fn run_blocking_returns_the_outcome_and_the_answer() {
+        let captured = Captured::default();
+        let events = Events::new(Emitter::new(captured.clone()), Arc::new(|_| true), "").quiet();
+        let execute: Execute = Box::new(|job: &Job, _: &wcore::runner::Control| {
+            Some(RunSummary {
+                outcome: if job.act {
+                    "done".into()
+                } else {
+                    "dry run".into()
+                },
+                answer: format!("did: {}", job.goal),
+                seconds: 0.5,
+            })
+        });
+        let answer: Answerer =
+            Box::new(|_: &str, _: &Events, _: &wcore::runner::Control| Ok(String::new()));
+        let w = Wired::new(execute, says("run_goal", 1.0), answer);
+        let got = w
+            .run_blocking(
+                "open mail",
+                false,
+                events.clone(),
+                &api::chat::Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            RunSummary {
+                outcome: "dry run".into(),
+                answer: "did: open mail".into(),
+                seconds: 0.5
+            }
+        );
+        wait_until(|| !w.state().running);
+        // A second run is fine once the first is over.
+        assert!(w
+            .run_blocking("again", true, events, &api::chat::Cancel::new())
+            .is_ok());
+    }
+
+    #[test]
+    fn cancelling_a_blocking_run_aborts_it_and_says_so() {
+        let (w, events, _) = wired("run_goal", 1.0);
+        let cancel = api::chat::Cancel::new();
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            c.cancel();
+        });
+        let err = w.run_blocking("hold", true, events, &cancel).unwrap_err();
+        assert_eq!(err, "the run was stopped");
+        wait_until(|| !w.state().running);
+    }
+
+    #[test]
+    fn a_quiet_run_neither_speaks_nor_sends_an_answer_event() {
+        let captured = Captured::default();
+        let spoke = Arc::new(Mutex::new(Vec::new()));
+        let log = spoke.clone();
+        let events = Events::new(
+            Emitter::new(captured.clone()),
+            Arc::new(move |t: &str| {
+                log.lock().unwrap().push(t.to_string());
+                true
+            }),
+            "",
+        )
+        .quiet();
+        events.answer("it is open");
+        assert!(!events.speak("step one"));
+        assert!(spoke.lock().unwrap().is_empty());
+        let m = captured.messages();
+        assert!(m.iter().all(|e| e["event"] != "answer"));
+        assert!(m.iter().any(|e| e["text"] == "answer: it is open"));
     }
 }

@@ -21,7 +21,7 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 
 | method | params | result |
 |---|---|---|
-| `state` | — | `{ running, paused, hotkeys, stt }` — `hotkeys` is a display string of the bindings; `stt` is the speech engine: `chrome`, `openai` or `windows` |
+| `state` | — | `{ running, paused, hotkeys, stt, stt_lang, mode }` — `hotkeys` is a display string of the bindings; `stt` is the speech engine: `chrome`, `openai` or `windows`; `mode` is `assistant` or `quick` (see Assistant layer) |
 | `displays` | — | `[ { index, left, top, right, bottom, primary } ]` in physical pixels |
 | `capture` | `{ monitor? }` (default 0) | `{ width, height, origin: [x, y], bytes }` |
 | `start` | `{ goal, act }` | `{ queued: bool }`; `act: null` uses the mode from `set_mode` |
@@ -39,16 +39,25 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `settings` | — | `[ { key, label, value, fallback, secret } ]` |
 | `save_settings` | `{ values: { KEY: value } }` | `{ saved: true, keys: [KEY...] }` — names only, never values |
 | `hotkeys` | — | `{ names: [...], current: { name: spec }, defaults: { name: spec } }` for `talk`, `dictate`, `bar`, `goal`, `pause`, `abort`, `quit` (in that order) |
+| `chat` | `{ text, source: "voice" \| "typed" }` (`source` defaults to `typed`) | assistant mode: `{ queued: true, mode: "assistant" }` at once, the turn runs on its own thread and reports by events. Quick mode: the line is routed as `say` is, and the reply is that object plus `mode: "quick"`. Errors: empty `text`, an unknown `source` |
+| `gate` | `{ heard, speaking? }` (`speaking` defaults to true) | `{ interrupt: bool, confidence }` — see Assistant layer. Quick mode, or `speaking: false`, is always `{ interrupt: true, confidence: 1 }` |
+| `interrupt` | — | `{ ok }` — stops the speech only; the turn carries on |
+| `stop_all` | — | `{ ok: true }` — cancels the turn, its `pointer_run`, the speech, the background tasks and any run |
+| `new_conversation` | — | `{ ok }` — the old conversation stays on disk and is searchable; the next `chat` starts a new one |
+| `tasks` | — | `[ { id, title, status, summary } ]`; `status` is `running`, `done`, `failed`, `stopped` or `interrupted` |
+| `task_stop` | `{ id }` | `{ stopped: bool }` — false when it was not running; an error for an unknown id |
+| `confirm_reply` | `{ id, allow: bool }` | `{ ok }` — false when the id is unknown, already answered or timed out (a late yes is refused) |
+| `camera_frames` | `{ id, images?: [string], error?: string }` | `{ ok }` — answers a `camera` event; `images` are base64 JPEG or `data:image/...` URLs, at most 4 are used; `error` (non-empty) means the capture failed |
 | `set_hotkeys` | `{ values: { name: "ctrl+alt+x", ... } }` (any subset of the names) | `{ applied: { name: spec } (all seven, as now in force), refused: [name...] }` — applied live, no restart; see below |
 
 `name` must be a bare run folder name; anything with a separator or `..` is refused.
 
 ### Secrets
 
-`settings` lists `OPENAI_API_KEY` and `TYPESAFE_API_KEY` with `secret: true`,
+`settings` lists `OPENAI_API_KEY`, `TYPESAFE_API_KEY` and `POINTER_AGENT_API_KEY` with `secret: true`,
 an always-empty `value`, and a `fallback` that says only whether one is set. A secret's value never
 leaves the core, in a reply, an event or a log line. In `save_settings` an empty secret means
-"unchanged"; a non-empty one replaces the stored key. Keys not in the list are ignored. Saved values
+"unchanged"; a non-empty one replaces the stored key. Keys not in the list are ignored. For the agent key `fallback` can read `not set (the OpenAI key is used)`, since `OPENAI_API_KEY` stands in for it. Saved values
 take effect in the running core at once, except `CLICKER_HOTKEY_*` saved this way, which wait for a
 restart; change hotkeys with `set_hotkeys` instead.
 
@@ -108,7 +117,13 @@ prompt naming Claude Code, VS Code, Chrome and the commands, so "Claude" is not 
 | `highlight` | `{ marks: [ { x, y, w, h, label? } ], seconds }` | point at something on screen for `seconds` |
 | `stt` | `{ action: "start" \| "stop", purpose: "talk" \| "dictate" }` | chrome engine only: the talk or dictate key went down / up; the shell records and replies with `heard`, passing the same `purpose` back |
 | `answer` | `{ text, spoken }` | an answer is ready, and whether it was read aloud (`CLICKER_SPEAK`) |
-| `point` | `{ x, y, w, h, label, tone, step?, of?, hold }` or `{ clear: true }` | the buddy points at one box for `hold` seconds; see below |
+| `point` | `{ x, y, w, h, label, tone, step?, of?, hold, shape? }` or `{ clear: true }` | the buddy points at one box for `hold` seconds; see below. `shape` is set by the assistant's `interact` |
+| `assistant` | `{ state, detail }` | `state` is `idle`, `listening`, `thinking`, `working` (`detail` names the tool), `speaking` or `control` (see below) |
+| `reply` | `{ text }` | text for the user to read: from `interact`, or the closing text of a turn that never called it (then nothing is spoken) |
+| `speech` | `{ action: "start" \| "end", text }` | the assistant's voice began / finished (or was cut off) a line |
+| `task` | `{ id, title, status, summary }` | a background task started, finished, failed or was stopped |
+| `confirm` | `{ id, summary }` | the assistant needs a yes or no before it writes a file or runs a shell command; answer with `confirm_reply`. No answer in 60 s is a no |
+| `camera` | `{ action: "capture", id, seconds }` | the assistant wants the camera for about `seconds`; answer with `camera_frames` within 10 s |
 
 `highlight` marks are in PHYSICAL pixels on the virtual desktop — what the core captures and clicks
 in, and negative on a monitor above or left of the primary. The shell converts each one to DIPs
@@ -158,6 +173,65 @@ The core handles `pause`, `abort` and `quit` hotkeys itself (quit aborts the run
 is the shell's call) and `talk` records while the key is held and routes what it heard, as `say`
 does. `bar` and `goal` only open windows, which is the shell's job (after the foreground handoff
 above).
+
+## Assistant layer
+
+Two modes, the user's choice (Settings): `POINTER_MODE=assistant` (the default when an agent key
+exists) and `quick`. With no agent key (`POINTER_AGENT_API_KEY`, else `OPENAI_API_KEY`) the core is in
+quick mode whatever `POINTER_MODE` says; that is not an error. `state.mode` reports the one in force.
+Quick mode is exactly the behaviour described above: nothing in this section happens in it, and
+`chat` is `say`.
+
+In assistant mode `say`, spoken lines (`talk` key, `heard` as talk) and `chat` all go to the parent
+agent as `chat`, `source: "voice"` for the first two. `heard` with `purpose: "dictate"` is still only
+typed. The talk key also emits `assistant { state: "listening" }`. `start` and `ask` are unchanged.
+The model is any OpenAI-compatible server: `POINTER_AGENT_BASE_URL`, `POINTER_AGENT_MODEL` (default
+`gpt-4.1`), `POINTER_AGENT_API_KEY`.
+
+**One foreground turn at a time.** A new `chat` cancels the unfinished turn (the model call, a
+running `pointer_run`, a pending `confirm`, the speech) and carries on in the same conversation.
+Conversations are saved under `POINTER_HOME\conversations`; no API key and no camera image is ever
+written there. A long conversation is compacted into a summary.
+
+**Only `interact` reaches the user.** It speaks, draws marks and shows text in one call. The core
+validates the whole call first; one bad mark rejects all of it and nothing happens. An identical
+repeat within a turn is a no-op. On success the events come in this order: a `point { clear: true }`,
+one `point` per mark, `reply { text }`, `assistant { state: "speaking" }`, `speech { action: "start" }`,
+the voice, `speech { action: "end" }`. Each mark is a `point` with the usual physical-pixel box (origin
+added once) and a `shape`: `box`, `circle`, `arrow`, `underline`, `note` or `step` (an unknown shape
+is drawn as a box; the core already sends only these). A `note` mark has `tone: "note"`; marks with
+`shape: "step"` carry `step` and `of`. Several marks arrive as several `point` events back to back,
+so the shell should draw all of them until the next `point { clear: true }` or `hold` runs out. In
+quick mode `compose_teach` also returns a `shape` per step (an invalid one becomes `box`), but the
+quick-mode teach `point` events do not carry it yet.
+
+**`control`.** While the assistant runs `pointer_run` in Act mode it emits
+`assistant { state: "control" }` (it really is operating the computer); the next state replaces it.
+**Double-Escape** stops it: two presses of Escape within 1.5 s, only while Pointer is acting in Act
+mode (an assistant turn or a run going). The core does not register Escape as a hotkey or hook
+the keyboard, so Escape still reaches whatever app has focus; it polls the key's physical state
+every 25 ms, and only while armed. In Dry mode or when idle it does not read the key at all. The
+effect is `stop_all`, and a `line` says `stopped: Esc pressed twice`.
+
+**`gate`.** While the assistant is speaking, the shell may ask whether what the microphone just
+caught is meant for it, before it interrupts. The core asks TypeSafe a Choice, `interrupt` or `ignore`,
+with the transcript, the request being worked on and the last line spoken. A transcript starting with
+`no`, `wait`, `stop` or `actually` always interrupts; the same text heard again within 15 s passes
+(interrupts); an error or no answer within 1.5 s interrupts; `CLICKER_TURN_GATE=off` makes every
+line interrupt. An empty transcript never does. To act on an interrupt the shell calls `chat`.
+
+**Confirmations.** Reading a file or folder inside the user profile is free, except `.env` files,
+browser password and cookie stores and SSH keys, which are refused, as is anything outside the
+profile. Writing a file and running any shell command send `confirm { id, summary }` and wait for
+`confirm_reply`; no reply in 60 s, a cancel or `allow: false` is a no, and the model is told so.
+
+**Background tasks** (at most three) have their own conversations and only the file and shell tools,
+never the screen, the voice, the camera or the UI. Their only voice is the `task` event. The
+registry is saved to `tasks.json`; one that was running when the app closed is `interrupted` on the
+next start and is resumed only when the user asks the assistant to.
+
+**Camera.** `camera_look` is refused unless `POINTER_CAMERA` is `on` (default off). It emits `camera`
+and waits up to 10 s for `camera_frames`; the frames go to the model request and nowhere else.
 
 ## Dictation
 
