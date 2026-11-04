@@ -482,6 +482,10 @@ fn ax_role(control_type: i32) -> String {
 #[derive(Clone)]
 pub struct PressHandle {
     element: IUIAutomationElement,
+    /// Testing seam (feature `remote-handle`): a nonzero id names a node in a remote page, and
+    /// `element` is then only a placeholder.
+    #[cfg(feature = "remote-handle")]
+    remote: u64,
 }
 
 impl std::fmt::Debug for PressHandle {
@@ -492,11 +496,28 @@ impl std::fmt::Debug for PressHandle {
 
 impl PartialEq for PressHandle {
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "remote-handle")]
+        if self.remote != other.remote {
+            return false;
+        }
         self.element == other.element
     }
 }
 
 impl PressHandle {
+    /// A handle naming node `id` of a remote page (never a real control).
+    #[cfg(feature = "remote-handle")]
+    pub fn remote(id: u64) -> Option<PressHandle> {
+        let element = with_automation(|a| unsafe { a.GetRootElement().ok() }).flatten()?;
+        Some(PressHandle { element, remote: id })
+    }
+
+    /// The remote node id, 0 for a real UIA element.
+    #[cfg(feature = "remote-handle")]
+    pub fn remote_id(&self) -> u64 {
+        self.remote
+    }
+
     pub fn element(&self) -> &IUIAutomationElement {
         &self.element
     }
@@ -657,6 +678,8 @@ impl AxTree for UiaTree {
             loop {
                 out.push(PressHandle {
                     element: current.clone(),
+                    #[cfg(feature = "remote-handle")]
+                    remote: 0,
                 });
                 match self.walker.GetNextSiblingElement(&current) {
                     Ok(next) => current = next,
@@ -721,7 +744,11 @@ pub fn walk_window_capped(
     };
     with_automation(|automation| {
         let root = match unsafe { automation.ElementFromHandle(HWND(hwnd as *mut _)) } {
-            Ok(element) => PressHandle { element },
+            Ok(element) => PressHandle {
+                element,
+                #[cfg(feature = "remote-handle")]
+                remote: 0,
+            },
             Err(_) => return empty(),
         };
         let Ok(walker) = (unsafe { automation.RawViewWalker() }) else {
@@ -818,7 +845,11 @@ pub fn focused_field() -> Option<Node> {
             w,
             h,
             pressable,
-            handle: PressHandle { element },
+            handle: PressHandle {
+                element,
+                #[cfg(feature = "remote-handle")]
+                remote: 0,
+            },
         })
     })
     .flatten()
@@ -1857,4 +1888,350 @@ mod tests {
         }
         assert!(!out.on_screen.is_empty(), "a Chrome window has controls");
     }
+}
+
+// ---------------------------------------------------------------- browser tabs
+
+/// One tab of a browser window: its title as the tab strip shows it, and whether it is the
+/// selected one. Titles only; nothing of the page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabInfo {
+    pub title: String,
+    pub selected: bool,
+}
+
+/// What one walk of a browser window found: the tab strip, and the text fields (role, label,
+/// value) the address bar is picked from.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrowserScan {
+    pub tabs: Vec<TabInfo>,
+    pub fields: Vec<(String, String, String)>,
+}
+
+/// A tab's accessible name carries live noise Chrome appends ("Title - Memory usage - 56.1 MB"),
+/// which changes between two looks and would make a title never match twice. The page title is
+/// what is left once that tail is cut off.
+pub fn clean_tab_title(raw: &str) -> String {
+    let mut t = raw.trim();
+    for marker in [" - High memory usage - ", " - Memory usage - "] {
+        if let Some(i) = t.rfind(marker) {
+            t = &t[..i];
+        }
+    }
+    t.trim().to_string()
+}
+
+fn is_selected(handle: &PressHandle) -> bool {
+    unsafe {
+        handle
+            .element
+            .GetCurrentPattern(UIA_SelectionItemPatternId)
+            .ok()
+            .and_then(|p| p.cast::<IUIAutomationSelectionItemPattern>().ok())
+            .and_then(|p| p.CurrentIsSelected().ok())
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+fn walk_for_browser(hwnd: isize) -> Walked {
+    let monitors = crate::display::monitors();
+    let m = monitors.get(crate::display::monitor_of(hwnd));
+    let (w, h, origin) = match m {
+        Some(m) => (
+            m.width() as f64,
+            m.height() as f64,
+            (m.bounds().0 as f64, m.bounds().1 as f64),
+        ),
+        None => (4000.0, 4000.0, (0.0, 0.0)),
+    };
+    walk_window(hwnd, w, h, origin)
+}
+
+/// The tab strip and address-bar candidates of one browser window.
+pub fn browser_scan(hwnd: isize) -> BrowserScan {
+    let walked = walk_for_browser(hwnd);
+    let mut scan = BrowserScan::default();
+    for n in walked.on_screen.iter().chain(walked.off_screen.iter()) {
+        match n.role.as_str() {
+            "AXTab" if !n.label.trim().is_empty() => scan.tabs.push(TabInfo {
+                title: clean_tab_title(&n.label),
+                selected: is_selected(&n.handle),
+            }),
+            "AXTextField" | "AXTextArea" => {
+                scan.fields
+                    .push((n.role.clone(), n.label.clone(), value(&n.handle).unwrap_or_default()))
+            }
+            _ => {}
+        }
+    }
+    scan
+}
+
+/// Which tab a wanted title means: an exact match ignoring case, else the only tab whose title
+/// contains it. None when nothing matches or several do.
+pub fn pick_tab(titles: &[String], wanted: &str) -> Result<usize, String> {
+    let w = wanted.trim().to_lowercase();
+    if w.is_empty() {
+        return Err("a tab title is required".into());
+    }
+    if let Some(i) = titles.iter().position(|t| t.trim().to_lowercase() == w) {
+        return Ok(i);
+    }
+    let hits: Vec<usize> = titles
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.to_lowercase().contains(&w))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.len() {
+        0 => Err(format!("no tab is titled like {wanted:?}")),
+        1 => Ok(hits[0]),
+        n => Err(format!("{n} tabs match {wanted:?}: give more of the title")),
+    }
+}
+
+/// Bring the browser window forward and press the tab matching `title`. Returns the tab's full
+/// title. Presses only; nothing is typed.
+pub fn press_tab(hwnd: isize, title: &str) -> Result<String, String> {
+    let walked = walk_for_browser(hwnd);
+    let tabs: Vec<&Node> = walked
+        .on_screen
+        .iter()
+        .chain(walked.off_screen.iter())
+        .filter(|n| n.role == "AXTab" && !n.label.trim().is_empty())
+        .collect();
+    let titles: Vec<String> = tabs.iter().map(|n| clean_tab_title(&n.label)).collect();
+    let i = pick_tab(&titles, title)?;
+    crate::winlist::activate_window(hwnd, 1500);
+    if press(&tabs[i].handle) {
+        Ok(titles[i].clone())
+    } else {
+        Err("the tab would not take the press".into())
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::{clean_tab_title, pick_tab};
+
+    #[test]
+    fn live_noise_is_cut_from_a_tab_title() {
+        assert_eq!(clean_tab_title("AI / ML Engineer - Memory usage - 56.1 MB"), "AI / ML Engineer");
+        assert_eq!(clean_tab_title("Docs - High memory usage - 1.2 GB"), "Docs");
+        assert_eq!(clean_tab_title("  Plain  "), "Plain");
+    }
+
+    #[test]
+    fn a_tab_is_picked_exactly_or_by_a_unique_part() {
+        let t: Vec<String> = ["Inbox - Mail", "Docs", "Docs 2"].map(String::from).to_vec();
+        assert_eq!(pick_tab(&t, "docs"), Ok(1)); // exact beats partial
+        assert_eq!(pick_tab(&t, "inbox"), Ok(0));
+        assert!(pick_tab(&t, "doc").unwrap_err().contains("2 tabs"));
+        assert!(pick_tab(&t, "nothing").is_err());
+        assert!(pick_tab(&t, " ").is_err());
+    }
+}
+
+// ---------------------------------------------------------------- form controls
+
+/// One form control of a window, with the handle that focuses and reads it.
+#[derive(Debug, Clone)]
+pub struct FormControl {
+    /// `text`, `radio`, `checkbox` or `select`.
+    pub kind: String,
+    pub label: String,
+    /// For a radio or a checkbox: the question text that came before its run of options.
+    pub group: String,
+    pub value: String,
+    pub checked: bool,
+    pub required: bool,
+    pub offscreen: bool,
+    pub handle: PressHandle,
+}
+
+/// A button or link of the page.
+#[derive(Debug, Clone)]
+pub struct PageButton {
+    pub label: String,
+    pub link: bool,
+    pub enabled: bool,
+    pub handle: PressHandle,
+}
+
+/// What a page (the document inside a browser window) holds right now.
+#[derive(Debug, Clone, Default)]
+pub struct PageScan {
+    pub controls: Vec<FormControl>,
+    pub buttons: Vec<PageButton>,
+    /// Text on the page, in order.
+    pub texts: Vec<String>,
+}
+
+impl PageScan {
+    /// A fingerprint of what the page shows: its text, buttons and controls (not their typed
+    /// values), so it changes when the page swaps content and not when the user types.
+    pub fn signature(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in &self.texts {
+            h.write(t.as_bytes());
+            h.write_u8(0);
+        }
+        for b in &self.buttons {
+            h.write(b.label.as_bytes());
+            h.write_u8(b.enabled as u8);
+        }
+        for c in &self.controls {
+            h.write(c.kind.as_bytes());
+            h.write(c.label.as_bytes());
+            h.write(c.group.as_bytes());
+        }
+        h.finish()
+    }
+}
+
+fn toggled(element: &IUIAutomationElement) -> Option<bool> {
+    unsafe {
+        if let Ok(p) = element.GetCurrentPattern(UIA_TogglePatternId) {
+            if let Ok(p) = p.cast::<IUIAutomationTogglePattern>() {
+                if let Ok(s) = p.CurrentToggleState() {
+                    return Some(s.0 == 1);
+                }
+            }
+        }
+        if let Ok(p) = element.GetCurrentPattern(UIA_SelectionItemPatternId) {
+            if let Ok(p) = p.cast::<IUIAutomationSelectionItemPattern>() {
+                if let Ok(b) = p.CurrentIsSelected() {
+                    return Some(b.as_bool());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a checkbox or radio is on now.
+pub fn is_checked(handle: &PressHandle) -> Option<bool> {
+    toggled(&handle.element)
+}
+
+/// The text fields, radios, checkboxes and selects, the buttons and links, and the text of the
+/// document in one window, in reading order, including what is scrolled out of view (a web
+/// page's accessibility tree holds the whole page). Only the page itself is read, never the
+/// browser's own tabs and address bar. Bounded in nodes and time.
+pub fn page_scan(hwnd: isize) -> PageScan {
+    with_automation(|automation| {
+        let Ok(root) = (unsafe { automation.ElementFromHandle(HWND(hwnd as *mut _)) }) else {
+            return PageScan::default();
+        };
+        let Ok(walker) = (unsafe { automation.RawViewWalker() }) else {
+            return PageScan::default();
+        };
+        let start = Instant::now();
+        let mut scan = PageScan::default();
+        let mut last_text = String::new();
+        let mut run_group = String::new();
+        let mut prev_option = false;
+        let mut prev_kind = String::new();
+        let mut run_text = String::new();
+        let mut nodes = 0usize;
+        // (element, inside the page document)
+        let mut stack: Vec<(IUIAutomationElement, bool)> = vec![(root, false)];
+        while let Some((el, in_doc)) = stack.pop() {
+            nodes += 1;
+            if nodes > 15_000 || start.elapsed().as_secs_f64() > 5.0 {
+                break;
+            }
+            let control = unsafe { el.CurrentControlType() }.map(|c| c.0).unwrap_or(0);
+            let name = unsafe { el.CurrentName() }
+                .map(|n| collapse_whitespace(&n.to_string()))
+                .unwrap_or_default();
+            let now_in_doc = in_doc || control == UIA_DocumentControlTypeId.0;
+            if in_doc {
+                let kind = match control {
+                    x if x == UIA_EditControlTypeId.0 => Some("text"),
+                    x if x == UIA_RadioButtonControlTypeId.0 => Some("radio"),
+                    x if x == UIA_CheckBoxControlTypeId.0 => Some("checkbox"),
+                    x if x == UIA_ComboBoxControlTypeId.0 => Some("select"),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let option = kind == "radio" || kind == "checkbox";
+                    let group = if option {
+                        // A new run of options: after something else, of another kind, or
+                        // after new question text.
+                        if !prev_option || prev_kind != kind || run_text != last_text {
+                            run_group = last_text.clone();
+                            run_text = last_text.clone();
+                        }
+                        prev_kind = kind.to_string();
+                        run_group.clone()
+                    } else {
+                        String::new()
+                    };
+                    prev_option = option;
+                    scan.controls.push(FormControl {
+                        kind: kind.to_string(),
+                        label: name.clone(),
+                        group,
+                        value: if option { String::new() } else { value_of(&el).unwrap_or_default() },
+                        checked: option && toggled(&el).unwrap_or(false),
+                        required: unsafe { el.CurrentIsRequiredForForm() }.map(|b| b.as_bool()).unwrap_or(false),
+                        offscreen: unsafe { el.CurrentIsOffscreen() }.map(|b| b.as_bool()).unwrap_or(false),
+                        handle: PressHandle {
+                            element: el.clone(),
+                            #[cfg(feature = "remote-handle")]
+                            remote: 0,
+                        },
+                    });
+                } else if control == UIA_ButtonControlTypeId.0 || control == UIA_HyperlinkControlTypeId.0 {
+                    if !name.is_empty() {
+                        scan.buttons.push(PageButton {
+                            label: name.clone(),
+                            link: control == UIA_HyperlinkControlTypeId.0,
+                            enabled: unsafe { el.CurrentIsEnabled() }.map(|b| b.as_bool()).unwrap_or(true),
+                            handle: PressHandle {
+                            element: el.clone(),
+                            #[cfg(feature = "remote-handle")]
+                            remote: 0,
+                        },
+                        });
+                    }
+                } else if control == UIA_TextControlTypeId.0 && !name.is_empty() {
+                    scan.texts.push(name.clone());
+                    // An option's own label text is not the question.
+                    let echo = scan.controls.last().is_some_and(|c| c.label == name);
+                    // A lone "*" (the required star) is not the question.
+                    if !echo && name.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                        last_text = name;
+                    }
+                }
+            }
+            let mut kids = Vec::new();
+            unsafe {
+                if let Ok(first) = walker.GetFirstChildElement(&el) {
+                    let mut cur = first;
+                    loop {
+                        kids.push(cur.clone());
+                        match walker.GetNextSiblingElement(&cur) {
+                            Ok(next) => cur = next,
+                            Err(_) => break,
+                        }
+                        if kids.len() > 2_000 {
+                            break;
+                        }
+                    }
+                }
+            }
+            stack.extend(kids.into_iter().rev().map(|k| (k, now_in_doc)));
+        }
+        scan
+    })
+    .unwrap_or_default()
+}
+
+/// The form controls of one window: see [`page_scan`].
+pub fn form_controls(hwnd: isize) -> Vec<FormControl> {
+    page_scan(hwnd).controls
 }

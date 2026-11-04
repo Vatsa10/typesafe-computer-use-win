@@ -19,7 +19,7 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Media::Speech::{
     ISpObjectTokenCategory, ISpVoice, SVSFPurgeBeforeSpeak, SVSFlagsAsync, SpObjectTokenCategory,
-    SpVoice, SPCAT_VOICES,
+    SpVoice, SPCAT_VOICES, SPVOICESTATUS,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -38,6 +38,7 @@ pub const SPEAK_LIMIT: usize = 240;
 enum Request {
     Speak(String, Sender<bool>),
     Voices(Sender<Vec<String>>),
+    Speaking(Sender<bool>),
 }
 
 /// The speech thread's mailbox, or None when the voice could not be created.
@@ -59,6 +60,9 @@ fn start() -> Option<Mutex<Sender<Request>>> {
             };
             let _ = ready_tx.send(voice.is_some());
             let Some(voice) = voice else { return };
+            if let Ok(wanted) = std::env::var("POINTER_VOICE") {
+                pick_voice(&voice, wanted.trim());
+            }
             for request in rx {
                 match request {
                     Request::Speak(text, reply) => {
@@ -66,6 +70,13 @@ fn start() -> Option<Mutex<Sender<Request>>> {
                         // SAFETY: wide outlives the call; SAPI copies async text before returning.
                         let ok = unsafe { voice.Speak(&wide, ASYNC_PURGE, None) }.is_ok();
                         let _ = reply.send(ok);
+                    }
+                    Request::Speaking(reply) => {
+                        let mut status = SPVOICESTATUS::default();
+                        // SAFETY: a valid out struct; the bookmark out is optional.
+                        let ok = unsafe { voice.GetStatus(&mut status, std::ptr::null_mut()) }.is_ok();
+                        // SPRS_IS_SPEAKING is bit 1 of the running state.
+                        let _ = reply.send(ok && status.dwRunningState & 2 != 0);
                     }
                     Request::Voices(reply) => {
                         let _ = reply.send(list_voices().unwrap_or_default());
@@ -77,6 +88,37 @@ fn start() -> Option<Mutex<Sender<Request>>> {
         return None;
     }
     Some(Mutex::new(tx))
+}
+
+/// Switch to the installed voice whose description contains the name (case-insensitive). A name
+/// that matches nothing, such as a Murf voice id, leaves the default voice alone. Speech thread only.
+fn pick_voice(voice: &ISpVoice, wanted: &str) {
+    if wanted.is_empty() {
+        return;
+    }
+    let wanted = wanted.to_lowercase();
+    // SAFETY: COM calls on the initialised speech thread; strings are freed after copying.
+    unsafe {
+        let Ok(category) = CoCreateInstance::<_, ISpObjectTokenCategory>(&SpObjectTokenCategory, None, CLSCTX_ALL) else { return };
+        if category.SetId(SPCAT_VOICES, false).is_err() {
+            return;
+        }
+        let Ok(tokens) = category.EnumTokens(PCWSTR::null(), PCWSTR::null()) else { return };
+        let mut count = 0u32;
+        if tokens.GetCount(&mut count).is_err() {
+            return;
+        }
+        for i in 0..count {
+            let Ok(token) = tokens.Item(i) else { continue };
+            let Ok(raw) = token.GetStringValue(PCWSTR::null()) else { continue };
+            let name = raw.to_string().unwrap_or_default().to_lowercase();
+            CoTaskMemFree(Some(raw.0 as *const _));
+            if name.contains(&wanted) {
+                let _ = voice.SetVoice(&token);
+                return;
+            }
+        }
+    }
 }
 
 /// Installed voice descriptions, read from the SAPI voice token category. Speech thread only.
@@ -127,6 +169,11 @@ pub fn speak(text: &str) -> bool {
     }
     let spoken = spoken.to_string();
     ask(|reply| Request::Speak(spoken, reply)).unwrap_or(false)
+}
+
+/// True while the SAPI voice is still producing sound.
+pub fn is_speaking() -> bool {
+    ask(Request::Speaking).unwrap_or(false)
 }
 
 /// Cut off whatever is being said. Safe when nothing is speaking and with no engine. Returns

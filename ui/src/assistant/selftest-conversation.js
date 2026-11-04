@@ -57,6 +57,16 @@ async function run() {
   await r.conv.onSegment("um open uh the calendar");
   check("filler-stripped request goes to chat as voice", r.chats().join("|") === "open the calendar" && r.calls[0].params.source === "voice");
 
+  // an acknowledgement clip is echo history, not a reply
+  r = rig();
+  await r.conv.begin();
+  await r.conv.onSegment("open the calendar");
+  r.conv.onCoreEvent({ event: "speech", real: true, ack: true, action: "start", text: "Let's see." });
+  check("an ack clip does not mark the request as answered", r.conv._lastChat().replyStarted === false);
+  await r.conv.onSegment("let's see");
+  check("an ack clip heard back through the mic is dropped", r.chats().length === 1);
+  r.conv.onCoreEvent({ event: "speech", real: true, ack: true, action: "end", cut: true });
+
   // echo of its own voice
   r = rig();
   await r.conv.begin();

@@ -10,9 +10,12 @@
 //! the `interact` tool reaches the user; a turn that ends without it shows its text, silently.
 
 pub mod agent;
+pub mod answers;
 pub mod control;
+pub mod forms;
 pub mod gate;
 pub mod pending;
+pub mod readonly;
 pub mod safety;
 pub mod shell;
 pub mod store;
@@ -71,6 +74,17 @@ pub fn current_mode() -> Mode {
     resolve_mode(
         std::env::var("POINTER_MODE").ok().as_deref(),
         api::chat::agent_key().is_some(),
+    )
+}
+
+/// `POINTER_AUTONOMY`: full unless set to ask.
+pub fn autonomy_setting() -> bool {
+    !matches!(
+        std::env::var("POINTER_AUTONOMY")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .as_deref(),
+        Some("ask")
     )
 }
 
@@ -138,8 +152,62 @@ impl Observation {
     }
 }
 
+/// Where TypeSafe found something on the screen, on the virtual desktop in physical pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Located {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// TypeSafe's box confidence. Not a reliable gate: it reads low on exact boxes.
+    pub confidence: f64,
+}
+
 pub trait Senses: Send + Sync {
     fn observe(&self) -> Result<Observation, String>;
+
+    /// Ask TypeSafe where `what` is on the screen under the mouse. Looks only; never clicks.
+    fn locate(&self, _what: &str) -> Result<Located, String> {
+        Err("locating is not available here".into())
+    }
+
+    /// A fresh look at the whole machine (windows, browsers' tab titles, the mouse).
+    fn world(&self) -> Result<crate::world::Snapshot, String> {
+        Err("the world cannot be read here".into())
+    }
+
+    /// The installed apps Pointer can launch.
+    fn catalog(&self) -> Vec<crate::world::CatApp> {
+        Vec::new()
+    }
+
+    /// Launch an app from the catalog and report what appeared. Only called in Act mode.
+    fn open_app(&self, _app: &crate::world::CatApp) -> Result<String, String> {
+        Err("launching apps is not available here".into())
+    }
+
+    /// The form controls of the front window (text fields, radios, checkboxes, selects), read
+    /// from the page, including those scrolled out of view.
+    fn form_read(&self) -> Result<forms::PageView, String> {
+        Err("forms cannot be read here".into())
+    }
+
+    /// Fill entries into the front window's form with real focus and keystrokes, then read the
+    /// page back and say per entry whether it holds. Only called in Act mode.
+    fn form_fill(&self, _entries: &[forms::FormEntry]) -> Result<Vec<forms::FormResult>, String> {
+        Err("forms cannot be filled here".into())
+    }
+
+    /// Press the page button or link named `label` with real focus and keys, wait for the page to
+    /// settle, and say whether it changed. Only called in Act mode.
+    fn form_click(&self, _label: &str) -> Result<forms::ClickReport, String> {
+        Err("pages cannot be clicked here".into())
+    }
+
+    /// Press the browser tab matching `title`. Only called in Act mode.
+    fn switch_tab(&self, _title: &str) -> Result<String, String> {
+        Err("switching tabs is not available here".into())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +276,9 @@ impl Default for Limits {
 
 pub type ChatSource = Arc<dyn Fn() -> Result<Arc<dyn Chat>, String> + Send + Sync>;
 pub type Flag = Arc<dyn Fn() -> bool + Send + Sync>;
+/// The structured writer, resolved per call like the chat model. Err says why there is none.
+pub type WriterSource =
+    Arc<dyn Fn() -> Result<Box<dyn crate::writer::StructuredWriter>, String> + Send + Sync>;
 
 pub struct Services {
     /// The model, resolved per call so a key saved in Settings applies at once.
@@ -229,6 +300,12 @@ pub struct Services {
     pub confirms: Pending<bool>,
     /// Camera frames (data URLs) or an error message.
     pub cameras: Pending<Result<Vec<String>, String>>,
+    /// The document index and profile cache for find_documents and get_profile.
+    pub documents: Arc<crate::documents::Documents>,
+    pub writer: WriterSource,
+    /// Autonomy is full: nothing is asked except payments, deleting or overwriting the user's
+    /// files, and passwords. False is `ask`: writes, shell and resumes need a yes.
+    pub autonomy_full: Flag,
 }
 
 impl Services {
@@ -252,6 +329,12 @@ impl Services {
 pub struct Memory {
     pub current_request: String,
     pub last_spoken: String,
+    /// What Pointer knows about the machine, kept across turns.
+    pub world: crate::world::World,
+    /// The user said yes to sending a resume's text to the model, for this session.
+    pub profile_ok: bool,
+    /// The profile get_profile read last, for form_answer.
+    pub profile: Option<crate::documents::Profile>,
 }
 
 struct TurnSlot {
@@ -363,7 +446,11 @@ impl Assistant {
             cancel,
             tasks: &self.tasks,
             memory: &self.memory,
-            system: agent::system_prompt((self.svc.act_mode)(), (self.svc.camera_enabled)()),
+            system: agent::system_prompt(
+                (self.svc.act_mode)(),
+                (self.svc.camera_enabled)(),
+                (self.svc.autonomy_full)(),
+            ),
             max_iterations: self.svc.limits.max_iterations,
             time: self.svc.limits.turn_time,
         };
@@ -446,7 +533,12 @@ impl Assistant {
         self.svc.voice.stop();
         let mut conv = self.conv.lock().unwrap_or_else(|p| p.into_inner());
         *conv = Conversation::new(&self.svc.conversations_dir());
-        *self.memory.lock().unwrap_or_else(|p| p.into_inner()) = Memory::default();
+        {
+            // The conversation starts over; what Pointer knows about the machine does not.
+            let mut m = self.memory.lock().unwrap_or_else(|p| p.into_inner());
+            m.current_request.clear();
+            m.last_spoken.clear();
+        }
         self.svc.assistant_state("idle", "");
     }
 

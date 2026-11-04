@@ -15,3 +15,6 @@ serde_json = { workspace = true }
 wcore = { package = "core", path = "../core" }
 api = { path = "../api" }
 base64 = { workspace = true }
+
+[dev-dependencies]
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

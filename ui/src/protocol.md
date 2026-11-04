@@ -32,14 +32,16 @@ them by `id`. A missing or `null` `params` is the same as `{}`.
 | `abort` | — | `{ ok: bool }` — whether there was a run; also emits `state` |
 | `listen_start` | — | `{ listening: bool }` — false when already recording; error when voice is off, or on the chrome engine (the shell answers it there) |
 | `listen_stop` | — | `{ heard: string }` — `""` for silence |
-| `set_mode` | `{ act, voice, hide }` (any subset) | the same three, as applied |
+| `set_mode` | `{ act, voice, hide }` (any subset) | the same three, as applied. Act is the default, in Assistant mode and Quick alike; Dry run stays a choice |
+| `get_answers` | — | `{ fields: [ { key, label, value } ] }` — the saved personal answers (`my-answers.json` under `POINTER_HOME`) |
+| `set_answers` | `{ values: { key: text } }` | the same shape, as saved; an empty text removes the answer |
 | `runs` | — | `[ { name, goal, outcome, answer, goal_achieved, seconds, steps_taken, acted } ]`, newest first |
 | `steps` | `{ name }` | `[ { number, has_shot } ]` |
 | `shot` | `{ name, number }` | `{ data_url }` — a `data:image/png;base64,...` URL, `""` when there is no capture |
 | `settings` | — | `[ { key, label, value, fallback, secret } ]` |
 | `save_settings` | `{ values: { KEY: value } }` | `{ saved: true, keys: [KEY...] }` — names only, never values |
 | `hotkeys` | — | `{ names: [...], current: { name: spec }, defaults: { name: spec } }` for `talk`, `dictate`, `bar`, `goal`, `pause`, `abort`, `quit` (in that order) |
-| `chat` | `{ text, source: "voice" \| "typed" }` (`source` defaults to `typed`) | assistant mode: `{ queued: true, mode: "assistant" }` at once, the turn runs on its own thread and reports by events. Quick mode: the line is routed as `say` is, and the reply is that object plus `mode: "quick"`. Errors: empty `text`, an unknown `source` |
+| `chat` | `{ text, source: "voice" | "typed" }` (`source` defaults to `typed`) | assistant mode: `{ queued: true, mode: "assistant" }` at once, the turn runs on its own thread and reports by events. Quick mode: the line is routed as `say` is, and the reply is that object plus `mode: "quick"`. Errors: empty `text`, an unknown `source` |
 | `gate` | `{ heard, speaking? }` (`speaking` defaults to true) | `{ interrupt: bool, confidence }` — see Assistant layer. Quick mode, or `speaking: false`, is always `{ interrupt: true, confidence: 1 }` |
 | `interrupt` | — | `{ ok }` — stops the speech only; the turn carries on |
 | `stop_all` | — | `{ ok: true }` — cancels the turn, its `pointer_run`, the speech, the background tasks and any run |
@@ -83,6 +85,45 @@ hotkey is delivered to the core, not the shell, so before the core emits `hotkey
 (`win.show(); win.focus()`) as soon as it receives the event; the grant lapses at the next input, so
 focus promptly rather than after an animation.
 
+### Voice engines: Deepgram and Murf
+
+`CLICKER_STT` order is `deepgram` (when `DEEPGRAM_API_KEY` is set), `chrome`, `windows`; a named value forces
+one (`openai` too). On **deepgram** the core records through `platform::audio` and streams 16 kHz PCM to
+Deepgram (`nova-3`, interim results, endpointing 400 ms, `utterance_end_ms` 1000, key terms Claude, Claude
+Code, Pointer, TypeSafe). The key stays in the core. `CLICKER_STT_LANG` picks the language (unset is `en`;
+`auto` or `multi` is code-switching, which handles Hindi mixed with English but answers more slowly).
+The shell asks for the session: `listen_start { conv?: bool, purpose?: "talk"|"dictate" }` (`conv` keeps
+the microphone open across sentences) and `listen_stop` returns everything heard. Push-to-talk emits
+`stt` start/stop exactly as on chrome and the shell answers with `listen_start`/`listen_stop`.
+The core ends an utterance itself rather than wait for Deepgram's `speech_final` (which does not fire in a
+noisy room): `Finalize` goes after 850 ms of quiet, or 1.6 s when the words stop mid-phrase ("open the", a
+trailing "and"/preposition/comma). Two clocks drive it, the local gate's quiet and the age of Deepgram's own
+text, and either can fire. When every word is already final the utterance is delivered at once, without
+waiting for the server's answer to `Finalize`. The microphone starts recording as soon as a session starts,
+while the socket opens (a spare socket is kept open with `KeepAlive`), and the last 2 s are replayed so the
+first words are not clipped. A dropped socket in a conversation is reopened once before falling back.
+
+| event | payload | meaning |
+|---|---|---|
+| `transcript` | `{ text, final, purpose }` | `final: false` is everything of the current utterance so far; `final: true` is the finished utterance. Never logged |
+| `stt_fallback` | `{ engine: "chrome", reason }` | Deepgram could not connect or the socket dropped; `state.stt` reads `chrome` for two minutes and the shell moves an open conversation to the browser recognizer. A line says so |
+| `stt_stats` | `{ floor, threshold, peak_rms, heard_speech, seconds }` | levels of a finished session, for diagnosing the silence gate; no words |
+| `speech` with `real: true` | `{ action: "start"|"end", real, engine, cut, first_audio_ms? }` | sound really started / ended at the audio device (`cut` when interrupted). `first_audio_ms` on a start is the time from the request to first sound. The plain `speech` events still bracket the voice call and carry the text |
+| `speech` with `real: true, ack: true` | `{ action, real, ack, text?, engine, cut? }` | an acknowledgement clip ("Hmm.", "Okay.", "Let's see."), played the moment a voice request ends. Lowest priority: the real reply, `interrupt`, Stop or more speech cuts it. It carries its `text` so the shell adds it to the echo history; it is **not** a reply. Skipped when replies are muted. Clips are made once in the chosen voice under `POINTER_HOME/voice/ack/<engine>-<voice hash>/` |
+
+**Voices.** Auto order is Rumik (`RUMIK_API_KEY`), then Murf (`MURF_API_KEY`), then Windows SAPI;
+`POINTER_TTS=rumik|murf|sapi` forces one, and a failing cloud voice falls back down the chain with a line.
+Rumik is `POST silk-api.rumik.ai/v1/tts` with `audio_format: "pcm"` (24 kHz mono), `RUMIK_MODEL`
+(`mulberry` default, or `muga`) and `RUMIK_SPEAKER` (default `emma`). A reply is split at sentence
+boundaries and two sentences are synthesised at a time into one gap-free playback, over one pooled,
+kept-warm connection. While the mic is open the core cancels the echo of its own playback
+(`POINTER_AEC=0` turns that off).
+
+**Murf** (`POINTER_TTS=murf`): `POINTER_VOICE` is a Murf voice
+id (default `en-US-natalie`) or, on SAPI, part of an installed voice name. Audio streams as raw PCM and is
+played by the core as bytes arrive (about 0.25 s to first sound); `interrupt` resets the device, so sound
+ends within tens of milliseconds.
+
 ### Voice
 
 `listen_start` records the default microphone on a worker thread until `listen_stop`, the longest
@@ -115,12 +156,12 @@ prompt naming Claude Code, VS Code, Chrome and the commands, so "Claude" is not 
 | `state` | `{ running, paused, hotkeys }` | at startup, and when a run starts, pauses, resumes or ends |
 | `hotkey` | `{ name }` | a global hotkey fired: `bar`, `talk`, `dictate`, `goal`, `pause`, `abort` or `quit` (the bar opens on `bar`) |
 | `highlight` | `{ marks: [ { x, y, w, h, label? } ], seconds }` | point at something on screen for `seconds` |
-| `stt` | `{ action: "start" \| "stop", purpose: "talk" \| "dictate" }` | chrome engine only: the talk or dictate key went down / up; the shell records and replies with `heard`, passing the same `purpose` back |
+| `stt` | `{ action: "start" | "stop", purpose: "talk" | "dictate" }` | chrome engine only: the talk or dictate key went down / up; the shell records and replies with `heard`, passing the same `purpose` back |
 | `answer` | `{ text, spoken }` | an answer is ready, and whether it was read aloud (`CLICKER_SPEAK`) |
 | `point` | `{ x, y, w, h, label, tone, step?, of?, hold, shape? }` or `{ clear: true }` | the buddy points at one box for `hold` seconds; see below. `shape` is set by the assistant's `interact` |
 | `assistant` | `{ state, detail }` | `state` is `idle`, `listening`, `thinking`, `working` (`detail` names the tool), `speaking` or `control` (see below) |
 | `reply` | `{ text }` | text for the user to read: from `interact`, or the closing text of a turn that never called it (then nothing is spoken) |
-| `speech` | `{ action: "start" \| "end", text }` | the assistant's voice began / finished (or was cut off) a line |
+| `speech` | `{ action: "start" | "end", text }` | the assistant's voice began / finished (or was cut off) a line |
 | `task` | `{ id, title, status, summary }` | a background task started, finished, failed or was stopped |
 | `confirm` | `{ id, summary }` | the assistant needs a yes or no before it writes a file or runs a shell command; answer with `confirm_reply`. No answer in 60 s is a no |
 | `camera` | `{ action: "capture", id, seconds }` | the assistant wants the camera for about `seconds`; answer with `camera_frames` within 10 s |
@@ -151,6 +192,23 @@ pointing. Who points:
   (1.5–6 s) so the voice finishes before the next. A step naming no listed item is only said, with
   no `point`. Teaching ends with `{ clear: true }`. A spoken "stop" (or the abort hotkey) ends it
   between steps; the steps are about the capture taken when the question was asked.
+
+### Assistant tools that reach the machine (no new events)
+
+The assistant's `locate{what}` asks TypeSafe's box primitive where something is on the screen under the
+mouse and returns a mark (`L1`, ...) that `interact` can point at (`marks: [{ located: "L1" }]`); the
+box becomes an ordinary `point` event in physical virtual-desktop pixels, display origin added once.
+`locate` only looks: it never clicks. An item that `observe` already lists is preferred. `world`
+returns what Pointer knows of the machine (windows per display, Chrome/Edge tab titles and the active
+address without query or fragment, the app catalog, recent changes, Pointer's own actions); a short
+form is added to every turn. `open_app{key}` and `switch_tab{title}` act only in Act mode; in Dry mode
+they change nothing and return `{ acted: false, dry_mode: true, would_launch | would_select }`.
+`POINTER_JEV_VISION` is `auto` (the default: the downscaled screen image goes to TypeSafe only when the
+screen is sparse in readable items, fewer than 8 OCR or accessibility items), `on` (always) or `off`
+(never). Measured: the image tripled decision latency (1.2 s against 0.42 s) with no better decisions on
+a screen that reads well as text. `locate` always uses the image.
+Only the app catalog (`apps-v2.json`) and Pointer's own action log (`world-actions.json` in
+`POINTER_HOME`) are written to disk; window and tab titles never are.
 
 ### Pointer context
 
@@ -185,8 +243,31 @@ Quick mode is exactly the behaviour described above: nothing in this section hap
 In assistant mode `say`, spoken lines (`talk` key, `heard` as talk) and `chat` all go to the parent
 agent as `chat`, `source: "voice"` for the first two. `heard` with `purpose: "dictate"` is still only
 typed. The talk key also emits `assistant { state: "listening" }`. `start` and `ask` are unchanged.
-The model is any OpenAI-compatible server: `POINTER_AGENT_BASE_URL`, `POINTER_AGENT_MODEL` (default
-`gpt-4.1`), `POINTER_AGENT_API_KEY`.
+`POINTER_LLM` picks the provider: `openai` (agent model `gpt-6-luna`; any OpenAI-compatible server through
+`POINTER_AGENT_BASE_URL`) or `claude` (`claude-haiku-5-5`). `POINTER_AGENT_MODEL` overrides the model,
+`POINTER_AGENT_API_KEY` (else `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) is the key.
+
+**Tools.** `interact`, `observe`, `locate`, `world`, `open_app`, `switch_tab`, `pointer_run`, `read_file`,
+`list_dir`, `write_file`, `run_shell`, `camera_look`, `start_task`, `list_tasks`, `stop_task`,
+`resume_task`, `search_history`, and for documents and forms: `find_documents` (names, paths and dates
+of resumes and other files, never contents), `get_profile` (a resume read into a structured profile),
+`form_answer` (one field from the profile or from the saved answers), `save_answer`, `form_read` and
+`form_fill` (the front window's fields read from the page, and filled with real focus and typing,
+each result read back), and `confirm`. Dry mode: `form_fill` types nothing and returns what it would fill.
+
+**Autonomy.** `POINTER_AUTONOMY=full` (the default; Settings can switch to `ask`). In full the assistant
+acts without asking: files are written, shell commands run (a parsed read-only PowerShell allowlist
+always runs), resumes are read and forms submitted. It sends `confirm` only before a payment or purchase,
+before deleting or overwriting the user's files (a shell command that does so, or `write_file` over an
+existing file) and before entering a password. Forbidden paths stay blocked. In `ask` every file write,
+every shell command outside the read-only allowlist and the first `get_profile` of a session need a yes.
+
+**My answers.** What only the user can say on a form (expected salary, notice period, start date, work
+authorisation, visa sponsorship, gender, disability, race, veteran status, relocation, criminal history,
+attestation) lives in `my-answers.json` under `POINTER_HOME`, filled once in Settings ("My answers") or
+learned when the user answers. `form_answer` uses it with no question; it never infers these from a
+resume. With no saved answer it returns `needs_user`: an optional field is left empty, and for a required
+one the assistant asks once, in one message, and calls `save_answer`.
 
 **One foreground turn at a time.** A new `chat` cancels the unfinished turn (the model call, a
 running `pointer_run`, a pending `confirm`, the speech) and carries on in the same conversation.
@@ -222,8 +303,14 @@ line interrupt. An empty transcript never does. To act on an interrupt the shell
 
 **Confirmations.** Reading a file or folder inside the user profile is free, except `.env` files,
 browser password and cookie stores and SSH keys, which are refused, as is anything outside the
-profile. Writing a file and running any shell command send `confirm { id, summary }` and wait for
+profile. What needs a yes (see Autonomy for when) sends `confirm { id, summary }` and waits for
 `confirm_reply`; no reply in 60 s, a cancel or `allow: false` is a no, and the model is told so.
+`run_shell` runs without a card when the command parses as read-only: a pipeline of `Get-ChildItem`,
+`Get-Item`, `Get-Content`, `Select-String`, `Measure-Object`, `Sort-Object`, `Select-Object`,
+`Where-Object`, `Format-*`, `Test-Path`, `Get-Process` and `Get-Date` with known parameters and literal
+arguments; any redirect, `;`, `&`, backtick, `$(...)`, variable, `Invoke-*`, `iex`, other cmdlet or
+filter block that calls anything is not read-only, nor is a path that is forbidden or outside the
+profile, or files piped into a file reader.
 
 **Background tasks** (at most three) have their own conversations and only the file and shell tools,
 never the screen, the voice, the camera or the UI. Their only voice is the `task` event. The

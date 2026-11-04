@@ -46,8 +46,32 @@ fn hotkey_default(name: &str) -> String {
 /// Every editable key, in the order the panel shows them.
 pub fn catalog() -> Vec<Setting> {
     vec![
+        row(
+            "POINTER_LLM",
+            "Assistant model: openai (GPT-6 Luna, about $0.10 in / $0.50 out per 1M tokens) or claude (Claude Haiku 5.5, $0.10 in / $0.50 out per 1M)",
+            "openai if its key is set, else claude if its key is set",
+        ),
         secret("OPENAI_API_KEY", "OpenAI API key"),
+        secret("ANTHROPIC_API_KEY", "Anthropic API key"),
         secret("TYPESAFE_API_KEY", "TypeSafe API key"),
+        secret("DEEPGRAM_API_KEY", "Deepgram API key (speech to text)"),
+        secret("MURF_API_KEY", "Murf API key (the assistant's voice)"),
+        row(
+            "POINTER_TTS",
+            "Voice engine: murf, windows or off",
+            "murf if its key is set, else windows",
+        ),
+        row("POINTER_VOICE", "Voice name for the assistant", "the engine's default"),
+        row(
+            "POINTER_AUTONOMY",
+            "Autonomy: full (acts without asking, except payments, deleting or overwriting files, passwords) or ask",
+            "full",
+        ),
+        row(
+            "POINTER_JEV_VISION",
+            "Send the screen image to TypeSafe: auto (only when the screen is sparse), on or off",
+            "auto",
+        ),
         row(
             "POINTER_MODE",
             "Mode: assistant or quick",
@@ -55,13 +79,17 @@ pub fn catalog() -> Vec<Setting> {
         ),
         row(
             "POINTER_AGENT_BASE_URL",
-            "Agent base URL (any OpenAI-compatible server)",
+            "Agent base URL (OpenAI provider only; any OpenAI-compatible server)",
             api::chat::DEFAULT_BASE_URL,
         ),
         row(
             "POINTER_AGENT_MODEL",
-            "Agent model",
-            api::chat::DEFAULT_MODEL,
+            "Agent model (overrides the provider default)",
+            format!(
+                "{} (openai) or {} (claude)",
+                api::chat::DEFAULT_MODEL,
+                api::anthropic::DEFAULT_MODEL
+            ),
         ),
         secret("POINTER_AGENT_API_KEY", "Agent API key"),
         row(
@@ -160,18 +188,26 @@ pub fn catalog() -> Vec<Setting> {
         row("CLICKER_OCR_LANGUAGE", "OCR language", "en-US"),
         row(
             "CLICKER_WRITER_PROVIDER",
-            "Writer provider",
-            "openai when its key is set",
+            "Writer provider (follows the assistant model by default)",
+            "same as POINTER_LLM",
         ),
         row(
             "CLICKER_WRITER_MODEL",
             "Writer model",
-            config::DEFAULT_OPENAI_WRITER_MODEL,
+            format!(
+                "{} (openai) or {} (claude)",
+                config::DEFAULT_OPENAI_WRITER_MODEL,
+                config::DEFAULT_WRITER_MODEL
+            ),
         ),
         row(
             "CLICKER_ANSWER_MODEL",
             "Answer model",
-            config::DEFAULT_OPENAI_ANSWER_MODEL,
+            format!(
+                "{} (openai) or {} (claude)",
+                config::DEFAULT_OPENAI_ANSWER_MODEL,
+                config::DEFAULT_ANSWER_MODEL
+            ),
         ),
     ]
 }
@@ -301,6 +337,25 @@ mod tests {
         assert_eq!(
             to_write(values.as_object().unwrap()),
             vec![("POINTER_AGENT_API_KEY".to_string(), "sk-new".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_anthropic_key_is_a_masked_secret_and_the_provider_choice_is_plain() {
+        let rows = rows(&BTreeMap::from([
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-hush".to_string()),
+            ("POINTER_LLM".to_string(), "claude".to_string()),
+        ]));
+        assert!(!serde_json::to_string(&rows).unwrap().contains("sk-ant-hush"));
+        let key = rows.iter().find(|r| r["key"] == "ANTHROPIC_API_KEY").unwrap();
+        assert_eq!((key["secret"].clone(), key["value"].clone()), (json!(true), json!("")));
+        assert!(key["fallback"].as_str().unwrap().starts_with("set"));
+        let llm = rows.iter().find(|r| r["key"] == "POINTER_LLM").unwrap();
+        assert_eq!((llm["secret"].clone(), llm["value"].clone()), (json!(false), json!("claude")));
+        let values = json!({ "ANTHROPIC_API_KEY": "", "POINTER_LLM": "openai" });
+        assert_eq!(
+            to_write(values.as_object().unwrap()),
+            vec![("POINTER_LLM".to_string(), "openai".to_string())]
         );
     }
 

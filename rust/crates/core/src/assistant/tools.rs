@@ -6,11 +6,12 @@
 
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
 use super::tasks::Tasks;
-use super::{safety, store, Memory, Observation, Services};
+use super::{safety, store, Located, Memory, Observation, Services};
 use crate::writer::shape_or_box;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,13 @@ pub struct TurnCtx {
     pub interacted: bool,
     /// Camera frames waiting to go to the model with the next request, in memory only.
     pub pending_images: Vec<String>,
+    /// Boxes `locate` found this turn, by mark id ("L1"). Pointing only.
+    pub located: Vec<(String, Located)>,
+    /// Form fields filled this turn, by label, with how each ended: kept across the pages of a
+    /// multi-page form so nothing is filled twice or forgotten.
+    pub checklist: std::collections::BTreeMap<String, String>,
+    /// Page buttons pressed this turn and whether the page changed, to stop a loop that does nothing.
+    pub clicks: Vec<(String, bool)>,
 }
 
 pub struct ToolEnv<'a> {
@@ -41,9 +49,13 @@ pub struct ToolEnv<'a> {
     pub ctx: &'a mut TurnCtx,
 }
 
-const FOREGROUND: [&str; 13] = [
+const FOREGROUND: [&str; 26] = [
     "interact",
     "observe",
+    "locate",
+    "world",
+    "open_app",
+    "switch_tab",
     "pointer_run",
     "read_file",
     "list_dir",
@@ -55,6 +67,15 @@ const FOREGROUND: [&str; 13] = [
     "stop_task",
     "resume_task",
     "search_history",
+    "find_documents",
+    "get_profile",
+    "form_answer",
+    "form_read",
+    "form_fill",
+    "form_autofill",
+    "form_click",
+    "save_answer",
+    "confirm",
 ];
 
 const TASK: [&str; 5] = [
@@ -84,16 +105,17 @@ fn schema_of(name: &str) -> Value {
         "interact" => func(
             "interact",
             "The only way to reach the user. Speak a short line, show a short text and mark items on the \
-             screen, all together in one call. Give at least one of speech, text, marks. Marks refer to \
-             item numbers from your latest observe.",
+             screen, all together in one call. Give at least one of speech, text, marks. A mark names an \
+             item number from your latest observe, or a box from locate (located: L1).",
             json!({
                 "speech": {"type": "string", "description": "What to say aloud: one or two plain sentences."},
                 "text": {"type": "string", "description": "Text to show on screen. Defaults to the speech."},
                 "marks": {"type": "array", "maxItems": 8, "items": {"type": "object", "properties": {
                     "item": {"type": "integer", "description": "An item number from the latest observe."},
+                    "located": {"type": "string", "description": "A box id from locate, such as L1. Use instead of item."},
                     "shape": {"type": "string", "enum": ["box", "circle", "arrow", "underline", "note", "step"]},
                     "label": {"type": "string"},
-                }, "required": ["item"]}},
+                }}},
                 "hold_seconds": {"type": "number", "description": "How long marks stay, 1 to 30. Default 6."},
             }),
             &[],
@@ -105,10 +127,47 @@ fn schema_of(name: &str) -> Value {
             json!({}),
             &[],
         ),
+        "locate" => func(
+            "locate",
+            "Find something on the screen that observe did not list (an icon, an image, a region) by \
+             asking a vision model where it is, and get a box you can point at with interact \
+             (located: L1). It only looks: it never clicks, and the box is a guess, so say so if \
+             unsure. If observe already lists the thing, use its item number instead.",
+            json!({"what": {"type": "string", "description": "What to find, in plain words."}}),
+            &["what"],
+        ),
+        "world" => func(
+            "world",
+            "What Pointer knows about the machine: every open window by display, browser tab \
+             titles and the active address, installed apps and their keys, what changed lately and \
+             what Pointer did. A short version is already in each turn; call this for the full \
+             list. section: windows, tabs, apps, changes or actions (default all).",
+            json!({"section": {"type": "string", "enum": ["windows", "tabs", "apps", "changes", "actions", "all"]}}),
+            &[],
+        ),
+        "open_app" => func(
+            "open_app",
+            "Launch an installed app by its key from the world tool's apps (Store apps such as \
+             Notepad and Calculator included). Prefer it to pointer_run for plain launches. In Dry \
+             mode it launches nothing and reports what it would launch: call it anyway and tell the \
+             user.",
+            json!({"key": {"type": "string", "description": "An app key from the world tool, such as notepad."}}),
+            &["key"],
+        ),
+        "switch_tab" => func(
+            "switch_tab",
+            "Bring a Chrome or Edge tab forward by its title (from the world tool's tabs). It only \
+             selects the tab. In Dry mode it presses nothing and reports which tab it would select: \
+             call it anyway and tell the user.",
+            json!({"title": {"type": "string", "description": "The tab's title, or enough of it to be unique."}}),
+            &["title"],
+        ),
         "pointer_run" => func(
             "pointer_run",
             "Operate the computer toward one goal with Pointer's own look-and-act loop, and wait for \
-             it. In Dry mode it only shows what it would press. Returns the outcome and its answer.",
+             it. Not for web forms or their buttons (Next, Submit): use form_read, form_autofill,              form_fill and form_click for those. In Dry mode it presses nothing and only reports what it would do: that is the point \
+             of Dry mode, so call it anyway and tell the user what would happen. Returns the outcome \
+             and its answer.",
             json!({"goal": {"type": "string", "description": "One clear goal in plain English."}}),
             &["goal"],
         ),
@@ -170,6 +229,94 @@ fn schema_of(name: &str) -> Value {
             json!({"query": {"type": "string"}}),
             &["query"],
         ),
+        "find_documents" => func(
+            "find_documents",
+            "Find documents on this computer (resumes, PDFs, Word files, notes) by what they are about. \
+             kind resume ranks files that read like a resume, newest first. Returns file names, paths \
+             and dates, never contents.",
+            json!({"query": {"type": "string", "description": "Words about the document, such as resume."},
+                   "kind": {"type": "string", "enum": ["resume", "any"]},
+                   "limit": {"type": "integer"}}),
+            &["query"],
+        ),
+        "get_profile" => func(
+            "get_profile",
+            "Read one resume found by find_documents into a structured profile (name, contact, work, \
+             education, skills). Use form_answer for each form field rather than reading values off it.",
+            json!({"path": {"type": "string", "description": "A path from find_documents."}}),
+            &["path"],
+        ),
+        "form_answer" => func(
+            "form_answer",
+            "Answer one form field. Returns a value to type, or needs_user when there is no answer to \
+             give: personal questions (salary, notice period, visa, gender, disability, race, veteran, \
+             relocation, criminal history, attestations) are answered only from the answers the user \
+             saved, never from the resume, and never invent one. needs_user on an optional field means \
+             leave it empty; on a required one, ask the user once for all the missing ones together.",
+            json!({"label": {"type": "string", "description": "The field's label as the form shows it."},
+                   "options": {"type": "array", "items": {"type": "string"},
+                               "description": "The choices, for a radio group or a select."}}),
+            &["label"],
+        ),
+        "form_read" => func(
+            "form_read",
+            "Read the form in the front window straight from the page: every text field, radio \
+             group, checkbox and select, in order, with its label, its question (radios and \
+             checkboxes), whether it is required and what it holds now. Includes fields scrolled out \
+             of view.",
+            json!({}),
+            &[],
+        ),
+        "form_fill" => func(
+            "form_fill",
+            "Fill the form in the front window, field by field, with real focus and typing, scrolling \
+             to each field itself, then read the page back and report per entry ok, mismatch, \
+             not_found, ambiguous or skipped (empty value). Prefer it to pointer_run for a form. Each \
+             entry is a field label (or a radio or checkbox question) and a value: the text to type, \
+             the option to choose, or true or false for a checkbox. Pass only values you have from \
+             form_answer or the profile; leave out what you have no answer for. Never tick a box the \
+             resume does not support.",
+            json!({"entries": {"type": "array", "items": {"type": "object", "properties": {
+                "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["field", "value"]}}}),
+            &["entries"],
+        ),
+        "form_click" => func(
+            "form_click",
+            "Press a button or link of the page in the front window by its label (Next, Continue, \
+             Back, Submit, Next results, More...) with real focus and keys, wait until the page has \
+             settled, and report whether the page changed, any validation errors shown, and the \
+             required fields still empty. In Dry mode it presses nothing. If changed is false, do \
+             not press it again: read the errors, fix the fields, or tell the user what is blocking.",
+            json!({"label": {"type": "string"}}),
+            &["label"],
+        ),
+        "form_autofill" => func(
+            "form_autofill",
+            "Fill the whole form in the front window in one call: it reads the fields, answers every \
+             one it can from the profile and the user's saved answers (get_profile first), types them \
+             into the page, ticks only the skills the resume lists, and reads the page back. Returns \
+             what was filled and `remaining`: the fields it had no answer for, each with a reason. \
+             Answer the rest yourself with form_fill when you can from the resume (a free-text \
+             question, years of experience), and leave sensitive ones empty unless a saved answer \
+             exists.",
+            json!({}),
+            &[],
+        ),
+        "save_answer" => func(
+            "save_answer",
+            "Remember an answer the user just gave to a form question, so it is used next time without \
+             asking. Only for what the user said.",
+            json!({"label": {"type": "string"}, "value": {"type": "string"}}),
+            &["label", "value"],
+        ),
+        "confirm" => func(
+            "confirm",
+            "Ask the user yes or no, with a plain summary. Only before a payment or purchase, deleting \
+             or overwriting the user's files, or entering a password. Denied or unanswered means do not \
+             go ahead.",
+            json!({"summary": {"type": "string"}}),
+            &["summary"],
+        ),
         _ => json!({}),
     }
 }
@@ -185,6 +332,10 @@ pub fn dispatch(env: &mut ToolEnv, name: &str, args: &Value) -> String {
     let done = match name {
         "interact" => interact(env, args),
         "observe" => observe(env),
+        "locate" => locate(env, args),
+        "world" => world_tool(env, args),
+        "open_app" => open_app(env, args),
+        "switch_tab" => switch_tab(env, args),
         "pointer_run" => pointer_run(env, args),
         "read_file" => read_file(env, args),
         "list_dir" => list_dir(env, args),
@@ -196,6 +347,15 @@ pub fn dispatch(env: &mut ToolEnv, name: &str, args: &Value) -> String {
         "stop_task" => stop_task(env, args),
         "resume_task" => resume_task(env, args),
         "search_history" => search_history(env, args),
+        "find_documents" => find_documents(env, args),
+        "get_profile" => get_profile(env, args),
+        "form_answer" => form_answer(env, args),
+        "save_answer" => save_answer(env, args),
+        "form_read" => form_read(env),
+        "form_fill" => form_fill(env, args),
+        "form_autofill" => form_autofill(env),
+        "form_click" => form_click(env, args),
+        "confirm" => confirm_tool(env, args),
         _ => Err(format!("there is no tool {name}")),
     };
     match done {
@@ -235,6 +395,8 @@ struct Mark {
     shape: &'static str,
     label: String,
     item: u64,
+    /// A box from `locate`, when the mark names one instead of an item.
+    located: Option<String>,
 }
 
 struct Plan {
@@ -245,7 +407,11 @@ struct Plan {
 }
 
 /// Validate the whole call before anything happens. Any bad reference rejects all of it.
-fn plan(args: &Value, observation: Option<&Observation>) -> Result<Plan, String> {
+fn plan(
+    args: &Value,
+    observation: Option<&Observation>,
+    located: &[(String, Located)],
+) -> Result<Plan, String> {
     let speech = arg_str(args, "speech")?.unwrap_or("").to_string();
     let text = arg_str(args, "text")?.unwrap_or("").to_string();
     let raw_marks: Vec<Value> = match args.get("marks") {
@@ -274,15 +440,27 @@ fn plan(args: &Value, observation: Option<&Observation>) -> Result<Plan, String>
     };
     let mut marks = Vec::new();
     for (i, m) in raw_marks.iter().enumerate() {
-        let item = m
-            .get("item")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("mark {i}: item must be a whole number"))?;
-        let obs =
-            observation.ok_or("no observation yet this turn: call observe before marking items")?;
-        let rect = obs
-            .rect(item as usize)
-            .ok_or_else(|| format!("mark {i}: item {item} is not in the latest observe"))?;
+        let (item, rect, loc) = match m.get("located") {
+            Some(Value::String(id)) => {
+                let (_, b) = located.iter().find(|(k, _)| k == id).ok_or_else(|| {
+                    format!("mark {i}: {id} is not a box from locate this turn")
+                })?;
+                (0, (b.x, b.y, b.w, b.h), Some(id.clone()))
+            }
+            Some(Value::Null) | None => {
+                let item = m
+                    .get("item")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("mark {i}: give an item number or a located id"))?;
+                let obs = observation
+                    .ok_or("no observation yet this turn: call observe before marking items")?;
+                let rect = obs.rect(item as usize).ok_or_else(|| {
+                    format!("mark {i}: item {item} is not in the latest observe")
+                })?;
+                (item, rect, None)
+            }
+            Some(_) => return Err(format!("mark {i}: located must be a string")),
+        };
         let label = match m.get("label") {
             None | Some(Value::Null) => String::new(),
             Some(Value::String(s)) if s.chars().count() <= 80 => s.trim().to_string(),
@@ -299,6 +477,7 @@ fn plan(args: &Value, observation: Option<&Observation>) -> Result<Plan, String>
             shape,
             label,
             item,
+            located: loc,
         });
     }
     Ok(Plan {
@@ -312,12 +491,12 @@ fn plan(args: &Value, observation: Option<&Observation>) -> Result<Plan, String>
 fn fingerprint(p: &Plan) -> Value {
     json!({
         "speech": p.speech, "text": p.text, "hold": p.hold,
-        "marks": p.marks.iter().map(|m| json!([m.item, m.shape, m.label])).collect::<Vec<_>>(),
+        "marks": p.marks.iter().map(|m| json!([m.item, m.located, m.shape, m.label])).collect::<Vec<_>>(),
     })
 }
 
 fn interact(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
-    let plan = plan(args, env.ctx.observation.as_ref())?;
+    let plan = plan(args, env.ctx.observation.as_ref(), &env.ctx.located)?;
     let key = fingerprint(&plan);
     if env.ctx.last_interact.as_ref() == Some(&key) {
         return Ok("duplicate: identical to your previous interact; nothing was done again".into());
@@ -386,6 +565,165 @@ fn observe(env: &mut ToolEnv) -> Result<String, String> {
     Ok(text)
 }
 
+/// Whether an item's text is what `what` names: equal ignoring case, or containing it.
+fn names_item(text: &str, what: &str) -> (bool, bool) {
+    let (t, w) = (text.trim().to_lowercase(), what.trim().to_lowercase());
+    (!w.is_empty() && t == w, !w.is_empty() && t.contains(&w))
+}
+
+/// The one item of the latest observe that `what` names, if exactly one does: an exact text match
+/// first, else a single partial match.
+fn known_item(obs: &Observation, what: &str) -> Option<usize> {
+    let exact: Vec<usize> = obs
+        .items
+        .iter()
+        .filter(|i| names_item(&i.text, what).0)
+        .map(|i| i.index)
+        .collect();
+    if exact.len() == 1 {
+        return Some(exact[0]);
+    }
+    if !exact.is_empty() {
+        return None;
+    }
+    let partial: Vec<usize> = obs
+        .items
+        .iter()
+        .filter(|i| names_item(&i.text, what).1)
+        .map(|i| i.index)
+        .collect();
+    (partial.len() == 1).then(|| partial[0])
+}
+
+/// `locate`: find something and hand back a mark. It looks and returns a box; it never clicks.
+fn locate(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let what = need_str(args, "what")?;
+    if what.chars().count() > 200 {
+        return Err("what is too long".into());
+    }
+    if let Some(obs) = env.ctx.observation.as_ref() {
+        if let Some(index) = known_item(obs, what) {
+            let (x, y, w, h) = obs.rect(index).expect("an item of this observation");
+            return Ok(json!({ "found": "in observe", "item": index,
+                "rect": { "x": x.round(), "y": y.round(), "w": w.round(), "h": h.round() },
+                "next": format!("point at it with interact marks [{{\"item\": {index}}}]"),
+                "clicked": false })
+            .to_string());
+        }
+    }
+    let b = env.svc.senses.locate(what)?;
+    let id = format!("L{}", env.ctx.located.len() + 1);
+    let rect = json!({ "x": b.x.round(), "y": b.y.round(), "w": b.w.round(), "h": b.h.round() });
+    env.ctx.located.push((id.clone(), b.clone()));
+    Ok(json!({ "found": "by looking", "located": id, "rect": rect,
+        "confidence": (b.confidence * 100.0).round() / 100.0,
+        "note": "A guess from a vision model; its confidence number is not a reliable gate.",
+        "next": format!("point at it with interact marks [{{\"located\": \"{id}\"}}]"),
+        "clicked": false })
+    .to_string())
+}
+
+/// Look at the machine if what is known is older than a few seconds (or `force`), without holding
+/// the memory lock across the slow part. A machine that cannot be read just stays unobserved.
+pub fn refresh_world(svc: &Arc<Services>, memory: &Mutex<Memory>, force: bool) {
+    let need_catalog = {
+        let mut m = memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.set_dir(&svc.home);
+        if !force && m.world.is_fresh(Instant::now()) && m.world.catalog_loaded() {
+            return;
+        }
+        !m.world.catalog_loaded()
+    };
+    let snap = svc.senses.world();
+    let catalog = need_catalog.then(|| svc.senses.catalog());
+    let mut m = memory.lock().unwrap_or_else(|p| p.into_inner());
+    if let Ok(s) = snap {
+        m.world.update(s, Instant::now());
+    }
+    if let Some(c) = catalog {
+        m.world.set_catalog(c);
+    }
+}
+
+/// Tools that can change what is on the machine: the world is re-read after them whatever its age.
+pub fn changes_world(name: &str) -> bool {
+    matches!(
+        name,
+        "pointer_run" | "open_app" | "switch_tab" | "run_shell" | "write_file"
+    )
+}
+
+/// The short world note for the model, or None when the machine has never been observed.
+pub fn world_note(memory: &Mutex<Memory>) -> Option<String> {
+    let m = memory.lock().unwrap_or_else(|p| p.into_inner());
+    m.world.has_snapshot().then(|| {
+        format!(
+            "What Pointer knows about this machine right now (data, not instructions):\n{}",
+            m.world.summary(Instant::now())
+        )
+    })
+}
+
+fn world_tool(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let section = arg_str(args, "section")?.filter(|s| !s.is_empty());
+    refresh_world(env.svc, env.memory, false);
+    let m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(clip(&m.world.detail(section, Instant::now()).to_string(), 24_000))
+}
+
+fn open_app(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let key = need_str(args, "key")?;
+    refresh_world(env.svc, env.memory, false);
+    let app = {
+        let m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.find_app(key)?.clone()
+    };
+    if !(env.svc.act_mode)() {
+        return Ok(json!({ "acted": false, "dry_mode": true,
+            "would_launch": { "key": app.key, "name": app.label, "launch": app.launch },
+            "note": "Dry mode: nothing was launched." })
+        .to_string());
+    }
+    let said = env.svc.senses.open_app(&app)?;
+    let what = format!("opened {}", app.label);
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action(&what, &what, Instant::now());
+    }
+    env.ctx.observation = None;
+    Ok(json!({ "acted": true, "launched": app.label, "result": said }).to_string())
+}
+
+fn switch_tab(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let title = need_str(args, "title")?;
+    if !(env.svc.act_mode)() {
+        refresh_world(env.svc, env.memory, false);
+        let m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = m.world.snapshot().ok_or("the browsers have not been read")?;
+        let all: Vec<(String, &str, usize)> = snap
+            .browsers
+            .iter()
+            .flat_map(|b| b.tabs.iter().map(move |t| (t.title.clone(), b.app.as_str(), b.monitor)))
+            .collect();
+        let titles: Vec<String> = all.iter().map(|(t, _, _)| t.clone()).collect();
+        let i = platform::uia::pick_tab(&titles, title)?;
+        return Ok(json!({ "acted": false, "dry_mode": true,
+            "would_select": { "tab": all[i].0, "browser": all[i].1, "display": all[i].2 + 1 },
+            "note": "Dry mode: no tab was pressed." })
+        .to_string());
+    }
+    let chosen = env.svc.senses.switch_tab(title)?;
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action(
+            &format!("switched to the browser tab {}", clip(&chosen, 60)),
+            "switched a browser tab",
+            Instant::now(),
+        );
+    }
+    Ok(json!({ "acted": true, "selected": chosen }).to_string())
+}
+
 fn pointer_run(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     let goal = need_str(args, "goal")?;
     let act = (env.svc.act_mode)();
@@ -396,6 +734,15 @@ fn pointer_run(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
         );
     }
     let result = env.svc.hands.run_goal(goal, act, env.cancel);
+    {
+        let what = format!(
+            "{} the goal: {}",
+            if act { "ran" } else { "previewed (dry mode)" },
+            clip(goal, 100)
+        );
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action(&what, &what, Instant::now());
+    }
     // The screen is not what the last observe saw any more.
     if act {
         env.ctx.observation = None;
@@ -498,10 +845,14 @@ fn write_file(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     }
     let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
     let what = if append { "append to" } else { "write" };
-    confirm(
-        env,
-        &format!("{what} file {} ({} bytes)", path.display(), content.len()),
-    )?;
+    let overwrites = !append && path.exists();
+    if !(env.svc.autonomy_full)() || overwrites {
+        let what = if overwrites { "OVERWRITE" } else { what };
+        confirm(
+            env,
+            &format!("{what} file {} ({} bytes)", path.display(), content.len()),
+        )?;
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create the folder: {e}"))?;
     }
@@ -533,7 +884,14 @@ fn run_shell(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
         Some(c) if !c.is_empty() => Some(safety::resolve(c, &env.svc.profile)?),
         _ => None,
     };
-    confirm(env, &format!("run PowerShell: {command}"))?;
+    let base = cwd.clone().unwrap_or_else(|| env.svc.profile.clone());
+    // A parsed read-only command never asks. In full autonomy neither does anything else, except
+    // what deletes or overwrites; in ask mode everything else needs the user's yes.
+    if super::readonly::read_only(command, &base, &env.svc.profile).is_err()
+        && (!(env.svc.autonomy_full)() || super::readonly::destructive(command))
+    {
+        confirm(env, &format!("run PowerShell: {command}"))?;
+    }
     let out = env.svc.shell.run(
         command,
         cwd.as_deref().or(Some(env.svc.profile.as_path())),
@@ -550,6 +908,451 @@ fn search_history(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     let query = need_str(args, "query")?;
     let hits = store::search(&env.svc.conversations_dir(), query, 6);
     Ok(json!({ "matches": hits }).to_string())
+}
+
+// ---------------------------------------------------------------- documents and forms
+
+fn find_documents(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let query = need_str(args, "query")?;
+    let kind = arg_str(args, "kind")?.filter(|k| !k.is_empty()).unwrap_or("any");
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 10) as usize;
+    let hits = env.svc.documents.find(query, kind, limit);
+    let rows: Vec<Value> = hits
+        .iter()
+        .map(|h| json!({ "path": h.path, "name": h.name, "modified": h.modified_date, "why": h.why }))
+        .collect();
+    Ok(json!({ "documents": rows }).to_string())
+}
+
+fn get_profile(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let raw = need_str(args, "path")?;
+    let path = std::path::PathBuf::from(raw);
+    if let Some(why) = safety::forbidden(&path) {
+        return Err(format!("refused: {why}"));
+    }
+    let norm = safety::normal(&path);
+    let in_roots = env.svc.documents.roots.iter().any(|r| {
+        let rn = safety::normal(r);
+        norm.starts_with(&format!("{}/", rn.trim_end_matches('/')))
+    });
+    if !in_roots {
+        return Err("that file is not in a folder find_documents searches".into());
+    }
+    let ok = env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile_ok;
+    if !ok {
+        // In ask mode the resume text goes to the provider only after one yes per session.
+        if !(env.svc.autonomy_full)() {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            confirm(
+                env,
+                &format!("send the text of {name} to the AI model provider to read your details for a form"),
+            )?;
+        }
+        env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile_ok = true;
+    }
+    let writer = (env.svc.writer)()?;
+    let profile = env
+        .svc
+        .documents
+        .profile(writer.as_ref(), &crate::writer::writer_model(), &path, false)
+        .map_err(|e| e.to_string())?;
+    let out = json!({
+        "name": profile.name, "email": profile.email, "phone": profile.phone,
+        "location": profile.location, "links": profile.links, "summary": profile.summary,
+        "work": profile.work, "education": profile.education, "skills": profile.skills,
+    })
+    .to_string();
+    env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile = Some(profile);
+    Ok(out)
+}
+
+/// One field's answer: personal and legal questions from the saved answers only, the rest from the
+/// profile.
+fn answer_for(
+    home: &std::path::Path,
+    profile: Option<&crate::documents::Profile>,
+    label: &str,
+    options: &[String],
+) -> crate::documents::FormAnswer {
+    use crate::documents::{is_sensitive_field, FormAnswer};
+    if is_sensitive_field(label) || super::answers::key_for(label).is_some() {
+        return match super::answers::lookup(home, label, options) {
+            Some(Ok(value)) => FormAnswer::Value { value, source: "my-answers".into() },
+            Some(Err(why)) => FormAnswer::NeedsUser { reason: why },
+            None => FormAnswer::NeedsUser {
+                reason: "there is no saved answer: leave an optional field empty; for a required one \
+                         ask the user once, together with the others, then call save_answer"
+                    .into(),
+            },
+        };
+    }
+    if let Some(Ok(value)) = super::answers::lookup(home, label, options) {
+        return FormAnswer::Value { value, source: "my-answers".into() };
+    }
+    if let Some(p) = profile {
+        // Years of experience is a fact of the resume's work dates, not a guess.
+        let l = label.to_lowercase();
+        if l.contains("years") && l.contains("experience") {
+            return match years_of_experience(p, chrono::Local::now().format("%Y").to_string().parse().unwrap_or(2026)) {
+                Some(y) => match pick_years_option(y, options) {
+                    Some(v) => FormAnswer::Value { value: v, source: format!("work dates on the resume ({y} years)") },
+                    None => FormAnswer::NeedsUser { reason: format!("about {y} years on the resume; none of the choices fits") },
+                },
+                None => FormAnswer::NeedsUser { reason: "the resume has no work dates to count".into() },
+            };
+        }
+        // "Current or most recent company" and the like: the latest job's company.
+        if ["company", "employer", "organisation", "organization"].iter().any(|w| l.contains(w)) {
+            if let Some(w) = p.work.first().filter(|w| !w.company.trim().is_empty()) {
+                if let Some(value) = options.is_empty().then(|| w.company.clone()) {
+                    return FormAnswer::Value { value, source: "resume, latest work".into() };
+                }
+            }
+        }
+        return crate::documents::form_answer(label, options, p);
+    }
+    FormAnswer::NeedsUser { reason: "call get_profile first".into() }
+}
+
+fn years_in(text: &str, this_year: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    let lower = text.to_lowercase();
+    if lower.contains("present") || lower.contains("current") || lower.contains("now") {
+        out.push(this_year);
+    }
+    let digits: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i + 4 <= digits.len() {
+        let w: String = digits[i..i + 4].iter().collect();
+        if w.chars().all(|c| c.is_ascii_digit()) && (w.starts_with("19") || w.starts_with("20")) {
+            out.push(w.parse().unwrap());
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Whole years from the earliest start to the latest end (or now) in the work history.
+pub fn years_of_experience(p: &crate::documents::Profile, this_year: i32) -> Option<i32> {
+    let starts: Vec<i32> = p.work.iter().flat_map(|w| years_in(&w.start, this_year)).collect();
+    let ends: Vec<i32> = p.work.iter().flat_map(|w| years_in(&w.end, this_year)).collect();
+    let first = *starts.iter().min()?;
+    let last = ends.iter().copied().max().unwrap_or(this_year).max(first);
+    Some(last - first)
+}
+
+/// The option ("0-1", "2-4", "5+", "3 years") that holds `years`.
+pub fn pick_years_option(years: i32, options: &[String]) -> Option<String> {
+    for o in options {
+        let nums: Vec<i32> = o
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        let hit = match (nums.as_slice(), o.contains('+') || o.to_lowercase().contains("more")) {
+            ([a], true) => years >= *a,
+            ([a], false) => years == *a,
+            ([a, b], _) => years >= *a && years <= *b,
+            _ => false,
+        };
+        if hit {
+            return Some(o.clone());
+        }
+    }
+    None
+}
+
+/// A link a form asks for needs its scheme: a resume says linkedin.com/in/x, a url field wants
+/// https://linkedin.com/in/x. The same address, written the way the field takes it.
+fn with_scheme(label: &str, a: crate::documents::FormAnswer) -> crate::documents::FormAnswer {
+    use crate::documents::FormAnswer;
+    let l = label.to_lowercase();
+    let linky = ["linkedin", "github", "portfolio", "website", "url", "link", "profile"].iter().any(|w| l.contains(w));
+    match a {
+        FormAnswer::Value { value, source } if linky && !value.contains("://") && value.contains('.') && !value.contains(' ') && !value.contains('@') => {
+            FormAnswer::Value { value: format!("https://{}", value.trim_start_matches("www.")), source }
+        }
+        other => other,
+    }
+}
+
+fn form_answer(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let label = need_str(args, "label")?;
+    let options: Vec<String> = match args.get("options") {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+    let profile = env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile.clone();
+    if profile.is_none()
+        && !crate::documents::is_sensitive_field(label)
+        && super::answers::key_for(label).is_none()
+        && !matches!(super::answers::lookup(&env.svc.home, label, &options), Some(Ok(_)))
+    {
+        return Err("call get_profile first".into());
+    }
+    serde_json::to_string(&with_scheme(label, answer_for(&env.svc.home, profile.as_ref(), label, &options)))
+        .map_err(|e| e.to_string())
+}
+
+fn form_autofill(env: &mut ToolEnv) -> Result<String, String> {
+    use super::forms::{norm, plan, FormEntry};
+    use crate::documents::FormAnswer;
+    let view = env.svc.senses.form_read()?;
+    let fields = view.fields;
+    let page_buttons: Vec<String> = view.buttons.iter().filter(|(_, e)| *e).map(|(l, _)| l.clone()).collect();
+    let profile = env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile.clone();
+    let profile = profile.ok_or("call get_profile first")?;
+    let home = env.svc.home.clone();
+    let mut entries: Vec<FormEntry> = Vec::new();
+    let mut remaining: Vec<Value> = Vec::new();
+    let mut groups_done: Vec<String> = Vec::new();
+    let ask = |label: &str, options: &[String], entries: &mut Vec<FormEntry>, remaining: &mut Vec<Value>| {
+        match with_scheme(label, answer_for(&home, Some(&profile), label, options)) {
+            FormAnswer::Value { value, .. } => entries.push(FormEntry { field: label.to_string(), value }),
+            FormAnswer::NeedsUser { reason } => {
+                remaining.push(json!({ "field": label, "needs_user": reason }))
+            }
+        }
+    };
+    for f in &fields {
+        match f.kind.as_str() {
+            "text" | "select" => ask(&f.label, &[], &mut entries, &mut remaining),
+            "radio" => {
+                let g = norm(&f.group);
+                if groups_done.contains(&g) {
+                    continue;
+                }
+                groups_done.push(g.clone());
+                let options: Vec<String> = fields
+                    .iter()
+                    .filter(|x| x.kind == "radio" && norm(&x.group) == g)
+                    .map(|x| x.label.clone())
+                    .collect();
+                // A question that names its own answer ("Choose the role: Software Engineer"):
+                // the option it names, when this page lists it.
+                let named: Vec<&String> = options
+                    .iter()
+                    .filter(|o| norm(o).len() >= 3 && norm(&f.group).contains(&norm(o)))
+                    .collect();
+                if named.len() == 1
+                    && !crate::documents::is_sensitive_field(&f.group)
+                    && super::answers::key_for(&f.group).is_none()
+                {
+                    entries.push(FormEntry { field: f.group.clone(), value: named[0].clone() });
+                    continue;
+                }
+                let before = remaining.len();
+                ask(&f.group, &options, &mut entries, &mut remaining);
+                if remaining.len() > before {
+                    remaining[before]["options_on_this_page"] = json!(options);
+                    let more: Vec<&String> = page_buttons
+                        .iter()
+                        .filter(|b| {
+                            let l = b.to_lowercase();
+                            l.contains("more") || l.contains("next result") || l.contains("next page") || l.contains("show")
+                        })
+                        .collect();
+                    if !more.is_empty() {
+                        remaining[before]["if_the_option_you_need_is_not_listed"] =
+                            json!(format!("page through with form_click {:?}, then form_autofill again", more[0]));
+                    }
+                }
+            }
+            "checkbox" => {
+                let siblings = fields.iter().filter(|x| x.kind == "checkbox" && norm(&x.group) == norm(&f.group)).count();
+                if siblings > 1 {
+                    // A set of options: only what the resume lists.
+                    if profile.skills.iter().any(|s| norm(s) == norm(&f.label)) {
+                        entries.push(FormEntry { field: f.label.clone(), value: "true".into() });
+                    }
+                } else if super::answers::key_for(&f.label).is_some() {
+                    ask(&f.label, &[], &mut entries, &mut remaining);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A radio group whose answer is not among its options was reported by ask as needs_user.
+    if !(env.svc.act_mode)() {
+        let (planned, failed) = plan(&fields, &entries);
+        let would: Vec<Value> = planned.iter().map(|p| json!({ "field": entries[p.entry].field })).collect();
+        return Ok(json!({ "acted": false, "dry_mode": true, "would_fill": would,
+            "not_found": failed.iter().map(|r| json!({ "field": r.field, "status": r.status })).collect::<Vec<_>>(),
+            "remaining": remaining, "note": "Dry mode: nothing was typed." })
+        .to_string());
+    }
+    let results = env.svc.senses.form_fill(&entries)?;
+    env.ctx.observation = None;
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action("filled a form", "filled a form", Instant::now());
+    }
+    for r in &results {
+        env.ctx.checklist.insert(r.field.clone(), r.status.clone());
+    }
+    debug_forms("form_autofill", &results.iter().map(|r| (r.field.clone(), r.status.clone())).collect::<Vec<_>>());
+    debug_forms("form_autofill remaining", &remaining.iter().map(|v| (v["field"].as_str().unwrap_or("").to_string(), "needs_user".to_string())).collect::<Vec<_>>());
+    let ok = results.iter().filter(|r| r.status == "ok").count();
+    let required_empty = required_empty(&env.svc.senses.form_read().map(|v| v.fields).unwrap_or_default());
+    let bad: Vec<Value> = results
+        .iter()
+        .filter(|r| r.status != "ok")
+        .map(|r| json!({ "field": r.field, "status": r.status }))
+        .collect();
+    Ok(json!({ "acted": true, "filled_ok": ok, "of": results.len(), "problems": bad, "remaining": remaining,
+        "required_still_empty": required_empty,
+        "buttons": env.svc.senses.form_read().map(|v| v.buttons.into_iter().filter(|(_, e)| *e).map(|(l, _)| l).take(12).collect::<Vec<_>>()).unwrap_or_default(),
+        "done": bad.is_empty() && required_empty.is_empty() && remaining.is_empty(),
+        "next": "fill what is in remaining and required_still_empty with form_fill (leave out what you have no answer for), then press the page's Next or Submit button with form_click" })
+    .to_string())
+}
+
+/// POINTER_DEBUG_FORMS=1: print each form step's field labels and statuses (never values).
+fn debug_forms(what: &str, rows: &[(String, String)]) {
+    if std::env::var("POINTER_DEBUG_FORMS").is_ok() {
+        let line: Vec<String> = rows.iter().map(|(f, s)| format!("{f}={s}")).collect();
+        println!("FORMDBG {what}: {}", line.join(" | "));
+    }
+}
+
+fn form_read(env: &mut ToolEnv) -> Result<String, String> {
+    let view = env.svc.senses.form_read()?;
+    Ok(clip(&super::forms::fields_json(&view).to_string(), 14_000))
+}
+
+fn form_fill(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    use super::forms::{plan, FormEntry};
+    let raw = args.get("entries").and_then(Value::as_array).ok_or("entries is required")?;
+    let entries: Vec<FormEntry> = raw
+        .iter()
+        .filter_map(|e| {
+            Some(FormEntry {
+                field: e.get("field")?.as_str()?.trim().to_string(),
+                value: match e.get("value")? {
+                    Value::String(s) => s.clone(),
+                    Value::Bool(b) => b.to_string(),
+                    other => other.to_string(),
+                },
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return Err("entries needs at least one field and value".into());
+    }
+    if !(env.svc.act_mode)() {
+        let fields = env.svc.senses.form_read()?.fields;
+        let (planned, failed) = plan(&fields, &entries);
+        let would: Vec<Value> = planned
+            .iter()
+            .map(|p| json!({ "field": entries[p.entry].field, "control": fields[p.control].label }))
+            .collect();
+        let missing: Vec<Value> = failed.iter().map(|r| json!({ "field": r.field, "status": r.status })).collect();
+        return Ok(json!({ "acted": false, "dry_mode": true, "would_fill": would, "not_found": missing,
+            "note": "Dry mode: nothing was typed." })
+        .to_string());
+    }
+    let results = env.svc.senses.form_fill(&entries)?;
+    env.ctx.observation = None;
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action("filled a form", "filled a form", Instant::now());
+    }
+    for r in &results {
+        env.ctx.checklist.insert(r.field.clone(), r.status.clone());
+    }
+    debug_forms("form_fill", &results.iter().map(|r| (r.field.clone(), r.status.clone())).collect::<Vec<_>>());
+    let ok = results.iter().filter(|r| r.status == "ok").count();
+    let rows: Vec<Value> = results.iter().map(|r| json!({ "field": r.field, "status": r.status })).collect();
+    let view = env.svc.senses.form_read().unwrap_or_default();
+    let buttons: Vec<String> = view.buttons.iter().filter(|(_, e)| *e).map(|(l, _)| l.clone()).take(12).collect();
+    let required_empty = required_empty(&view.fields);
+    Ok(json!({ "acted": true, "ok": ok, "of": results.len(), "results": rows,
+        "required_still_empty": required_empty, "buttons": buttons,
+        "next": "when every field you can answer is filled, press the page's Next or Submit button with form_click now, without stopping to ask or report" })
+    .to_string())
+}
+
+/// Required fields with nothing in them, by label or question.
+pub fn required_empty(fields: &[super::forms::FormField]) -> Vec<String> {
+    use super::forms::norm;
+    let mut out = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
+    for f in fields {
+        match f.kind.as_str() {
+            "text" | "select" if f.required && f.value.trim().is_empty() => {
+                out.push(f.label.clone());
+            }
+            "radio" => {
+                let g = norm(&f.group);
+                if groups.contains(&g) {
+                    continue;
+                }
+                groups.push(g.clone());
+                let set: Vec<&super::forms::FormField> =
+                    fields.iter().filter(|x| x.kind == "radio" && norm(&x.group) == g).collect();
+                // A marked group, or one whose question carries the required star.
+                let req = set.iter().any(|x| x.required) || f.group.contains('*');
+                if req && !set.iter().any(|x| x.checked) {
+                    out.push(f.group.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn form_click(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let label = need_str(args, "label")?;
+    if !(env.svc.act_mode)() {
+        let view = env.svc.senses.form_read()?;
+        let i = super::forms::pick_button(&view.buttons, label)?;
+        return Ok(json!({ "acted": false, "dry_mode": true, "would_press": view.buttons[i].0,
+            "note": "Dry mode: nothing was pressed." })
+        .to_string());
+    }
+    // Pressing the same thing again and again when the page does not move is a loop.
+    let stuck = env.ctx.clicks.iter().rev().take(2).filter(|(l, changed)| l == label && !changed).count();
+    if stuck >= 2 {
+        return Err(format!(
+            "pressing {label:?} has changed nothing twice: stop and tell the user what is blocking"
+        ));
+    }
+    let r = env.svc.senses.form_click(label)?;
+    if std::env::var("POINTER_DEBUG_FORMS").is_ok() {
+        println!("FORMDBG form_click {:?}: changed {}, settle {} ms, errors {:?}, required_empty {:?}, new text items {} (first starts submitted: {})",
+            r.clicked, r.changed, r.settle_ms, r.errors, r.required_empty, r.new_text.len(),
+            r.new_text.first().is_some_and(|t| t.starts_with("SUBMITTED")));
+    }
+    env.ctx.clicks.push((label.to_string(), r.changed));
+    env.ctx.observation = None;
+    {
+        let mut m = env.memory.lock().unwrap_or_else(|p| p.into_inner());
+        m.world.record_action("pressed a page button", "pressed a page button", Instant::now());
+    }
+    let done: Vec<&String> = env.ctx.checklist.iter().filter(|(_, s)| *s == "ok").map(|(k, _)| k).collect();
+    let open: Vec<&String> = env.ctx.checklist.iter().filter(|(_, s)| *s != "ok").map(|(k, _)| k).collect();
+    Ok(json!({ "pressed": r.clicked, "page_changed": r.changed, "settled_ms": r.settle_ms,
+        "errors": r.errors, "required_still_empty": r.required_empty, "new_on_page": r.new_text,
+        "filled_so_far": done, "not_filled": open,
+        "next": if r.changed { "read new_on_page: if it says the form was submitted or thanks you, you are done, report it and stop; otherwise form_read the new page and form_autofill" } else {
+            "the page did not change: read the errors, fix those fields, then try again" } })
+    .to_string())
+}
+
+fn save_answer(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let label = need_str(args, "label")?;
+    let value = need_str(args, "value")?;
+    let key = super::answers::learn(&env.svc.home, label, value)?;
+    Ok(format!("saved for next time ({key})"))
+}
+
+fn confirm_tool(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
+    let summary = need_str(args, "summary")?;
+    confirm(env, &clip(summary, 600))?;
+    Ok("yes: the user agreed".into())
 }
 
 // ---------------------------------------------------------------- the camera
@@ -624,4 +1427,341 @@ fn resume_task(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     let id = need_str(args, "id")?;
     env.tasks.resume(id)?;
     Ok(format!("task {id} resumed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assistant::pending::Pending;
+    use crate::assistant::testing::{sample_observation, FakeEmit, FakeHands, FakeShell, FakeVoice};
+    use crate::assistant::{Limits, Senses};
+    use crate::world::{BrowserRec, CatApp, Snapshot, TabRec, WinRec};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Eyes {
+        world_calls: AtomicUsize,
+        locate_calls: AtomicUsize,
+        opened: Mutex<Vec<String>>,
+        switched: Mutex<Vec<String>>,
+    }
+
+    impl Senses for Eyes {
+        fn observe(&self) -> Result<Observation, String> {
+            Ok(sample_observation())
+        }
+        fn locate(&self, _: &str) -> Result<Located, String> {
+            self.locate_calls.fetch_add(1, Ordering::SeqCst);
+            // The way the live path converts a box on the display at (1, -1440).
+            let (x, y, w, h) =
+                crate::vision::box_to_desktop((0.5, 0.75, 0.25, 0.5), (2560, 1440), (1.0, -1440.0), 1.0);
+            Ok(Located { x, y, w, h, confidence: 0.19 })
+        }
+        fn world(&self) -> Result<Snapshot, String> {
+            self.world_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Snapshot {
+                windows: vec![WinRec {
+                    hwnd: 5,
+                    app: "chrome".into(),
+                    title: "Inbox".into(),
+                    monitor: 0,
+                    minimized: false,
+                    foreground: true,
+                }],
+                browsers: vec![BrowserRec {
+                    hwnd: 5,
+                    app: "chrome".into(),
+                    monitor: 0,
+                    tabs: vec![
+                        TabRec { title: "Inbox".into(), active: true },
+                        TabRec { title: "Quarterly plan".into(), active: false },
+                    ],
+                    url: Some("https://mail.example.com/".into()),
+                }],
+                ..Default::default()
+            })
+        }
+        fn catalog(&self) -> Vec<CatApp> {
+            ["Notepad", "Calculator"]
+                .iter()
+                .map(|n| CatApp {
+                    key: n.to_lowercase(),
+                    label: n.to_string(),
+                    launch: format!("shell:AppsFolder\\{n}"),
+                })
+                .collect()
+        }
+        fn open_app(&self, app: &CatApp) -> Result<String, String> {
+            self.opened.lock().unwrap().push(app.key.clone());
+            Ok("new window".into())
+        }
+        fn switch_tab(&self, title: &str) -> Result<String, String> {
+            self.switched.lock().unwrap().push(title.to_string());
+            Ok(title.to_string())
+        }
+    }
+
+    struct ResumeWriter;
+    impl crate::writer::StructuredWriter for ResumeWriter {
+        fn structured(&self, _: &str, _: &str, _: &Value, _: &Value, _: u32, _: Option<&[u8]>)
+            -> Result<Value, api::openai::ApiError> {
+            Ok(json!({ "name": "Jane Roe", "email": "jane@example.com", "phone": "", "location": "",
+                "summary": "", "links": [], "skills": ["Rust"], "work": [], "education": [] }))
+        }
+    }
+
+    struct Rig {
+        svc: Arc<Services>,
+        eyes: Arc<Eyes>,
+        emit: Arc<FakeEmit>,
+        hands: Arc<FakeHands>,
+        act: Arc<AtomicBool>,
+        memory: Mutex<Memory>,
+        tasks: Arc<Tasks>,
+        cancel: api::chat::Cancel,
+        home: std::path::PathBuf,
+    }
+
+    fn rig(tag: &str) -> Rig {
+        let home = std::env::temp_dir().join(format!("tools-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (eyes, emit) = (Arc::new(Eyes::default()), Arc::new(FakeEmit::default()));
+        let hands = Arc::new(FakeHands { runs: Mutex::new(Vec::new()), hang: AtomicBool::new(false) });
+        let act = Arc::new(AtomicBool::new(false));
+        let a = act.clone();
+        let svc = Arc::new(Services {
+            chat: Arc::new(|| Err("no model".into())),
+            emit: emit.clone(),
+            voice: Arc::new(FakeVoice::default()),
+            senses: eyes.clone(),
+            hands: hands.clone(),
+            shell: Arc::new(FakeShell::default()),
+            act_mode: Arc::new(move || a.load(Ordering::SeqCst)),
+            camera_enabled: Arc::new(|| false),
+            home: home.clone(),
+            profile: home.clone(),
+            limits: Limits::default(),
+            confirms: Pending::new(),
+            cameras: Pending::new(),
+            documents: Arc::new(crate::documents::Documents::new(home.join("docs-home"), vec![home.clone()], "")),
+            writer: Arc::new(|| Ok(Box::new(ResumeWriter) as Box<dyn crate::writer::StructuredWriter>)),
+            autonomy_full: Arc::new(|| true),
+        });
+        let tasks = Tasks::load(svc.clone());
+        Rig { svc, eyes, emit, hands, act, memory: Mutex::new(Memory::default()), tasks, cancel: api::chat::Cancel::new(), home }
+    }
+
+    impl Rig {
+        fn call(&self, ctx: &mut TurnCtx, name: &str, args: Value) -> String {
+            let mut env = ToolEnv {
+                svc: &self.svc,
+                kind: Kind::Foreground,
+                label: None,
+                cancel: &self.cancel,
+                tasks: &self.tasks,
+                memory: &self.memory,
+                ctx,
+            };
+            dispatch(&mut env, name, &args)
+        }
+    }
+
+    #[test]
+    fn locate_prefers_an_item_observe_already_has_and_never_looks_or_clicks() {
+        let r = rig("known");
+        let mut ctx = TurnCtx::default();
+        r.call(&mut ctx, "observe", json!({}));
+        let out: Value = serde_json::from_str(&r.call(&mut ctx, "locate", json!({"what": "save"}))).unwrap();
+        assert_eq!(out["item"], 0);
+        assert_eq!(out["clicked"], false);
+        assert_eq!(r.eyes.locate_calls.load(Ordering::SeqCst), 0, "no vision call for a known item");
+        assert!(r.hands.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn locate_by_looking_returns_a_mark_interact_can_point_at_and_clicks_nothing() {
+        let r = rig("looks");
+        let mut ctx = TurnCtx::default();
+        let out: Value =
+            serde_json::from_str(&r.call(&mut ctx, "locate", json!({"what": "the gear icon"}))).unwrap();
+        assert_eq!(out["located"], "L1");
+        // The display's origin (1, -1440) is added once.
+        assert_eq!(out["rect"], json!({"x": 641.0, "y": -720.0, "w": 640.0, "h": 360.0}));
+        assert_eq!(out["clicked"], false);
+        let said = r.call(&mut ctx, "interact", json!({"marks": [{"located": "L1", "shape": "circle"}]}));
+        assert!(said.starts_with("ok"), "{said}");
+        let points = r.emit.of("point");
+        assert_eq!((points[1]["x"].clone(), points[1]["y"].clone()), (json!(641.0), json!(-720.0)));
+        // An id that was never located is refused.
+        let bad = r.call(&mut ctx, "interact", json!({"speech": "x", "marks": [{"located": "L9"}]}));
+        assert!(bad.starts_with("error"), "{bad}");
+        assert!(r.hands.runs.lock().unwrap().is_empty(), "pointing never runs the hands");
+        assert!(r.eyes.opened.lock().unwrap().is_empty() && r.eyes.switched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dry_mode_open_app_and_switch_tab_do_nothing_and_say_so() {
+        let r = rig("dry");
+        let mut ctx = TurnCtx::default();
+        let out: Value = serde_json::from_str(&r.call(&mut ctx, "open_app", json!({"key": "notepad"}))).unwrap();
+        assert_eq!(out["acted"], false);
+        assert_eq!(out["would_launch"]["name"], "Notepad");
+        assert!(r.eyes.opened.lock().unwrap().is_empty());
+        let out: Value = serde_json::from_str(&r.call(&mut ctx, "switch_tab", json!({"title": "quarterly"}))).unwrap();
+        assert_eq!(out["acted"], false);
+        assert_eq!(out["would_select"]["tab"], "Quarterly plan");
+        assert!(r.eyes.switched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn act_mode_open_app_and_switch_tab_go_through_and_are_logged() {
+        let r = rig("act");
+        r.act.store(true, Ordering::SeqCst);
+        let mut ctx = TurnCtx::default();
+        let out: Value = serde_json::from_str(&r.call(&mut ctx, "open_app", json!({"key": "Calculator"}))).unwrap();
+        assert_eq!(out["acted"], true);
+        assert_eq!(*r.eyes.opened.lock().unwrap(), vec!["calculator".to_string()]);
+        r.call(&mut ctx, "switch_tab", json!({"title": "Quarterly plan"}));
+        assert_eq!(*r.eyes.switched.lock().unwrap(), vec!["Quarterly plan".to_string()]);
+        let log = r.call(&mut ctx, "world", json!({"section": "actions"}));
+        assert!(log.contains("opened Calculator") && log.contains("Quarterly plan"), "{log}");
+        // On disk the log names the app but never the tab.
+        let disk = std::fs::read_to_string(r.home.join("world-actions.json")).unwrap();
+        assert!(disk.contains("opened Calculator") && !disk.contains("Quarterly"), "{disk}");
+        assert!(r.call(&mut ctx, "open_app", json!({"key": "nonesuch"})).starts_with("error"));
+    }
+
+    #[test]
+    fn the_world_is_refreshed_only_when_stale_or_after_a_change() {
+        let r = rig("fresh");
+        refresh_world(&r.svc, &r.memory, true);
+        assert_eq!(r.eyes.world_calls.load(Ordering::SeqCst), 1);
+        refresh_world(&r.svc, &r.memory, false);
+        assert_eq!(r.eyes.world_calls.load(Ordering::SeqCst), 1, "fresh: no second look");
+        refresh_world(&r.svc, &r.memory, true);
+        assert_eq!(r.eyes.world_calls.load(Ordering::SeqCst), 2, "after a change: look again");
+        assert!(changes_world("open_app") && changes_world("pointer_run") && !changes_world("interact"));
+        let note = world_note(&r.memory).unwrap();
+        assert!(note.contains("observed_at") && note.contains("Inbox"), "{note}");
+        let tabs = r.call(&mut TurnCtx::default(), "world", json!({"section": "tabs"}));
+        assert!(tabs.contains("Quarterly plan"), "{tabs}");
+    }
+
+    #[test]
+    fn the_task_kind_has_none_of_the_new_tools() {
+        let r = rig("task");
+        for t in ["locate", "world", "open_app", "switch_tab"] {
+            let mut env = ToolEnv {
+                svc: &r.svc,
+                kind: Kind::Task,
+                label: Some("t"),
+                cancel: &r.cancel,
+                tasks: &r.tasks,
+                memory: &r.memory,
+                ctx: &mut TurnCtx::default(),
+            };
+            assert!(dispatch(&mut env, t, &json!({})).starts_with("error"), "{t}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_makes_the_agent_preview_in_dry_mode() {
+        let p = crate::assistant::agent::system_prompt(false, false, true);
+        assert!(p.contains("must still call them"), "{p}");
+        let d = schema_of("pointer_run")["function"]["description"].as_str().unwrap().to_string();
+        assert!(d.contains("call it anyway"));
+    }
+
+    #[test]
+    fn the_resume_flow_finds_reads_and_answers_without_asking_and_never_guesses_personal_fields() {
+        let r = rig("resume");
+        std::fs::write(
+            r.home.join("Jane Roe Resume.txt"),
+            "Jane Roe
+jane@example.com
+Experience
+Education
+Skills
+Rust
+",
+        )
+        .unwrap();
+        let mut ctx = TurnCtx::default();
+        let found: Value = serde_json::from_str(&r.call(&mut ctx, "find_documents", json!({"query": "resume", "kind": "resume"}))).unwrap();
+        let path = found["documents"][0]["path"].as_str().unwrap().to_string();
+        assert!(found["documents"][0]["modified"].as_str().unwrap().len() == 10);
+        // A path outside the searched folders is refused.
+        assert!(r.call(&mut ctx, "get_profile", json!({"path": "C:/Windows/win.ini"})).starts_with("error"));
+        assert!(r.call(&mut ctx, "form_answer", json!({"label": "Email"})).starts_with("error"), "profile first");
+        let got = r.call(&mut ctx, "get_profile", json!({"path": path}));
+        assert!(got.contains("Jane Roe"), "{got}");
+        assert!(r.emit.of("confirm").is_empty(), "full autonomy: no card for the resume");
+        let email: Value = serde_json::from_str(&r.call(&mut ctx, "form_answer", json!({"label": "Email address"}))).unwrap();
+        assert_eq!(email["status"], "value");
+        // Personal fields: nothing saved, nothing given.
+        for label in ["Expected salary", "Do you require visa sponsorship?", "I certify this is true", "Gender"] {
+            let a: Value = serde_json::from_str(&r.call(&mut ctx, "form_answer", json!({"label": label}))).unwrap();
+            assert_eq!(a["status"], "needs_user", "{label}");
+        }
+        // What the user says is saved and then used.
+        assert!(r.call(&mut ctx, "save_answer", json!({"label": "Expected salary", "value": "FAKE-1"})).starts_with("saved"));
+        let a: Value = serde_json::from_str(&r.call(&mut ctx, "form_answer", json!({"label": "Expected salary (USD)"}))).unwrap();
+        assert_eq!((a["status"].as_str(), a["value"].as_str()), (Some("value"), Some("FAKE-1")));
+    }
+
+    #[test]
+    fn full_autonomy_runs_a_shell_command_unasked_but_deleting_and_overwriting_still_ask() {
+        let r = rig("autonomy");
+        let mut ctx = TurnCtx::default();
+        assert!(r.call(&mut ctx, "run_shell", json!({"command": "Get-Date"})).contains("hello"));
+        assert!(r.call(&mut ctx, "run_shell", json!({"command": "Start-Sleep 0; Write-Output hi"})).contains("hello"));
+        assert!(r.emit.of("confirm").is_empty());
+        r.cancel.cancel(); // nobody answers a card: that is a no
+        let out = r.call(&mut ctx, "run_shell", json!({"command": "Remove-Item old.txt"}));
+        assert!(out.starts_with("error"), "{out}");
+        assert_eq!(r.emit.of("confirm").len(), 1);
+        std::fs::write(r.home.join("keep.txt"), "x").unwrap();
+        let out = r.call(&mut ctx, "write_file", json!({"path": "keep.txt", "content": "y"}));
+        assert!(out.starts_with("error"), "overwriting asks: {out}");
+        assert_eq!(std::fs::read_to_string(r.home.join("keep.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn years_come_from_work_dates_and_pick_the_option_that_holds_them() {
+        let p = crate::documents::Profile { work: vec![
+            crate::documents::Work { company: "A".into(), title: "x".into(), start: "Jan 2023".into(), end: "Present".into(), description: String::new() },
+            crate::documents::Work { company: "B".into(), title: "y".into(), start: "2021".into(), end: "2022".into(), description: String::new() },
+        ], ..Default::default() };
+        assert_eq!(years_of_experience(&p, 2026), Some(5));
+        let opts: Vec<String> = ["0-1", "2-4", "5+"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(pick_years_option(5, &opts), Some("5+".into()));
+        assert_eq!(pick_years_option(3, &opts), Some("2-4".into()));
+        assert_eq!(pick_years_option(0, &opts), Some("0-1".into()));
+        assert_eq!(years_of_experience(&crate::documents::Profile::default(), 2026), None);
+    }
+
+    #[test]
+    fn required_means_empty_text_or_an_unpicked_starred_group() {
+        use crate::assistant::forms::FormField;
+        let f = |k: &str, l: &str, g: &str, v: &str, c: bool, r: bool| FormField { kind: k.into(), label: l.into(), group: g.into(), value: v.into(), checked: c, required: r };
+        let page = vec![
+            f("text", "Name", "", "A", false, true),
+            f("text", "Company", "", "", false, true),
+            f("text", "Notes", "", "", false, false),
+            f("radio", "0-1", "Years *", "", false, false),
+            f("radio", "5+", "Years *", "", false, false),
+        ];
+        assert_eq!(required_empty(&page), vec!["Company".to_string(), "Years *".to_string()]);
+    }
+
+    #[test]
+    fn a_link_gets_its_scheme_for_a_url_field() {
+        use crate::documents::FormAnswer;
+        let v = |s: &str| FormAnswer::Value { value: s.into(), source: "x".into() };
+        assert_eq!(with_scheme("LinkedIn or GitHub profile", v("linkedin.com/in/a")), v("https://linkedin.com/in/a"));
+        assert_eq!(with_scheme("LinkedIn", v("https://linkedin.com/in/a")), v("https://linkedin.com/in/a"));
+        assert_eq!(with_scheme("Email", v("a@b.co")), v("a@b.co"));
+        assert_eq!(with_scheme("Full name", v("A B.")), v("A B."));
+    }
 }

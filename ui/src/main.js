@@ -13,6 +13,7 @@ const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 const { createBridge } = require("./stt/bridge");
+const { createCoreSpeech, createSpeechRouter } = require("./stt/core-speech");
 const prefsStore = require("./assistant/prefs");
 const { createConversation } = require("./assistant/conversation");
 const { createPill } = require("./assistant/pill");
@@ -79,6 +80,7 @@ function startCore() {
 }
 
 function call(method, params) {
+  if (method === "interrupt" && SELFTEST_HOOKS.interrupt) SELFTEST_HOOKS.interrupt();
   return new Promise((resolve) => {
     if (!core || core.killed) return resolve({ ok: false, error: "the core is not running" });
     const id = nextId++;
@@ -95,13 +97,18 @@ function call(method, params) {
 // CLICKER_STT=chrome (the default): the core cannot record on this engine, so the shell does,
 // through Google's recognizer in a dedicated, hidden Chrome or Edge window (src/stt/bridge.js).
 // Started on first use, kept alive, killed on quit. Transcripts are never logged here.
-const speech = createBridge({
-  log: (text) => toPanel({ event: "line", text }),
-  // Live words while someone speaks to the command bar; they go to the bar only, never to a log.
-  onInterim: (text) => {
-    if (bar && !bar.isDestroyed()) bar.webContents.send("bar-interim", text);
-  },
-});
+// Live words while someone speaks to the command bar; they go to the bar only, never to a log.
+const barInterim = (text) => {
+  if (bar && !bar.isDestroyed()) bar.webContents.send("bar-interim", text);
+};
+const chromeSpeech = createBridge({ log: (text) => toPanel({ event: "line", text }), onInterim: barInterim });
+// CLICKER_STT=deepgram (the default with a DEEPGRAM_API_KEY): the core records and streams to
+// Deepgram and sends `transcript` events; src/stt/core-speech.js turns them into the same sink calls.
+const coreSpeech = createCoreSpeech({ call, onInterim: barInterim });
+// One interface for both; the engine is asked of the core at every start, and a dropped Deepgram
+// socket (`stt_fallback`) moves an open conversation to the browser recognizer.
+const speech = createSpeechRouter({ chrome: chromeSpeech, core: coreSpeech, engineName: () => sttEngine(), log: (text) => toPanel({ event: "line", text }) });
+const shellDriven = (engine) => engine === "chrome" || engine === "deepgram"; // the shell asks for the session
 
 /* ------------------------------------------------------- the assistant layer */
 
@@ -272,6 +279,7 @@ function onAssistantEvent(message) {
   } else if (message.event === "camera") {
     if (message.action === "capture") onCamera(message);
   } else {
+    if (SELFTEST_HOOKS.core) SELFTEST_HOOKS.core(message);
     conv.onCoreEvent(message); // assistant, reply, speech
   }
 }
@@ -318,11 +326,11 @@ async function sttEngine() {
   return reply && reply.ok ? reply.result.stt : "";
 }
 
-async function speechStart() {
+async function speechStart(opts) {
   if (!voiceOn) return { ok: false, error: "voice is off" };
   conv.end("another microphone user"); // the bar, the talk key and the panel share one recognizer
   try {
-    return { ok: true, result: { listening: await speech.start() } };
+    return { ok: true, result: { listening: await speech.start(opts) } };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -342,7 +350,7 @@ async function onSttEvent(message) {
   if (message.action === "start") {
     // Pressing to talk over Pointer's voice is an interruption.
     if (mode === "assistant" && message.purpose !== "dictate" && conv.snapshot().coreState === "speaking") call("interrupt");
-    const started = await speechStart();
+    const started = await speechStart({ purpose: message.purpose === "dictate" ? "dictate" : "talk" });
     if (!started.ok) toPanel({ event: "line", text: `voice: ${started.error}` });
   } else if (message.action === "stop") {
     const { result } = await speechStop();
@@ -361,6 +369,9 @@ let recordingHotkeys = false;
 
 function onEvent(message) {
   if (message.event === "stt") return onSttEvent(message);
+  if (message.event === "transcript" && SELFTEST_HOOKS.core) SELFTEST_HOOKS.core({ event: "transcript", words: String(message.text || "").split(/\s+/).filter(Boolean).length, final: message.final });
+  if (message.event === "transcript") return coreSpeech.onTranscript(message); // never logged or forwarded
+  if (message.event === "stt_fallback") return speech.onFallback();
   if (message.event === "hotkey" && recordingHotkeys && (message.name === "bar" || message.name === "goal")) return;
   if (message.event === "hotkey" && message.name === "bar") return openBar();
   if (message.event === "hotkey" && message.name === "goal") showPanel();
@@ -393,9 +404,9 @@ ipcMain.handle("call", async (_event, method, params) => {
     panelHidesWhileActing = params.hide !== false;
     if (typeof params.voice === "boolean") voiceOn = params.voice;
   }
-  // On the chrome engine the panel's and the bar's mic are answered here, from the bridge.
-  if ((method === "listen_start" || method === "listen_stop") && (await sttEngine()) === "chrome") {
-    return method === "listen_start" ? speechStart() : speechStop();
+  // On the shell-driven engines the panel's and the bar's mic are answered here, from the router.
+  if ((method === "listen_start" || method === "listen_stop") && shellDriven(await sttEngine())) {
+    return method === "listen_start" ? speechStart(params) : speechStop();
   }
   const reply = await call(method, params);
   if (method === "save_settings" && reply.ok) refreshMode(); // the mode may have just changed
@@ -584,7 +595,7 @@ function closeBar() {
 ipcMain.handle("bar-listen", async (_event, action) => {
   if (action === "start") {
     if (!voiceOn) return { ok: false, error: "voice is off" };
-    barEngineLive = (await sttEngine()) === "chrome";
+    barEngineLive = shellDriven(await sttEngine());
     barHoldOpenUntil = Date.now() + 30000;
     const started = barEngineLive ? await speechStart() : await call("listen_start");
     barHoldOpenUntil = Date.now() + 1000;
@@ -888,6 +899,7 @@ app.whenReady().then(() => {
   setInterval(refreshMode, 15000);
   if (prefs.wake) wake.enable(); // the user turned it on in Settings; the mic stays open while resting
   if (process.env.POINTER_CONV_SELFTEST === "1") convSelfTest();
+  if (process.env.POINTER_BARGE_SELFTEST === "1") setTimeout(bargeSelfTest, 3000);
   if (process.env.POINTER_PILL_SELFTEST === "1") pillSelfTest();
   if (process.env.POINTER_OVERLAY_SELFTEST === "1") overlaySelfTest();
   if (process.env.POINTER_CAMERA_SELFTEST === "1") cameraSelfTest();
@@ -943,6 +955,44 @@ function selfFinish(code = 0) {
 
 async function convSelfTest() {
   const ok = await require("./assistant/selftest-conversation").run();
+  selfFinish(ok ? 0 : 1);
+}
+
+// POINTER_BARGE_SELFTEST=1 (with POINTER_BARGE_CLIP=<wav> and POINTER_VOICE_TOOL=<voice_tool.exe>):
+// the real shell path for barge-in. The conversation is opened as a user's would be, Pointer is asked
+// something long and starts speaking, and one clip is played aloud through the speakers. The shell's own
+// conversation controller must hear 2+ interim words from the core and call `interrupt`; this only
+// watches and times it. Words are counted, never logged.
+async function bargeSelfTest() {
+  const log = (text) => console.log(`[barge-selftest] ${text}`);
+  const at = Date.now();
+  const rel = () => `+${((Date.now() - at) / 1000).toFixed(2)}s`;
+  let speechStart = 0, clipAt = 0, interim = 0, interruptAt = 0, cutAt = 0;
+  SELFTEST_HOOKS.interrupt = () => { interruptAt = interruptAt || Date.now(); log(`shell called interrupt ${rel()}`); };
+  SELFTEST_HOOKS.core = (m) => {
+    if (m.event === "speech" && !m.real) log(`plain speech ${m.action} text_chars=${String(m.text || "").length} ${rel()}`);
+    if (m.event === "transcript" && !clipAt) log(`transcript before the clip: ${m.words} words final=${m.final} ${rel()}`);
+    if (m.event === "speech" && m.real && m.action === "start" && !m.ack && !speechStart) { speechStart = Date.now(); log(`speech really started ${rel()} first_audio_ms=${m.first_audio_ms}`); }
+    if (m.event === "speech" && m.real && m.action === "end" && !m.ack) { cutAt = Date.now(); log(`speech really ended ${rel()} cut=${m.cut}`); }
+    if (m.event === "transcript" && clipAt && !interim && m.words >= 2) { interim = Date.now(); log(`core heard ${m.words} words ${rel()} (${interim - clipAt} ms after the clip began)`); }
+  };
+  await call("set_mode", { act: false, voice: true, hide: false });
+  const st = await call("state");
+  log(`engine=${st.ok ? st.result.stt : "unknown"}`);
+  await conv.begin();
+  conv.send("Without using any tools, answer aloud in about six sentences: why is the sky blue?", "typed");
+  for (let i = 0; i < 300 && !speechStart; i++) await waitMs(100);
+  if (!speechStart) { log("Pointer never spoke"); return selfFinish(1); }
+  await waitMs(2500);
+  clipAt = Date.now();
+  log(`playing the clip aloud ${rel()}`);
+  require("child_process").spawn(process.env.POINTER_VOICE_TOOL, ["play", process.env.POINTER_BARGE_CLIP], { stdio: "ignore" });
+  for (let i = 0; i < 100 && !cutAt; i++) await waitMs(100);
+  const ok = Boolean(interruptAt && cutAt && cutAt >= interruptAt);
+  log(`RESULT ${ok ? "PASS" : "FAIL"}: interim ${interim ? interim - clipAt : "never"} ms, interrupt ${interruptAt ? interruptAt - clipAt : "never"} ms, sound cut ${cutAt ? cutAt - clipAt : "never"} ms after the clip began`);
+  conv.end("selftest");
+  await call("stop_all");
+  await waitMs(2500); // let the clip finish so nothing it said becomes a request
   selfFinish(ok ? 0 : 1);
 }
 

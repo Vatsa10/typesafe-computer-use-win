@@ -7,7 +7,7 @@
 //! than in the Python dict's order. The questions and their criteria keep the Python order: the
 //! api crate writes that part of the body by hand.
 
-use api::typesafe::{Answer, ApiError, ChoiceAnswer, Question, TypeSafe};
+use api::typesafe::{Answer, ApiError, Asset, ChoiceAnswer, Question, TypeSafe};
 use platform::uia::Hit;
 use serde_json::{json, Map, Value};
 
@@ -37,9 +37,29 @@ pub trait Classifier {
         state: &Value,
         questions: &[(String, Question)],
     ) -> Result<Vec<(String, Answer)>, ApiError>;
+
+    /// The same request with images beside the state. None means this classifier cannot take
+    /// images, so the caller sends the text-only request.
+    fn system_one_images(
+        &self,
+        _state: &Value,
+        _questions: &[(String, Question)],
+        _assets: &[Asset],
+    ) -> Option<Result<Vec<(String, Answer)>, ApiError>> {
+        None
+    }
 }
 
 impl Classifier for TypeSafe {
+    fn system_one_images(
+        &self,
+        state: &Value,
+        questions: &[(String, Question)],
+        assets: &[Asset],
+    ) -> Option<Result<Vec<(String, Answer)>, ApiError>> {
+        Some(self.system_one_with(state, questions, assets))
+    }
+
     fn system_one(
         &self,
         state: &Value,
@@ -382,7 +402,7 @@ pub(crate) fn find<'a>(answers: &'a [(String, Answer)], name: &str) -> Option<&'
 pub(crate) fn choice_of(answers: &[(String, Answer)], name: &str) -> Option<ChoiceAnswer> {
     match find(answers, name)? {
         Answer::Choice(c) => Some(c.clone()),
-        Answer::Noul(_) => None,
+        _ => None,
     }
 }
 
@@ -495,7 +515,8 @@ pub fn decide(
     apps: &[App],
 ) -> Result<Decision, ApiError> {
     let q = questions(screen, items, browser, email, sites, apps);
-    let answers = client.system_one(&base_state(goal, screen, items, history), &q)?;
+    let state = base_state(goal, screen, items, history);
+    let answers = ask(client, screen, &state, &q)?;
     Ok(Decision {
         kind: choice_of(&answers, "kind").ok_or_else(|| bad("no kind answer".into()))?,
         item: choice_of(&answers, "item"),
@@ -504,6 +525,44 @@ pub fn decide(
         window: choice_of(&answers, "window"),
         app: choice_of(&answers, "app"),
     })
+}
+
+/// One request about this screen. When the screen is sparse in readable items (or vision is on), the capture goes along as a downscaled image
+/// and the state names it; any failure to build or send the image falls back to the text-only
+/// request, which is exactly what vision off sends.
+fn ask(
+    client: &dyn Classifier,
+    screen: &Screen,
+    state: &Value,
+    q: &[(String, Question)],
+) -> Result<Vec<(String, Answer)>, ApiError> {
+    ask_with(crate::vision::vision_current(), client, screen, state, q)
+}
+
+fn ask_with(
+    mode: crate::vision::VisionMode,
+    client: &dyn Classifier,
+    screen: &Screen,
+    state: &Value,
+    q: &[(String, Question)],
+) -> Result<Vec<(String, Answer)>, ApiError> {
+    let readable = state
+        .get("screen_items_in_reading_order")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if crate::vision::should_send(mode, readable) {
+        if let Some(asset) = crate::vision::screen_asset(&screen.bgra, screen.width, screen.height)
+        {
+            let mut with_image = state.clone();
+            if let Value::Object(m) = &mut with_image {
+                m.insert("screen_image".into(), json!(crate::vision::SHOT_KEY));
+            }
+            if let Some(Ok(answers)) = client.system_one_images(&with_image, q, &[asset]) {
+                return Ok(answers);
+            }
+        }
+    }
+    client.system_one(state, q)
 }
 
 /// Probability that the field now holds a sensible value for its purpose.
@@ -1060,5 +1119,131 @@ pub(crate) mod tests {
             Err(e) => println!("LIVE decide failed: status={:?}", e.status),
         }
         assert!(got.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::tests::{answer, screen};
+    use super::*;
+    use crate::vision::VisionMode;
+    use std::cell::RefCell;
+
+    /// A classifier that takes images, and can be told to fail them.
+    struct Seeing {
+        fail_images: bool,
+        sent: RefCell<Vec<(Value, usize)>>,
+    }
+
+    impl Classifier for Seeing {
+        fn system_one(
+            &self,
+            state: &Value,
+            _: &[(String, Question)],
+        ) -> Result<Vec<(String, Answer)>, ApiError> {
+            self.sent.borrow_mut().push((state.clone(), 0));
+            Ok(vec![("kind".into(), Answer::Choice(answer("wait", 1.0)))])
+        }
+
+        fn system_one_images(
+            &self,
+            state: &Value,
+            _: &[(String, Question)],
+            assets: &[Asset],
+        ) -> Option<Result<Vec<(String, Answer)>, ApiError>> {
+            self.sent.borrow_mut().push((state.clone(), assets.len()));
+            Some(if self.fail_images {
+                Err(ApiError {
+                    status: Some(400),
+                    message: "image rejected".into(),
+                })
+            } else {
+                Ok(vec![("kind".into(), Answer::Choice(answer("wait", 1.0)))])
+            })
+        }
+    }
+
+    fn run(vision: VisionMode, fail: bool) -> Vec<(Value, usize)> {
+        let c = Seeing {
+            fail_images: fail,
+            sent: RefCell::new(Vec::new()),
+        };
+        let s = screen();
+        let state = base_state("g", &s, &[], &[]);
+        ask_with(vision, &c, &s, &state, &[]).unwrap();
+        c.sent.into_inner()
+    }
+
+    #[test]
+    fn vision_on_sends_one_image_and_names_it_in_the_state() {
+        let sent = run(VisionMode::On, false);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, 1);
+        assert_eq!(sent[0].0["screen_image"], "shot");
+    }
+
+    #[test]
+    fn auto_sends_the_image_only_when_the_screen_is_sparse() {
+        let sparse = run(VisionMode::Auto, false);
+        assert_eq!(sparse[0].1, 1, "an empty screen is sparse: the image goes");
+        let c = Seeing { fail_images: false, sent: RefCell::new(Vec::new()) };
+        let s = screen();
+        let rich: Vec<Item> = (0..crate::vision::SPARSE_ITEMS + 2)
+            .map(|i| super::tests::make_item(i, &format!("item {i}"), 10.0 * i as f64, 10.0 * i as f64 + 5.0))
+            .collect();
+        let state = base_state("g", &s, &rich, &[]);
+        ask_with(VisionMode::Auto, &c, &s, &state, &[]).unwrap();
+        let sent = c.sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, 0, "a screen that reads well as text sends no image");
+        assert!(sent[0].0.get("screen_image").is_none());
+    }
+
+    #[test]
+    fn vision_off_sends_the_plain_text_request() {
+        let sent = run(VisionMode::Off, false);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, 0);
+        assert!(sent[0].0.get("screen_image").is_none());
+    }
+
+    #[test]
+    fn an_image_error_falls_back_to_the_text_request_unchanged() {
+        let sent = run(VisionMode::On, true);
+        assert_eq!(sent.len(), 2, "the image try, then the fallback");
+        assert_eq!(sent[1].1, 0);
+        assert_eq!(sent[1].0, run(VisionMode::Off, false)[0].0, "the fallback is the vision-off state");
+    }
+
+    #[test]
+    fn an_unfittable_capture_just_sends_text() {
+        let c = Seeing {
+            fail_images: false,
+            sent: RefCell::new(Vec::new()),
+        };
+        let mut s = screen();
+        s.width = 8000;
+        s.height = 100;
+        s.bgra = vec![0; 8000 * 100 * 4];
+        let state = base_state("g", &s, &[], &[]);
+        ask_with(VisionMode::On, &c, &s, &state, &[]).unwrap();
+        assert_eq!(c.sent.into_inner()[0].1, 0);
+    }
+
+    #[test]
+    fn a_classifier_without_image_support_gets_text() {
+        struct Plain;
+        impl Classifier for Plain {
+            fn system_one(
+                &self,
+                _: &Value,
+                _: &[(String, Question)],
+            ) -> Result<Vec<(String, Answer)>, ApiError> {
+                Ok(vec![("kind".into(), Answer::Choice(answer("wait", 1.0)))])
+            }
+        }
+        let s = screen();
+        let state = base_state("g", &s, &[], &[]);
+        assert!(ask_with(VisionMode::On, &Plain, &s, &state, &[]).is_ok());
     }
 }

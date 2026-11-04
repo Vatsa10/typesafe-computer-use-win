@@ -18,3 +18,8 @@ rusqlite = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }
+pdf-extract = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }

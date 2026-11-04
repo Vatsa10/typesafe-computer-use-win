@@ -80,6 +80,10 @@ pub trait Desktop {
     fn element_at(&self, _x: f64, _y: f64) -> Option<platform::uia::Under> {
         None
     }
+    /// A browser window's tab strip (titles only) and address-bar candidates.
+    fn browser_scan(&self, _hwnd: isize) -> platform::uia::BrowserScan {
+        platform::uia::BrowserScan::default()
+    }
 }
 
 /// The real desktop.
@@ -161,6 +165,10 @@ impl Desktop for LiveDesktop {
 
     fn element_at(&self, x: f64, y: f64) -> Option<platform::uia::Under> {
         platform::uia::element_at(x.round() as i32, y.round() as i32)
+    }
+
+    fn browser_scan(&self, hwnd: isize) -> platform::uia::BrowserScan {
+        platform::uia::browser_scan(hwnd)
     }
 }
 

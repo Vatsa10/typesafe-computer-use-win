@@ -1,5 +1,5 @@
 //! The writer model: the only place free text is generated, when the classifier asks for it and
-//! once when the run ends. A port of `writer.py`, on OpenAI only.
+//! once when the run ends. A port of `writer.py`, on OpenAI or Claude.
 //!
 //! The service is reached through [`StructuredWriter`], which `api::openai::OpenAi` implements, so
 //! tests run against a fake. Request shape (strict JSON schema, system message, PNG data URL,
@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use api::anthropic::Claude;
 use api::openai::{problem, ApiError, OpenAi};
 use serde_json::{json, Value};
 
@@ -67,9 +68,40 @@ impl StructuredWriter for OpenAi {
     }
 }
 
-/// A writer, or None when no OpenAI key resolves, so a run never fails halfway for want of one.
-pub fn make_writer() -> Option<OpenAi> {
-    OpenAi::from_env()
+/// The configured writer: OpenAI or Claude, following [`config::writer_provider`].
+#[derive(Debug)]
+pub enum Writer {
+    OpenAi(OpenAi),
+    Claude(Claude),
+}
+
+impl StructuredWriter for Writer {
+    fn structured(
+        &self,
+        model: &str,
+        system: &str,
+        packet: &Value,
+        properties: &Value,
+        max_tokens: u32,
+        png: Option<&[u8]>,
+    ) -> Result<Value, ApiError> {
+        match self {
+            Self::OpenAi(w) => w.structured(model, system, packet, properties, max_tokens, png),
+            Self::Claude(w) => w.structured(model, system, packet, properties, max_tokens, png),
+        }
+    }
+}
+
+/// A writer, or None when neither key resolves, so a run never fails halfway for want of one.
+/// The chosen provider wins; when its key is missing the other is used if it has one.
+pub fn make_writer() -> Option<Writer> {
+    let claude = || Claude::from_env().map(Writer::Claude);
+    let openai = || OpenAi::from_env().map(Writer::OpenAi);
+    if config::writer_provider() == "anthropic" {
+        claude().or_else(openai)
+    } else {
+        openai().or_else(claude)
+    }
 }
 
 fn env_model(name: &str, default: &str) -> String {
@@ -80,15 +112,14 @@ fn env_model(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// `CLICKER_WRITER_MODEL`, else the OpenAI default: the writer is OpenAI everywhere, so the
-/// Anthropic default `config::writer_model` would pick without an OpenAI key never applies.
+/// `CLICKER_WRITER_MODEL`, else the provider's default.
 pub fn writer_model() -> String {
-    env_model("CLICKER_WRITER_MODEL", config::DEFAULT_OPENAI_WRITER_MODEL)
+    env_model("CLICKER_WRITER_MODEL", &config::writer_model())
 }
 
-/// `CLICKER_ANSWER_MODEL`, else the OpenAI default.
+/// `CLICKER_ANSWER_MODEL`, else the provider's default.
 pub fn answer_model() -> String {
-    env_model("CLICKER_ANSWER_MODEL", config::DEFAULT_OPENAI_ANSWER_MODEL)
+    env_model("CLICKER_ANSWER_MODEL", &config::answer_model())
 }
 
 /// The capture as PNG, shrunk so its long edge is at most `ANSWER_IMAGE_EDGE`. PNG because screen
@@ -838,8 +869,16 @@ pub(crate) mod tests {
     #[test]
     fn the_models_default_to_openai() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CLICKER_WRITER_MODEL");
-        std::env::remove_var("CLICKER_ANSWER_MODEL");
+        for n in [
+            "CLICKER_WRITER_MODEL",
+            "CLICKER_ANSWER_MODEL",
+            "CLICKER_WRITER_PROVIDER",
+            "POINTER_LLM",
+            "ANTHROPIC_API_KEY",
+        ] {
+            std::env::remove_var(n);
+        }
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
         assert_eq!(writer_model(), config::DEFAULT_OPENAI_WRITER_MODEL);
         assert_eq!(answer_model(), config::DEFAULT_OPENAI_ANSWER_MODEL);
     }

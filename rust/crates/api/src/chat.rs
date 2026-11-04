@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::typesafe::{env_var, error_message};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_MODEL: &str = "gpt-4.1";
+pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(25);
 
@@ -82,6 +82,8 @@ pub struct ToolCall {
 pub struct ChatReply {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Claude's thinking blocks, kept so the next turn can send them back unchanged.
+    pub thinking: Vec<Value>,
 }
 
 impl ChatReply {
@@ -96,7 +98,54 @@ impl ChatReply {
                                  "function": { "name": c.name, "arguments": c.arguments } }))
                 .collect::<Vec<_>>());
         }
+        if !self.thinking.is_empty() {
+            m[crate::anthropic::THINKING_KEY] = json!(self.thinking);
+        }
         m
+    }
+}
+
+/// Which service holds the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    OpenAi,
+    Claude,
+}
+
+impl Provider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Claude => "claude",
+        }
+    }
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAi => DEFAULT_MODEL,
+            Self::Claude => crate::anthropic::DEFAULT_MODEL,
+        }
+    }
+}
+
+fn openai_key() -> Option<String> {
+    env_var("POINTER_AGENT_API_KEY").or_else(|| env_var("OPENAI_API_KEY"))
+}
+
+/// The provider in force. `POINTER_LLM` (`openai` or `claude`) chooses; with an explicit choice
+/// and no key for it there is no provider. Unset: OpenAI if its key exists, else Claude if its key
+/// exists, else none (quick mode).
+pub fn provider() -> Option<Provider> {
+    match env_var("POINTER_LLM").map(|v| v.to_lowercase()).as_deref() {
+        Some("openai") => return openai_key().map(|_| Provider::OpenAi),
+        Some("claude" | "anthropic") => {
+            return crate::anthropic::api_key().map(|_| Provider::Claude)
+        }
+        _ => {}
+    }
+    if openai_key().is_some() {
+        Some(Provider::OpenAi)
+    } else {
+        crate::anthropic::api_key().map(|_| Provider::Claude)
     }
 }
 
@@ -111,6 +160,7 @@ pub trait Chat: Send + Sync {
 }
 
 pub struct ChatClient {
+    provider: Provider,
     key: String,
     base_url: String,
     model: String,
@@ -126,22 +176,46 @@ impl fmt::Debug for ChatClient {
     }
 }
 
-/// The agent key: `POINTER_AGENT_API_KEY`, else `OPENAI_API_KEY`.
+/// The key of the provider in force: `POINTER_AGENT_API_KEY` else `OPENAI_API_KEY` for OpenAI,
+/// `ANTHROPIC_API_KEY` for Claude.
 pub fn agent_key() -> Option<String> {
-    env_var("POINTER_AGENT_API_KEY").or_else(|| env_var("OPENAI_API_KEY"))
+    match provider()? {
+        Provider::OpenAi => openai_key(),
+        Provider::Claude => crate::anthropic::api_key(),
+    }
 }
 
 impl ChatClient {
     /// A client from the environment, or None when no key is set.
     pub fn from_env() -> Option<Self> {
+        let provider = provider()?;
         let key = agent_key()?;
-        let base_url = env_var("POINTER_AGENT_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
-        let model = env_var("POINTER_AGENT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.into());
-        Some(Self::new(key, base_url, model))
+        let model = env_var("POINTER_AGENT_MODEL").unwrap_or_else(|| provider.default_model().into());
+        Some(match provider {
+            Provider::OpenAi => {
+                let base =
+                    env_var("POINTER_AGENT_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.into());
+                Self::new(key, base, model)
+            }
+            Provider::Claude => Self::claude(key, crate::anthropic::base_url(), model),
+        })
+    }
+
+    /// A Claude client on the native Messages API.
+    pub fn claude(key: String, base_url: String, model: String) -> Self {
+        Self {
+            provider: Provider::Claude,
+            ..Self::new(key, base_url, model)
+        }
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
     }
 
     pub fn new(key: String, base_url: String, model: String) -> Self {
         Self {
+            provider: Provider::OpenAi,
             key,
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
@@ -161,10 +235,25 @@ impl ChatClient {
 
 /// The request body.
 pub fn build_request(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+    // The Claude-only thinking key must not reach an OpenAI server.
+    let messages: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            if let Some(o) = m.as_object_mut() {
+                o.remove(crate::anthropic::THINKING_KEY);
+            }
+            m
+        })
+        .collect();
     let mut body = json!({ "model": model, "messages": messages });
     if !tools.is_empty() {
         body["tools"] = json!(tools);
         body["tool_choice"] = json!("auto");
+        // gpt-6 models refuse function tools on chat completions unless reasoning is off.
+        if model.starts_with("gpt-6") {
+            body["reasoning_effort"] = json!("none");
+        }
     }
     body
 }
@@ -210,6 +299,7 @@ pub fn parse_reply(body: &Value) -> Result<ChatReply, ChatError> {
     Ok(ChatReply {
         content,
         tool_calls,
+        thinking: Vec::new(),
     })
 }
 
@@ -223,21 +313,35 @@ impl Chat for ChatClient {
         if cancel.is_cancelled() {
             return Err(ChatError::Cancelled);
         }
-        let body = build_request(&self.model, messages, tools);
+        let provider = self.provider;
+        let body = match provider {
+            Provider::OpenAi => build_request(&self.model, messages, tools),
+            Provider::Claude => crate::anthropic::build_request(&self.model, messages, tools),
+        };
         let url = format!("{}/chat/completions", self.base_url);
+        let url_base = self.base_url.clone();
         let key = self.key.clone();
         let timeout = self.timeout;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("chat".into())
             .spawn(move || {
-                let _ = tx.send(post(&url, &key, &body, timeout));
+                let r = match provider {
+                    Provider::OpenAi => post(&url, &key, &body, timeout),
+                    Provider::Claude => crate::anthropic::post(&url_base, &key, &body, timeout),
+                };
+                let _ = tx.send(r);
             })
             .map_err(|e| ChatError::Network(e.to_string()))?;
         let deadline = Instant::now() + timeout;
         loop {
             match rx.recv_timeout(POLL) {
-                Ok(result) => return result.and_then(|v| parse_reply(&v)),
+                Ok(result) => {
+                    return result.and_then(|v| match provider {
+                        Provider::OpenAi => parse_reply(&v),
+                        Provider::Claude => crate::anthropic::parse_reply(&v),
+                    })
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if cancel.is_cancelled() {
                         return Err(ChatError::Cancelled);
@@ -355,6 +459,9 @@ mod tests {
         let r = build_request("m", &[], &[json!({"type": "function"})]);
         assert_eq!(r["tool_choice"], "auto");
         assert_eq!(r["tools"].as_array().unwrap().len(), 1);
+        assert!(r.get("reasoning_effort").is_none());
+        let r = build_request("gpt-6-luna", &[], &[json!({"type": "function"})]);
+        assert_eq!(r["reasoning_effort"], "none");
     }
 
     #[test]
@@ -440,6 +547,86 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_turn_round_trips_over_http_with_headers_and_thinking() {
+        let body = json!({"stop_reason": "tool_use", "content": [
+            {"type": "thinking", "thinking": "t", "signature": "s"},
+            {"type": "tool_use", "id": "t1", "name": "observe", "input": {}}]});
+        let (url, seen) = serve(Some(http("200 OK", &body.to_string())));
+        let client = ChatClient::claude("sk-ant-secret".into(), url, "claude-haiku-5-5".into());
+        let reply = client
+            .complete(
+                &[json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "hi"})],
+                &[json!({"type": "function", "function": {"name": "observe", "parameters": {"type": "object"}}})],
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(reply.tool_calls[0].name, "observe");
+        assert_eq!(reply.message()["anthropic_thinking"][0]["signature"], "s");
+        let raw = seen.recv().unwrap();
+        let lower = raw.to_lowercase();
+        assert!(raw.starts_with("POST /v1/messages"));
+        assert!(lower.contains("x-api-key: sk-ant-secret"));
+        assert!(lower.contains("anthropic-version: 2023-06-01"));
+        assert!(!lower.contains("authorization"));
+        assert!(raw.contains("\"system\"") && raw.contains("\"input_schema\""));
+    }
+
+    #[test]
+    fn claude_errors_are_short_and_keyless() {
+        let (url, _) = serve(Some(http(
+            "401 Unauthorized",
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key sk-ant-secret"}}"#,
+        )));
+        let err = ChatClient::claude("sk-ant-secret".into(), url, "m".into())
+            .complete(&[], &[], &Cancel::new())
+            .unwrap_err();
+        assert_eq!(err.to_string(), "the agent key was rejected");
+    }
+
+    #[test]
+    fn the_thinking_key_never_reaches_an_openai_server() {
+        let r = build_request(
+            "m",
+            &[json!({"role": "assistant", "content": "", "anthropic_thinking": [{"type": "thinking"}]})],
+            &[],
+        );
+        assert!(r["messages"][0].get("anthropic_thinking").is_none());
+    }
+
+    #[test]
+    fn provider_choice_and_fallback_order() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names = ["POINTER_LLM", "POINTER_AGENT_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+            "POINTER_AGENT_MODEL"];
+        let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+        for n in names {
+            std::env::remove_var(n);
+        }
+        assert_eq!(provider(), None);
+        assert!(agent_key().is_none() && ChatClient::from_env().is_none());
+        std::env::set_var("ANTHROPIC_API_KEY", "a");
+        assert_eq!(provider(), Some(Provider::Claude));
+        assert_eq!(ChatClient::from_env().unwrap().model(), "claude-haiku-5-5");
+        std::env::set_var("OPENAI_API_KEY", "o");
+        assert_eq!(provider(), Some(Provider::OpenAi));
+        assert_eq!(ChatClient::from_env().unwrap().model(), "gpt-6-luna");
+        std::env::set_var("POINTER_LLM", "claude");
+        assert_eq!(provider(), Some(Provider::Claude));
+        assert_eq!(agent_key().as_deref(), Some("a"));
+        std::env::set_var("POINTER_AGENT_MODEL", "custom");
+        assert_eq!(ChatClient::from_env().unwrap().model(), "custom");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert_eq!(provider(), None, "an explicit choice without its key is not a silent switch");
+        for (n, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+        }
+    }
+
+    #[test]
     fn parse_handles_text_and_missing_ids() {
         let r = parse_reply(&json!({"choices": [{"message": {"content": "hello"}}]})).unwrap();
         assert_eq!(r.content, "hello");
@@ -449,5 +636,94 @@ mod tests {
         .unwrap();
         assert_eq!(r.tool_calls[0].id, "call_0");
         assert!(parse_reply(&json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod live {
+    //! Real-network turns, run by hand: `POINTER_HOME=<dir with .env> cargo test -p api live -- --ignored --nocapture`.
+    //! The tools are fakes; nothing touches the machine. Keys are never printed.
+    use super::*;
+    use crate::typesafe::ApiError;
+    use base64::Engine;
+    use std::time::Instant;
+
+    const RED: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
+
+    fn load() {
+        if let Ok(home) = std::env::var("POINTER_HOME") {
+            let text = std::fs::read_to_string(std::path::Path::new(&home).join(".env")).unwrap_or_default();
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    if std::env::var_os(k.trim()).is_none() {
+                        std::env::set_var(k.trim(), v.trim().trim_matches('"'));
+                    }
+                }
+            }
+        }
+    }
+
+    fn tools() -> Vec<Value> {
+        ["get_time", "get_weather"]
+            .iter()
+            .map(|n| json!({"type": "function", "function": {"name": n, "description": format!("Return the {n} result."),
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "additionalProperties": false}}}))
+            .collect()
+    }
+
+    fn turn(client: &ChatClient) {
+        let mut m = vec![
+            json!({"role": "system", "content": "You are a terse assistant. Use tools when asked."}),
+            json!({"role": "user", "content": "Call get_time and get_weather for Paris, both at once, then tell me both results."}),
+        ];
+        let cancel = Cancel::new();
+        let t = Instant::now();
+        let r1 = client.complete(&m, &tools(), &cancel).expect("first call");
+        println!("  call 1: {} ms, {} tool calls, thinking blocks {}", t.elapsed().as_millis(), r1.tool_calls.len(), r1.thinking.len());
+        assert!(!r1.tool_calls.is_empty(), "no tool call: {r1:?}");
+        m.push(r1.message());
+        for c in &r1.tool_calls {
+            m.push(json!({"role": "tool", "tool_call_id": c.id, "content": format!("{} ok: 14:05 / 12C rain", c.name)}));
+        }
+        m.push(json!({"role": "user", "content": [
+            {"type": "text", "text": "Here is the screen. What single colour fills it? Answer with the colour word and the tool results."},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{RED}")}}]}));
+        let t = Instant::now();
+        let r2 = client.complete(&m, &tools(), &cancel).expect("second call");
+        println!("  call 2: {} ms, {} tool calls, reply: {}", t.elapsed().as_millis(), r2.tool_calls.len(), r2.content.replace(char::from(10), " "));
+        assert!(r2.content.to_lowercase().contains("red"), "image not read: {r2:?}");
+    }
+
+    fn writer(name: &str, f: impl Fn(&str, &str, &Value, &Value, u32, Option<&[u8]>) -> Result<Value, ApiError>, model: &str) {
+        let props = json!({"colour": {"type": "string"}, "ok": {"type": "boolean"}});
+        let png = base64::engine::general_purpose::STANDARD.decode(RED).unwrap();
+        let t = Instant::now();
+        let v = f(model, "Describe the image.", &json!({"task": "name the colour"}), &props, 300, Some(&png));
+        println!("  {name} writer: {} ms -> {v:?}", t.elapsed().as_millis());
+        assert!(v.is_ok_and(|v| v["colour"].as_str().unwrap_or("").to_lowercase().contains("red")));
+    }
+
+    #[test]
+    #[ignore = "network: real OpenAI call"]
+    fn live_openai_luna_tool_loop_and_writer() {
+        load();
+        let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY");
+        println!("gpt-6-luna");
+        let c = ChatClient::new(key.clone(), DEFAULT_BASE_URL.into(), "gpt-6-luna".into());
+        turn(&c);
+        let o = crate::openai::OpenAi::new(key, DEFAULT_BASE_URL.into());
+        writer("openai", |m, s, p, pr, mt, i| o.structured(m, s, p, pr, mt, i), "gpt-6-luna");
+    }
+
+    #[test]
+    #[ignore = "network: real Anthropic call"]
+    fn live_claude_haiku_tool_loop_and_writer() {
+        load();
+        let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
+        println!("claude-haiku-5-5");
+        let c = ChatClient::claude(key.clone(), crate::anthropic::DEFAULT_BASE_URL.into(), "claude-haiku-5-5".into());
+        turn(&c);
+        let a = crate::anthropic::Claude::new(key, crate::anthropic::DEFAULT_BASE_URL.into());
+        writer("claude", |m, s, p, pr, mt, i| a.structured(m, s, p, pr, mt, i), "claude-haiku-5-5");
     }
 }

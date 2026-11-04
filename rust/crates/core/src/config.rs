@@ -15,12 +15,12 @@ pub const ABORT_CORNER_PX: i32 = 4;
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.4;
 pub const DEFAULT_STEPS: u32 = 100;
 pub const DEFAULT_DELAY: f64 = 2.0;
-pub const DEFAULT_WRITER_MODEL: &str = "claude-haiku-4-5";
-pub const DEFAULT_ANSWER_MODEL: &str = "claude-sonnet-5"; // runs once per run, on a screenshot: worth a stronger reader
-                                                          // The same two jobs on an OpenAI-compatible endpoint. Both read a screenshot for the answer, so both
-                                                          // have to be vision models. Override them when an account or a gateway offers something better.
-pub const DEFAULT_OPENAI_WRITER_MODEL: &str = "gpt-4.1-mini";
-pub const DEFAULT_OPENAI_ANSWER_MODEL: &str = "gpt-4.1";
+/// Both writer jobs (typing, answers, teaching) read a screenshot, so both models are vision
+/// models. The default follows the provider; the two are priced the same.
+pub const DEFAULT_WRITER_MODEL: &str = "claude-haiku-5-5";
+pub const DEFAULT_ANSWER_MODEL: &str = "claude-haiku-5-5";
+pub const DEFAULT_OPENAI_WRITER_MODEL: &str = "gpt-6-luna";
+pub const DEFAULT_OPENAI_ANSWER_MODEL: &str = "gpt-6-luna";
 pub const DEFAULT_BROWSER: &str = "Google Chrome";
 
 /// The curated core of the site catalog. These are always offered, whatever the browser holds, and
@@ -134,20 +134,20 @@ pub fn browser() -> String {
 
 /// Which service writes free text: "anthropic" or "openai".
 ///
-/// Set CLICKER_WRITER_PROVIDER to force one. Otherwise an OpenAI key wins, including when both
-/// are present, so swapping provider is a matter of which key is in .env rather than a code
-/// change. Anthropic remains fully supported and is used whenever it is the only key set.
+/// `CLICKER_WRITER_PROVIDER` forces one. Otherwise the writer follows the assistant's provider
+/// (`POINTER_LLM`, else OpenAI when its key exists, else Claude), so choosing a provider once
+/// moves typing, answers and teaching with it. With no key at all it is "openai".
 pub fn writer_provider() -> &'static str {
     let explicit = env_or("CLICKER_WRITER_PROVIDER", "").trim().to_lowercase();
     match explicit.as_str() {
-        "anthropic" => return "anthropic",
+        "anthropic" | "claude" => return "anthropic",
         "openai" => return "openai",
         _ => {}
     }
-    if env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty()) {
-        return "openai";
+    match api::chat::provider() {
+        Some(api::chat::Provider::Claude) => "anthropic",
+        _ => "openai",
     }
-    "anthropic"
 }
 
 /// An OpenAI-compatible endpoint other than OpenAI's own: Groq, OpenRouter, or a local server.
@@ -243,9 +243,10 @@ pub fn choose_stt(setting: &str) -> Result<&'static str, String> {
     match setting.trim().to_ascii_lowercase().as_str() {
         "" | "auto" | "chrome" => Ok("chrome"),
         "openai" => Ok("openai"),
+        "deepgram" => Ok("deepgram"),
         "windows" => Ok("windows"),
         other => Err(format!(
-            "CLICKER_STT must be auto, chrome, openai or windows, not {other:?}"
+            "CLICKER_STT must be auto, chrome, openai, deepgram or windows, not {other:?}"
         )),
     }
 }
@@ -539,34 +540,40 @@ mod tests {
         assert_eq!(choose_stt(" Chrome ").unwrap(), "chrome");
         assert_eq!(choose_stt(" Windows ").unwrap(), "windows");
         assert_eq!(choose_stt("openai").unwrap(), "openai");
+        assert_eq!(choose_stt(" Deepgram ").unwrap(), "deepgram");
         assert!(choose_stt("whisper").is_err());
     }
 
     #[test]
     fn test_models_follow_the_provider() {
         let _g = lock();
-        let saved: Vec<(&str, Option<String>)> = [
+        let names = [
             "OPENAI_API_KEY",
+            "POINTER_AGENT_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "POINTER_LLM",
             "CLICKER_WRITER_PROVIDER",
             "CLICKER_WRITER_MODEL",
             "CLICKER_ANSWER_MODEL",
-        ]
-        .into_iter()
-        .map(|n| (n, env::var(n).ok()))
-        .collect();
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            names.into_iter().map(|n| (n, env::var(n).ok())).collect();
         for (n, _) in &saved {
             env::remove_var(n);
         }
+        assert_eq!(writer_provider(), "openai");
+        assert_eq!(writer_model(), "gpt-6-luna");
+        env::set_var("ANTHROPIC_API_KEY", "k");
         assert_eq!(writer_provider(), "anthropic");
-        assert_eq!(writer_model(), "claude-haiku-4-5");
-        assert_eq!(answer_model(), "claude-sonnet-5");
+        assert_eq!(writer_model(), "claude-haiku-5-5");
+        assert_eq!(answer_model(), "claude-haiku-5-5");
         env::set_var("OPENAI_API_KEY", "sk-test");
         assert_eq!(writer_provider(), "openai");
-        assert_eq!(writer_model(), "gpt-4.1-mini");
-        assert_eq!(answer_model(), "gpt-4.1");
-        env::set_var("CLICKER_WRITER_PROVIDER", " Anthropic ");
+        assert_eq!(answer_model(), "gpt-6-luna");
+        env::set_var("POINTER_LLM", "claude");
         assert_eq!(writer_provider(), "anthropic");
-        assert_eq!(writer_model(), "claude-haiku-4-5");
+        env::set_var("CLICKER_WRITER_PROVIDER", " OpenAI ");
+        assert_eq!(writer_provider(), "openai");
         env::set_var("CLICKER_WRITER_MODEL", "custom");
         assert_eq!(writer_model(), "custom");
         for (n, v) in saved {

@@ -16,6 +16,7 @@ mod ipc;
 mod live;
 mod runner;
 mod settings;
+mod tts;
 mod voice;
 
 use std::io::BufRead;
@@ -106,6 +107,7 @@ fn main() {
     std::fs::create_dir_all(&cwd).ok();
     let dotenv = cwd.join(".env");
     let out = Emitter::new(std::io::stdout());
+    voice::attach(out.clone());
     if let Err(e) = wcore::config::load_dotenv(&dotenv) {
         out.line(format!("could not read .env: {e}"));
     }

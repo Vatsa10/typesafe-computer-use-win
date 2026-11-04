@@ -585,7 +585,7 @@ pub fn speak(text: &str) -> bool {
     if text.trim().is_empty() || !wcore::config::speak_answers() {
         return false;
     }
-    platform::speech::speak(&platform::speech::speakable(text))
+    crate::tts::speak_async(&platform::speech::speakable(text))
 }
 
 #[cfg(test)]

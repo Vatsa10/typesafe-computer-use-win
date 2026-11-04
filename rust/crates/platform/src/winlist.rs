@@ -313,6 +313,21 @@ pub fn activate_window(hwnd: isize, timeout_ms: u64) -> bool {
     }
 }
 
+/// Ask one window to close, by its exact handle: the window's own close request, never a kill.
+/// Whether it closes is up to the window (a document with unsaved work will ask first).
+pub fn close_window(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    unsafe {
+        PostMessageW(
+            HWND(hwnd as *mut core::ffi::c_void),
+            WM_CLOSE,
+            windows::Win32::Foundation::WPARAM(0),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

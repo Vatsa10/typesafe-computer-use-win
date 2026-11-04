@@ -96,8 +96,14 @@ impl Tasks {
     }
 
     fn save(&self) {
-        let rows: Vec<Value> = self
-            .records()
+        let records = self.records();
+        self.write_registry(&records);
+    }
+
+    /// Write the registry while the caller holds the records lock. A status is only visible to
+    /// other threads together with the file that says so, and writers never share the temp file.
+    fn write_registry(&self, records: &[TaskRecord]) {
+        let rows: Vec<Value> = records
             .iter()
             .map(|r| {
                 json!({ "id": r.id, "title": r.title, "instructions": r.instructions,
@@ -265,8 +271,10 @@ impl Tasks {
                         r.summary = clip(&summary, 600);
                         me.announce(r);
                     }
+                    // Saved before the lock is released: a reader that sees the task finished
+                    // (running_count, wait_idle) must also find it finished on disk.
+                    me.write_registry(&records);
                 }
-                me.save();
             });
         if spawned.is_err() {
             let mut records = self.records();

@@ -66,7 +66,12 @@ screenshot to a frontier model to plan a click.
    | key | needed for | where to get it |
    |---|---|---|
    | `TYPESAFE_API_KEY` | every decision (**required**) | [typesafe.ai](https://docs.typesafe.ai) |
-   | `OPENAI_API_KEY` | spoken answers, teaching, typing free text | [platform.openai.com](https://platform.openai.com) |
+   | `OPENAI_API_KEY` | the assistant, answers, teaching and typing free text, on **GPT-6 Luna** (about $0.10 in / $0.50 out per 1M tokens) | [platform.openai.com](https://platform.openai.com) |
+   | `ANTHROPIC_API_KEY` | the same jobs on **Claude Haiku 5.5** ($0.10 in / $0.50 out per 1M tokens) | [platform.claude.com](https://platform.claude.com) |
+
+   You need one of the last two. Pick which one in Settings, or set `POINTER_LLM=openai` or
+   `claude`. Unset, Pointer uses OpenAI if its key exists, else Claude. With neither, it stays in
+   Quick mode. The choice applies without a restart.
 
    Keys are saved to `%LOCALAPPDATA%\pointer\.env` and never shown again, not even to you.
 3. **Try it.** Hover over something, press `Right Alt`, and ask *"what is this?"*
@@ -162,7 +167,7 @@ graph LR
 4. **Stop** on `done`, low confidence, two no-ops in a row, your abort, or the step limit. Then
    read the final screen and say what happened.
 
-The writer model (OpenAI) is used only where free text is unavoidable: composing text to type,
+The writer model (GPT-6 Luna or Claude Haiku 5.5, following your choice) is used only where free text is unavoidable: composing text to type,
 proposing a URL for a site Pointer doesn't know, and answering or teaching from the screen.
 
 ### Sites and apps, learned from your machine
@@ -203,7 +208,10 @@ Everything is in the Settings tab. These are the ones worth knowing:
 | `CLICKER_EMAIL` | none | enables "type my email" |
 | `CLICKER_CATALOG` | on | `0` offers only the pinned sites, ignoring your browser |
 | `CLICKER_CATALOG_TITLES` | on | `0` sends bare domains, never page titles |
-| `CLICKER_WRITER_MODEL` / `CLICKER_ANSWER_MODEL` | `gpt-4.1-mini` / `gpt-4.1` | writer and answer models |
+| `POINTER_LLM` | `openai`, else `claude` | which provider runs the assistant and the writer |
+| `POINTER_AGENT_MODEL` | `gpt-6-luna` / `claude-haiku-5-5` | assistant model, overriding the provider default |
+| `POINTER_AGENT_BASE_URL` | OpenAI | OpenAI provider only: any OpenAI-compatible server |
+| `CLICKER_WRITER_MODEL` / `CLICKER_ANSWER_MODEL` | `gpt-6-luna` / `claude-haiku-5-5` | writer and answer models, overriding the provider default |
 | `POINTER_HOME` | `%LOCALAPPDATA%\pointer` | where `.env` and `runs\` live |
 
 ## Every run is saved

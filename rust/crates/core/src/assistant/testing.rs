@@ -50,6 +50,7 @@ pub fn calling(calls: Vec<ToolCall>) -> Script {
     Script::Reply(ChatReply {
         content: String::new(),
         tool_calls: calls,
+        ..Default::default()
     })
 }
 
@@ -57,6 +58,7 @@ pub fn saying(text: &str) -> Script {
     Script::Reply(ChatReply {
         content: text.into(),
         tool_calls: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -116,6 +118,7 @@ impl Chat for FakeChat {
             None => Ok(ChatReply {
                 content: "ok".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             }),
         }
     }
@@ -325,6 +328,13 @@ impl Harness {
             limits,
             confirms: Pending::new(),
             cameras: Pending::new(),
+            documents: Arc::new(crate::documents::Documents::new(
+                home.join("docs-home"),
+                vec![profile.clone()],
+                "",
+            )),
+            writer: Arc::new(|| Err("no writer".into())),
+            autonomy_full: Arc::new(|| false),
         });
         Self {
             svc,

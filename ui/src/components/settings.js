@@ -21,8 +21,9 @@ const GROUPS = [
 // know is only sent on Save if the user changed it.
 const ASSIST = [
   { key: "POINTER_MODE", label: "Mode" },
-  { key: "POINTER_AGENT_MODEL", label: "Agent model", fallback: "gpt-4.1", help: "The model that holds the conversation." },
-  { key: "POINTER_AGENT_BASE_URL", label: "Agent base URL", fallback: "https://api.openai.com/v1", help: "Any OpenAI-compatible server: OpenAI, Groq, OpenRouter or one on this machine." },
+  { key: "POINTER_LLM", label: "Assistant model" },
+  { key: "POINTER_AGENT_MODEL", label: "Agent model", fallback: "gpt-6-luna or claude-haiku-5-5", help: "Overrides the default model of the chosen provider." },
+  { key: "POINTER_AGENT_BASE_URL", label: "Agent base URL", fallback: "https://api.openai.com/v1", help: "OpenAI provider only: any OpenAI-compatible server, such as Groq, OpenRouter or one on this machine." },
   { key: "POINTER_AGENT_API_KEY", label: "Agent API key", secret: true, help: "Falls back to OPENAI_API_KEY. With no key at all, Pointer stays in Quick mode." },
 ];
 const ASSIST_KEYS = new Set(ASSIST.map((a) => a.key));
@@ -30,6 +31,11 @@ const MODE_COST = {
   assistant: "Assistant: a parent agent talks with you and runs tasks, so each turn costs model tokens.",
   quick: "Quick: Pointer routes with TypeSafe only, about $0.0002 a step.",
 };
+// Prices are per million tokens. Luna's come from third-party sources, so they are "about".
+const LLM_CHOICES = [
+  { value: "openai", text: "OpenAI GPT-6 Luna", key: "OPENAI_API_KEY", keyName: "OpenAI API key", price: "about $0.10 in and $0.50 out per 1M tokens" },
+  { value: "claude", text: "Claude Haiku 5.5", key: "ANTHROPIC_API_KEY", keyName: "Anthropic API key", price: "$0.10 in and $0.50 out per 1M tokens" },
+];
 const WAKE_HELP =
   "Say Hey Pointer to start talking. While this is on, Pointer keeps your microphone open all the time so it can hear the phrase. Audio is analysed on this computer and is never sent anywhere or saved. Turning it on downloads a 17 MB model once.";
 
@@ -38,7 +44,58 @@ const GROUP_NOTES = {
   hotkeys: "Hotkey changes take effect after Pointer restarts.",
 };
 
+// "My answers": what only you can say on a form (salary, visa, gender and the like). Kept in
+// my-answers.json on this computer; Pointer uses them to fill forms without asking, and never
+// guesses them from a resume. An empty field is left empty on the form. Saved on its own button.
+function createAnswersSection() {
+  const fields = new Map();
+  const status = h("span", { class: "helper", "aria-live": "polite" });
+  const saveBtn = h("button", { class: "btn", type: "button", text: "Save my answers" });
+  const card = h("div", { class: "card" });
+  const element = h(
+    "fieldset",
+    { class: "group", id: "my-answers" },
+    h("legend", { text: "My answers" }),
+    h("p", { class: "helper group-note", text: "Used to fill forms for you without asking. Stored only on this computer. Leave one empty and Pointer leaves it blank on a form, or asks once if the form requires it." }),
+    card,
+    h("div", { class: "settings-foot" }, saveBtn, status),
+  );
+
+  function paint(list) {
+    fields.clear();
+    card.replaceChildren();
+    for (const f of list) {
+      const id = "answer-" + f.key;
+      const input = h("input", { class: "field", id, type: "text", autocomplete: "off", spellcheck: "false" });
+      input.value = f.value || "";
+      fields.set(f.key, input);
+      card.append(h("div", { class: "setting" }, h("label", { for: id, text: f.label }), input));
+    }
+  }
+
+  async function load() {
+    const result = await call("get_answers");
+    if (result && Array.isArray(result.fields)) paint(result.fields);
+  }
+
+  saveBtn.addEventListener("click", async () => {
+    const values = {};
+    for (const [key, input] of fields) values[key] = input.value.trim();
+    saveBtn.disabled = true;
+    const result = await call("set_answers", { values });
+    saveBtn.disabled = false;
+    if (result && Array.isArray(result.fields)) {
+      paint(result.fields);
+      status.textContent = "Saved.";
+      toast({ kind: "success", title: "My answers saved", body: "Pointer will use them on forms." });
+    }
+  });
+
+  return { element, load };
+}
+
 export function createSettingsView() {
+  const answers = createAnswersSection();
   const scroll = h("div", { class: "settings-scroll" });
   const save = h("button", { class: "btn accent", type: "button", html: icon("save") + "<span>Save</span>" });
   const revert = h("button", { class: "btn", type: "button", text: "Discard changes" });
@@ -76,20 +133,44 @@ export function createSettingsView() {
     return agentKey ? "assistant" : "quick";
   }
 
+  function llmNow(row) {
+    const chosen = (row.value || "").toLowerCase();
+    if (chosen === "openai" || chosen === "claude") return chosen;
+    const isSet = (key) => rows.some((r) => r.key === key && /^set/i.test(r.fallback || ""));
+    if (isSet("OPENAI_API_KEY") || isSet("POINTER_AGENT_API_KEY")) return "openai";
+    return isSet("ANTHROPIC_API_KEY") ? "claude" : "openai";
+  }
+
   function modeRow(row) {
+    return choiceRow(row, "mode", "Mode", [
+      { value: "assistant", text: "Assistant" },
+      { value: "quick", text: "Quick" },
+    ], modeNow(row), (v) => MODE_COST[v]);
+  }
+
+  function llmRow(row) {
+    const keySet = (key) => rows.some((r) => r.key === key && /^set/i.test(r.fallback || ""));
+    return choiceRow(row, "llm", "Assistant model", LLM_CHOICES, llmNow(row), (v) => {
+      const c = LLM_CHOICES.find((x) => x.value === v);
+      const state = keySet(c.key) || (v === "openai" && keySet("POINTER_AGENT_API_KEY")) ? "key is set" : "no key yet: add the " + c.keyName + " above";
+      return c.text + ": " + c.price + ". The " + c.keyName + " " + (state === "key is set" ? "is set." : "is missing; " + state + ".") + " Typing, answers and teaching use the same provider. Applies without a restart.";
+    });
+  }
+
+  function choiceRow(row, id, label, options, initial, describe) {
     const field = { value: row.value || "" }; // what Save will send; blank leaves the core's default alone
     inputs.set(row.key, field);
-    const note = h("span", { class: "helper", id: "set-mode-help" });
-    const assistant = h("button", { type: "button", role: "radio", "data-mode": "assistant", text: "Assistant" });
-    const quick = h("button", { type: "button", role: "radio", "data-mode": "quick", text: "Quick" });
-    const group = h("div", { class: "segmented", role: "radiogroup", "aria-label": "Mode", "aria-describedby": "set-mode-help" }, assistant, quick);
-    let current = modeNow(row);
+    const note = h("span", { class: "helper", id: `set-${id}-help` });
+    const buttons = options.map((o) => h("button", { type: "button", role: "radio", "data-value": o.value, text: o.text }));
+    const group = h("div", { class: "segmented", role: "radiogroup", "aria-label": label, "aria-describedby": `set-${id}-help` }, ...buttons);
+    let current = initial;
     function paint() {
-      assistant.setAttribute("aria-checked", String(current === "assistant"));
-      quick.setAttribute("aria-checked", String(current === "quick"));
-      assistant.tabIndex = current === "assistant" ? 0 : -1;
-      quick.tabIndex = current === "quick" ? 0 : -1;
-      note.textContent = MODE_COST[current];
+      buttons.forEach((b, i) => {
+        const on = options[i].value === current;
+        b.setAttribute("aria-checked", String(on));
+        b.tabIndex = on ? 0 : -1;
+      });
+      note.textContent = describe(current);
     }
     function choose(next) {
       current = next;
@@ -97,16 +178,18 @@ export function createSettingsView() {
       paint();
       syncDirty();
     }
-    assistant.addEventListener("click", () => choose("assistant"));
-    quick.addEventListener("click", () => choose("quick"));
+    buttons.forEach((b, i) => b.addEventListener("click", () => choose(options[i].value)));
     group.addEventListener("keydown", (event) => {
       if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
       event.preventDefault();
-      choose(current === "assistant" ? "quick" : "assistant");
-      (current === "assistant" ? assistant : quick).focus();
+      const at = options.findIndex((o) => o.value === current);
+      const step = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
+      const next = (at + step + options.length) % options.length;
+      choose(options[next].value);
+      buttons[next].focus();
     });
     paint();
-    return h("div", { class: "setting" }, h("label", { id: "set-mode-label", text: row.label }), note, group);
+    return h("div", { class: "setting" }, h("label", { id: `set-${id}-label`, text: row.label }), note, group);
   }
 
   function toggleRow(title, help, checked, onChange, id) {
@@ -146,7 +229,7 @@ export function createSettingsView() {
       "fieldset",
       { class: "group", id: "group-assistant" },
       h("legend", { text: "Assistant" }),
-      h("div", { class: "card" }, list.map((row) => (row.key === "POINTER_MODE" ? modeRow(row) : settingRow(row))), wake.element, camera.element),
+      h("div", { class: "card" }, list.map((row) => (row.key === "POINTER_MODE" ? modeRow(row) : row.key === "POINTER_LLM" ? llmRow(row) : settingRow(row))), wake.element, camera.element),
     );
   }
 
@@ -217,6 +300,7 @@ export function createSettingsView() {
       );
       scroll.append(fieldset);
     }
+    scroll.append(answers.element);
     syncDirty();
   }
 
@@ -245,6 +329,7 @@ export function createSettingsView() {
     } catch {
       /* no shell bridge: the toggles show their defaults */
     }
+    await answers.load();
     render();
   }
 

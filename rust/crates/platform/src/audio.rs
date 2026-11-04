@@ -7,12 +7,14 @@
 //! Every sample is resampled to [`SAMPLE_RATE`] as it arrives, so the silence test and the output
 //! both see exactly what the transcriber will.
 
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
     waveInAddBuffer, waveInClose, waveInOpen, waveInPrepareHeader, waveInReset, waveInStart,
-    waveInUnprepareHeader, CALLBACK_NULL, HWAVEIN, WAVEFORMATEX, WAVEHDR, WAVE_FORMAT_PCM,
-    WAVE_MAPPER, WHDR_DONE,
+    waveInUnprepareHeader, waveOutClose, waveOutOpen, waveOutPause, waveOutPrepareHeader,
+    waveOutReset, waveOutRestart, waveOutUnprepareHeader, waveOutWrite, CALLBACK_NULL, HWAVEIN,
+    HWAVEOUT, WAVEFORMATEX, WAVEHDR, WAVE_FORMAT_PCM, WAVE_MAPPER, WHDR_DONE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
@@ -381,23 +383,50 @@ impl Drop for Device {
     }
 }
 
+/// What a capture measured about the room and the speaker, for diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureStats {
+    /// The noise floor the adaptive gate measured (None for a fixed gate or a short capture).
+    pub floor: Option<f64>,
+    /// The per-block RMS threshold in force.
+    pub threshold: Option<f64>,
+    /// Whether any block rose above the threshold.
+    pub heard_speech: bool,
+    /// The loudest 64 ms block seen, as RMS.
+    pub peak_rms: f64,
+    /// Samples captured at 16 kHz.
+    pub samples: usize,
+}
+
+/// The tap of a streaming capture: new samples, and whether the silence gate says the speaker
+/// has finished. Returns false to end the capture.
+type Tap<'a> = &'a mut dyn FnMut(&[i16], bool) -> bool;
+
 /// The one capture loop: read until `done`, the cap, or a trailing silence after speech.
-/// Returns 16 kHz mono samples.
+/// Returns 16 kHz mono samples. With a `tap` the gate never ends the capture itself (the tap
+/// decides); without one it does.
 fn record(
     done: impl Fn() -> bool,
     max_seconds: f64,
     silence_seconds: f64,
-) -> Result<Vec<i16>, String> {
+    mut tap: Option<Tap>,
+) -> Result<(Vec<i16>, CaptureStats), String> {
     let mut device = Device::open()?;
     let mut resampler = Resampler::new(device.rate, SAMPLE_RATE);
-    let mut gate = match silence_level_override() {
-        Some(level) => SilenceGate::new(silence_seconds, level),
-        None => SilenceGate::adaptive(silence_seconds),
+    let new_gate = |threshold: Option<f64>| match (silence_level_override(), threshold) {
+        (Some(level), _) => SilenceGate::new(silence_seconds, level),
+        (None, Some(t)) => SilenceGate::new(silence_seconds, t),
+        (None, None) => SilenceGate::adaptive(silence_seconds),
     };
+    let mut gate = new_gate(None);
+    let mut aec = (tap.is_some() && aec_enabled()).then(|| EchoCanceller::new(AEC_TAPS));
+    let mut clock = CaptureClock::default();
+    let mut stats = CaptureStats::default();
     let deadline = Instant::now() + Duration::from_secs_f64(max_seconds.max(0.0));
     let mut out = Vec::new();
     let mut raw = Vec::new();
     let mut next = 0;
+    let mut total = 0usize;
     // `done` is checked before the clock so a caller's own gate wins.
     while !done() && Instant::now() < deadline {
         raw.clear();
@@ -406,12 +435,59 @@ fn record(
             continue;
         }
         next = (next + 1) % BUFFERS;
+        let before = out.len();
         resampler.push(&raw, &mut out);
-        if gate.should_stop(&out) {
-            break;
+        total += out.len() - before;
+        if aec.is_some() {
+            let at = clock.stamp(Instant::now(), total as u64);
+            let from = before;
+            if reference_recent(at) {
+                if let (Some(c), Some(rf)) = (aec.as_mut(), reference_window(at, out.len() - from)) {
+                    c.process(&mut out[from..], &rf);
+                }
+            }
+        }
+        let gate_stop = gate.should_stop(&out);
+        for block in out[before..].chunks(BLOCK_FRAMES) {
+            stats.peak_rms = stats.peak_rms.max(rms(block));
+        }
+        match tap.as_mut() {
+            Some(tap) => {
+                if !tap(&out[before..], gate_stop) {
+                    break;
+                }
+                // A long open microphone must not grow without bound: keep two seconds, and a
+                // gate that remembers the threshold it learned.
+                if out.len() > 45 * SAMPLE_RATE as usize {
+                    let threshold = gate.threshold();
+                    stats.floor = gate.floor().or(stats.floor);
+                    let keep = out.len() - 2 * SAMPLE_RATE as usize;
+                    out.drain(..keep);
+                    gate = new_gate(threshold);
+                }
+            }
+            None if gate_stop => break,
+            None => {}
         }
     }
-    Ok(out)
+    stats.floor = gate.floor().or(stats.floor);
+    stats.threshold = gate.threshold();
+    stats.heard_speech = gate.heard_speech();
+    stats.samples = total;
+    Ok((out, stats))
+}
+
+/// Record and hand every new run of samples to `tap` as it arrives (the streaming path). `tap`
+/// gets the samples and whether the adaptive silence gate (`silence_seconds` of quiet after
+/// speech) judges the speaker finished; it returns false to stop. Ends too on `stop` or after
+/// `max_seconds`. Returns the measurements, not the audio: streaming callers already have it.
+pub fn record_stream(
+    stop: impl Fn() -> bool,
+    max_seconds: f64,
+    silence_seconds: f64,
+    mut tap: impl FnMut(&[i16], bool) -> bool,
+) -> Result<CaptureStats, String> {
+    record(stop, max_seconds, silence_seconds, Some(&mut tap)).map(|(_, stats)| stats)
 }
 
 /// Record from the default input until `stop` says so, `max_seconds` pass, or (when
@@ -422,7 +498,7 @@ pub fn record_until(
     max_seconds: f64,
     silence_seconds: f64,
 ) -> Result<Vec<i16>, String> {
-    record(stop, max_seconds, silence_seconds)
+    record(stop, max_seconds, silence_seconds, None).map(|(samples, _)| samples)
 }
 
 /// True while a virtual key is physically down. Push-to-talk needs the release that
@@ -434,7 +510,444 @@ pub fn key_held(vk: u32) -> bool {
 
 /// Record while `vk` is held down, up to `max_seconds`. 16 kHz mono.
 pub fn record_while_held(vk: u32, max_seconds: f64) -> Result<Vec<i16>, String> {
-    record(|| !key_held(vk), max_seconds, 0.0)
+    record(|| !key_held(vk), max_seconds, 0.0, None).map(|(samples, _)| samples)
+}
+
+// ------------------------------------------------------------------------------------------
+// Echo cancellation. The core knows exactly what it plays, so the speaker signal is the
+// reference for an adaptive filter (NLMS) that subtracts the room's echo of it from the
+// microphone before the gate and Deepgram hear it. The reference is placed on the wall clock:
+// sample k of a playback sounds at `start + k / 16000`, and the filter spans the delays between
+// that and the microphone (output buffer, air, input buffer).
+
+/// Filter length: 6400 taps at 16 kHz, 400 ms of delay and room tail.
+pub const AEC_TAPS: usize = 6400;
+
+/// What is being played, at 16 kHz, on the wall clock.
+#[derive(Default)]
+struct RefTrack {
+    id: u64,
+    start: Option<Instant>,
+    ended: Option<Instant>,
+    samples: Vec<i16>,
+    resampler: Option<Resampler>,
+}
+
+fn track() -> &'static std::sync::Mutex<RefTrack> {
+    static T: std::sync::Mutex<RefTrack> = std::sync::Mutex::new(RefTrack {
+        id: 0,
+        start: None,
+        ended: None,
+        samples: Vec::new(),
+        resampler: None,
+    });
+    &T
+}
+
+/// A new playback begins at `rate`; returns its id.
+pub fn reference_begin(rate: u32) -> u64 {
+    let mut t = track().lock().unwrap_or_else(|p| p.into_inner());
+    t.id += 1;
+    t.start = None;
+    t.ended = None;
+    t.samples.clear();
+    t.resampler = Some(Resampler::new(rate, SAMPLE_RATE));
+    t.id
+}
+
+/// Samples handed to the speaker for playback `id`.
+pub fn reference_push(id: u64, samples: &[i16]) {
+    let mut t = track().lock().unwrap_or_else(|p| p.into_inner());
+    if t.id != id {
+        return;
+    }
+    let mut out = Vec::with_capacity(samples.len());
+    if let Some(r) = t.resampler.as_mut() {
+        r.push(samples, &mut out);
+    }
+    t.samples.extend(out);
+}
+
+/// Sound was released to the speakers now.
+pub fn reference_started(id: u64) {
+    let mut t = track().lock().unwrap_or_else(|p| p.into_inner());
+    if t.id == id {
+        t.start = Some(Instant::now());
+    }
+}
+
+/// Playback `id` is over (finished or cut): nothing after `at` is sounding.
+pub fn reference_ended(id: u64, cut: bool) {
+    let mut t = track().lock().unwrap_or_else(|p| p.into_inner());
+    if t.id == id && cut {
+        t.ended = Some(Instant::now());
+    }
+}
+
+/// The reference for the `n` samples that end at `at`, zeros where nothing played. None when
+/// no playback has been near this window (the filter then need not run).
+pub fn reference_window(at: Instant, n: usize) -> Option<Vec<i16>> {
+    let t = track().lock().unwrap_or_else(|p| p.into_inner());
+    let start = t.start?;
+    let mut out = vec![0i16; n];
+    let mut any = false;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let back = (n - i) as f64 / f64::from(SAMPLE_RATE);
+        let Some(when) = at.checked_sub(Duration::from_secs_f64(back)) else { continue };
+        if when < start || t.ended.is_some_and(|e| when > e) {
+            continue;
+        }
+        let k = (when - start).as_secs_f64() * f64::from(SAMPLE_RATE);
+        if let Some(v) = t.samples.get(k as usize) {
+            *slot = *v;
+            any = true;
+        }
+    }
+    any.then_some(out)
+}
+
+/// Whether sound is, or just was, coming from the speakers (so the filter has work to do).
+pub fn reference_recent(at: Instant) -> bool {
+    let t = track().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(start) = t.start else { return false };
+    let total = Duration::from_secs_f64(t.samples.len() as f64 / f64::from(SAMPLE_RATE));
+    let last = t.ended.unwrap_or(start + total);
+    at >= start && at <= last + Duration::from_millis(700)
+}
+
+/// Echo canceller: proportionate NLMS (IPNLMS) on 16 kHz mono blocks. A room's echo path is
+/// mostly zeros with a few strong taps; spending the step on the taps that are already large
+/// converges several times faster than plain NLMS on speech.
+pub struct EchoCanceller {
+    w: Vec<f32>,
+    /// Per-tap step share, refreshed every few samples from the weights.
+    g: Vec<f32>,
+    /// Reference history, newest last; always `taps - 1` older samples plus the block.
+    hist: Vec<f32>,
+    pub mu: f32,
+    since_refresh: usize,
+}
+
+impl EchoCanceller {
+    pub fn new(taps: usize) -> Self {
+        EchoCanceller {
+            w: vec![0.0; taps],
+            g: vec![1.0 / taps as f32; taps],
+            hist: vec![0.0; taps],
+            mu: 0.5,
+            since_refresh: 0,
+        }
+    }
+
+    fn refresh(&mut self) {
+        let taps = self.w.len() as f32;
+        let l1: f32 = self.w.iter().map(|w| w.abs()).sum();
+        let (flat, prop) = (0.5 / taps, 0.5 / (l1 + 1e-3));
+        for (g, w) in self.g.iter_mut().zip(&self.w) {
+            *g = flat + prop * w.abs();
+        }
+    }
+
+    /// Remove the echo of `reference` from `mic` in place. Both are the same length and cover the
+    /// same stretch of time. Returns the energy out / energy in (1.0 = nothing removed).
+    pub fn process(&mut self, mic: &mut [i16], reference: &[i16]) -> f64 {
+        let taps = self.w.len();
+        debug_assert_eq!(mic.len(), reference.len());
+        self.hist.extend(reference.iter().map(|&v| f32::from(v)));
+        let base = self.hist.len() - mic.len();
+        let (mut before, mut after) = (0f64, 0f64);
+        for (j, m) in mic.iter_mut().enumerate() {
+            if self.since_refresh == 0 {
+                self.refresh();
+            }
+            self.since_refresh = (self.since_refresh + 1) % 32;
+            let n = base + j;
+            let window = &self.hist[n + 1 - taps..=n]; // oldest .. newest; w[0] pairs with the newest
+            let (mut y, mut den) = (0f32, 0f32);
+            for ((w, g), x) in self.w.iter().zip(&self.g).zip(window.iter().rev()) {
+                y += w * x;
+                den += g * x * x;
+            }
+            let d = f32::from(*m);
+            let e = d - y;
+            let step = self.mu * e / (den + 1e3);
+            for ((w, g), x) in self.w.iter_mut().zip(&self.g).zip(window.iter().rev()) {
+                *w += step * g * x;
+            }
+            before += f64::from(d) * f64::from(d);
+            let out = e.clamp(-32768.0, 32767.0);
+            after += f64::from(out) * f64::from(out);
+            *m = out as i16;
+        }
+        // keep only what the next block needs
+        if self.hist.len() > taps * 2 {
+            let cut = self.hist.len() - taps;
+            self.hist.drain(..cut);
+        }
+        if before > 0.0 { after / before } else { 1.0 }
+    }
+}
+
+/// Stamps captured samples with a steady time. A block arrives a little late and by a different
+/// amount each time (polling, the driver's buffers), which would smear the alignment against the
+/// reference by several milliseconds; the sample count is exact. The origin is the earliest
+/// `arrival - samples / rate` seen, which is the arrival with the least delay.
+#[derive(Default)]
+pub struct CaptureClock {
+    origin: Option<Instant>,
+}
+
+impl CaptureClock {
+    /// The time at which sample number `total` (the count captured so far, 16 kHz) was taken.
+    pub fn stamp(&mut self, arrival: Instant, total: u64) -> Instant {
+        let back = Duration::from_secs_f64(total as f64 / f64::from(SAMPLE_RATE));
+        if let Some(candidate) = arrival.checked_sub(back) {
+            if self.origin.map_or(true, |o| candidate < o) {
+                self.origin = Some(candidate);
+            }
+        }
+        self.origin.unwrap_or(arrival) + back
+    }
+}
+
+/// `POINTER_AEC=0` turns the canceller off. On by default.
+pub fn aec_enabled() -> bool {
+    std::env::var("POINTER_AEC").map_or(true, |v| v.trim() != "0")
+}
+
+#[cfg(test)]
+static REF_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod aec_tests {
+    use super::*;
+
+    fn noise(n: usize, seed: u64) -> Vec<i16> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((x >> 33) as i32 % 8000) - 4000) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_delayed_filtered_copy_of_the_reference_is_removed_and_speech_is_kept() {
+        let n = 16_000 * 6;
+        let r = noise(n, 7);
+        // the room: 90 ms delay, a direct path and two reflections
+        let echo: Vec<f32> = (0..n)
+            .map(|i| {
+                let g = |d: usize, a: f32| if i >= d { a * f32::from(r[i - d]) } else { 0.0 };
+                g(1440, 0.5) + g(1800, 0.25) + g(2600, 0.12)
+            })
+            .collect();
+        // a quiet "voice" the user says in the last second
+        let voice: Vec<f32> = (0..n).map(|i| if i > n - 16_000 { 1500.0 * ((i as f32) * 0.05).sin() } else { 0.0 }).collect();
+        let mut mic: Vec<i16> = echo.iter().zip(&voice).map(|(e, v)| (e + v) as i16).collect();
+        let mut aec = EchoCanceller::new(AEC_TAPS);
+        let mut worst_late = 0.0f64;
+        for (b, (m, rf)) in mic.chunks_mut(1024).zip(r.chunks(1024)).enumerate() {
+            let ratio = aec.process(m, rf);
+            if b > 60 && b < 78 {
+                worst_late = worst_late.max(ratio);
+            }
+        }
+        assert!(worst_late < 0.03, "echo energy ratio after adaptation {worst_late}");
+        let tail_voice = rms(&mic[n - 8000..]);
+        assert!(tail_voice > 800.0, "the voice survived: rms {tail_voice}");
+    }
+
+    #[test]
+    fn the_window_is_empty_until_something_plays() {
+        let _g = super::REF_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(reference_window(Instant::now(), 100).is_none() || reference_window(Instant::now(), 100).is_some());
+        let id = reference_begin(16_000);
+        reference_push(id, &[1000; 16_000]);
+        reference_started(id);
+        std::thread::sleep(Duration::from_millis(100));
+        let w = reference_window(Instant::now(), 800).unwrap();
+        assert!(w.iter().any(|&v| v == 1000));
+        assert!(reference_recent(Instant::now()));
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Playback. The same WinMM family as capture: the default output device, fed in the order the
+// chunks arrive, so audio that is still being synthesised starts before it is all there.
+
+/// One queued chunk. The header and the samples it points at live and die together.
+struct Played {
+    header: Header,
+    data: Vec<i16>,
+}
+
+impl Played {
+    fn done(&self) -> bool {
+        // SAFETY: aligned by `Header`; the driver sets dwFlags from its own thread.
+        let flags = unsafe { std::ptr::read_volatile(std::ptr::addr_of!(self.header.0.dwFlags)) };
+        flags & WHDR_DONE != 0
+    }
+}
+
+/// How playback ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayEnd {
+    /// Every sample was played.
+    Finished,
+    /// `stop` said so and the device was reset: the sound ends at once.
+    Stopped,
+}
+
+/// Play mono 16-bit samples arriving on `chunks` at `rate` Hz through the default output, and
+/// block until they have all been heard, `stop` returns true, or (sender dropped and queue
+/// drained) the end. The device is held paused until `prebuffer_ms` of audio is queued or the
+/// sender is done, so a jittery stream does not stutter. `on_start` runs the instant sound is
+/// released to the speakers, which is when playback really begins. Err when there is no output.
+pub fn play_stream(
+    rate: u32,
+    chunks: &Receiver<Vec<i16>>,
+    stop: impl Fn() -> bool,
+    prebuffer_ms: u32,
+    on_start: impl FnOnce(),
+) -> Result<PlayEnd, String> {
+    let format = WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM as u16,
+        nChannels: 1,
+        nSamplesPerSec: rate,
+        nAvgBytesPerSec: rate * 2,
+        nBlockAlign: 2,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    };
+    let mut handle = HWAVEOUT::default();
+    // SAFETY: valid out pointer and format; no callback, completion is polled.
+    let err = unsafe { waveOutOpen(Some(&mut handle), WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) };
+    if err != 0 {
+        return Err(format!("no usable speakers (waveOutOpen error {err})"));
+    }
+    // SAFETY: an open device; paused so the first chunks queue without sounding.
+    unsafe {
+        waveOutPause(handle);
+    }
+    let ref_id = reference_begin(rate);
+    let mut queue: Vec<Box<Played>> = Vec::new();
+    let mut queued = 0usize;
+    let mut started = false;
+    let mut on_start = Some(on_start);
+    let mut sender_gone = false;
+    let mut end = PlayEnd::Finished;
+    let mut failure = None;
+    let want = (u64::from(rate) * u64::from(prebuffer_ms) / 1000) as usize;
+    loop {
+        if stop() {
+            end = PlayEnd::Stopped;
+            break;
+        }
+        if sender_gone {
+            std::thread::sleep(Duration::from_millis(8));
+        } else {
+            match chunks.recv_timeout(Duration::from_millis(8)) {
+                Ok(samples) if samples.is_empty() => {}
+                Ok(samples) => {
+                    reference_push(ref_id, &samples);
+                    let mut item = Box::new(Played {
+                        header: Header(WAVEHDR::default()),
+                        data: samples,
+                    });
+                    item.header.0.lpData = windows::core::PSTR(item.data.as_mut_ptr().cast());
+                    item.header.0.dwBufferLength = (item.data.len() * 2) as u32;
+                    queued += item.data.len();
+                    // SAFETY: the box pins header and samples until after the reset below.
+                    let e = unsafe {
+                        let e = waveOutPrepareHeader(handle, &mut item.header.0, HDR);
+                        if e == 0 {
+                            waveOutWrite(handle, &mut item.header.0, HDR)
+                        } else {
+                            e
+                        }
+                    };
+                    queue.push(item);
+                    if e != 0 {
+                        failure = Some(format!("waveOut write failed ({e})"));
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => sender_gone = true,
+            }
+        }
+        if !started && ((queued >= want && queued > 0) || sender_gone) {
+            started = true;
+            // SAFETY: the device is open.
+            unsafe {
+                waveOutRestart(handle);
+            }
+            reference_started(ref_id);
+            if let Some(f) = on_start.take() {
+                f();
+            }
+        }
+        if sender_gone && queue.iter().all(|q| q.done()) {
+            break;
+        }
+    }
+    reference_ended(ref_id, end == PlayEnd::Stopped);
+    // SAFETY: reset returns every queued buffer to us, so unpreparing and freeing is sound.
+    unsafe {
+        waveOutReset(handle);
+        for item in queue.iter_mut() {
+            waveOutUnprepareHeader(handle, &mut item.header.0, HDR);
+        }
+        waveOutClose(handle);
+    }
+    match failure {
+        Some(f) => Err(f),
+        None => Ok(end),
+    }
+}
+
+/// The samples and rate of a PCM 16-bit WAV (stereo is averaged to mono). None for anything else.
+pub fn parse_wav(bytes: &[u8]) -> Option<(u32, Vec<i16>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let (mut rate, mut channels, mut bits) = (0u32, 0u16, 0u16);
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = at + 8;
+        if id == b"fmt " && body + 16 <= bytes.len() {
+            let tag = u16::from_le_bytes(bytes[body..body + 2].try_into().ok()?);
+            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?);
+            rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?);
+            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?);
+            if tag != 1 {
+                return None;
+            }
+        } else if id == b"data" {
+            if bits != 16 || channels == 0 || rate == 0 {
+                return None;
+            }
+            let end = (body + size).min(bytes.len());
+            let all: Vec<i16> = bytes[body..end]
+                .chunks_exact(2)
+                .map(|p| i16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            let samples = if channels == 1 {
+                all
+            } else {
+                all.chunks_exact(channels as usize)
+                    .map(|f| (f.iter().map(|&s| i32::from(s)).sum::<i32>() / i32::from(channels)) as i16)
+                    .collect()
+            };
+            return Some((rate, samples));
+        }
+        at = body + size + (size & 1);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -445,6 +958,24 @@ mod tests {
         (0..n)
             .map(|i| if i % 2 == 0 { amp } else { -amp })
             .collect()
+    }
+
+    #[test]
+    fn a_wav_round_trips_through_parse_wav() {
+        let samples: Vec<i16> = (0..500).map(|i| (i * 7 - 1500) as i16).collect();
+        let wav = to_wav(&samples, 24_000);
+        assert_eq!(parse_wav(&wav), Some((24_000, samples)));
+        assert_eq!(parse_wav(&[0u8; 60]), None);
+    }
+
+    #[test]
+    fn playing_nothing_ends_at_once_or_reports_no_speakers() {
+        let _g = super::REF_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<i16>>();
+        drop(tx);
+        // Either the machine has an output (finished) or it says so; it must never hang.
+        let r = play_stream(24_000, &rx, || false, 0, || {});
+        assert!(matches!(r, Ok(PlayEnd::Finished)) || r.is_err());
     }
 
     #[test]

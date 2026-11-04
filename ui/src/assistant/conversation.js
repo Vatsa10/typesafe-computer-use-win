@@ -6,7 +6,9 @@
 //     words or more stops Pointer's voice (`interrupt`). The finished sentence goes to `gate`, which
 //     decides whether it should cancel the work (`chat`) or be shown dimmed as "Ignored" (click to send).
 //   - Pointer's own voice, heard back through the mic, is recognised by comparing it with what Pointer
-//     said (the `speech` events) for as long as it speaks and 1.5 s after. See voice-rules.js.
+//     said (the `speech` events) for as long as it speaks and 1.5 s after. See voice-rules.js. The core
+//     also reports when the audio really started and ended (`speech` with `real: true`); the echo
+//     window follows those edges, so it is exact rather than estimated from the text.
 //   - A continuation said within 2.5 s of a request, before any reply has started, is merged into it.
 //
 // Everything outside is injected (the core call, the speech bridge, the clock), so a self-test can
@@ -167,6 +169,30 @@ function createConversation({ call, speech, notify = () => {}, log = () => {}, n
     } else if (m.event === "reply") {
       if (m.text) addItem("pointer", String(m.text));
       if (lastChat) lastChat.replyStarted = true;
+    } else if (m.event === "speech" && m.real && m.ack) {
+      // An acknowledgement clip ("hmm", "okay"): the lowest-priority sound. It joins the echo
+      // history so the clip heard back through the mic is not taken for a request, but it is not a
+      // reply: it does not mark the request as answered and does not count as Pointer speaking.
+      if (m.action === "start") {
+        spoken.text = `${spoken.text} ${String(m.text || "")}`.trim();
+        spoken.endedAt = now();
+      } else if (m.action === "end") {
+        spoken.endedAt = now();
+      }
+    } else if (m.event === "speech" && m.real) {
+      // The audio device's own word on when sound began and ended (no text, no new line). It only
+      // moves the echo window to the true edges; the line itself was announced by the plain
+      // `speech` events that bracket the voice call.
+      if (m.action === "start") {
+        spoken.active = true;
+        spoken.endedAt = 0;
+        cancelRest();
+      } else if (m.action === "end") {
+        spoken.active = false;
+        spoken.endedAt = now();
+        idleCheck();
+      }
+      notify();
     } else if (m.event === "speech") {
       if (m.action === "start") {
         spoken.text = String(m.text || "");

@@ -206,6 +206,15 @@ impl Daemon {
                 let written = settings::save(&self.paths.dotenv, values)?;
                 Ok(json!({ "saved": true, "keys": written }))
             }
+            "get_answers" => Ok(wcore::assistant::answers::describe(&self.answers_home())),
+            "set_answers" => {
+                let values = params
+                    .get("values")
+                    .and_then(Value::as_object)
+                    .ok_or("set_answers needs { values: { key: text } }")?;
+                wcore::assistant::answers::set_fixed(&self.answers_home(), values)?;
+                Ok(wcore::assistant::answers::describe(&self.answers_home()))
+            }
             "hotkeys" => Ok(hotkeys_value()),
             "set_hotkeys" => self.set_hotkeys(params),
             "set_mode" => Ok(self.set_mode(params)),
@@ -213,7 +222,9 @@ impl Daemon {
                 if !self.modes().voice {
                     return Err("voice is off".into());
                 }
-                Ok(json!({ "listening": self.listener.start()? }))
+                let conv = params.get("conv").and_then(Value::as_bool).unwrap_or(false);
+                let purpose = param_str(params, "purpose").unwrap_or("talk");
+                Ok(json!({ "listening": self.listener.start_session(conv, purpose)? }))
             }
             "listen_stop" => Ok(json!({ "heard": self.listener.stop()? })),
             "heard" => {
@@ -402,6 +413,15 @@ impl Daemon {
         Ok(json!({ "applied": applied, "refused": refused }))
     }
 
+    /// Where my-answers.json lives: beside the .env, under POINTER_HOME.
+    fn answers_home(&self) -> std::path::PathBuf {
+        self.paths
+            .dotenv
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
     fn set_mode(&self, params: &Value) -> Value {
         let mut modes = self.modes.lock().unwrap_or_else(|p| p.into_inner());
         let flag = |key: &str, now: bool| params.get(key).and_then(Value::as_bool).unwrap_or(now);
@@ -511,7 +531,7 @@ impl Daemon {
     /// Hold the key on `purpose`'s behalf. None on chrome, where the shell records between the
     /// `stt` start and stop and answers with `heard`; otherwise what the core heard.
     fn record_held(&self, vk: u32, purpose: Purpose) -> Result<Option<String>, String> {
-        if self.listener.engine() == "chrome" {
+        if matches!(self.listener.engine().as_str(), "chrome" | "deepgram") {
             let tag = purpose.name();
             self.out
                 .event("stt", json!({ "action": "start", "purpose": tag }));
@@ -766,6 +786,11 @@ mod tests {
             .filter(|m| m["event"] == "line")
             .map(|m| m["text"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    #[test]
+    fn act_is_the_default_mode() {
+        assert!(Modes::default().act, "Act is the default; Dry run stays a choice");
     }
 
     #[test]

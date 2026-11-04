@@ -20,7 +20,7 @@ const STATES = {
 
 export function createRunView() {
   const feed = createFeed();
-  let act = false;
+  let act = true; // Act is the default; Dry run stays a choice
   let listening = false;
 
   /* ---------------------------------------------------------- composer */

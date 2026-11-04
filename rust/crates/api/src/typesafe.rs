@@ -54,6 +54,40 @@ pub enum Question {
     Noul {
         instructions: String,
     },
+    /// Where something is in an image: "Locate ...". Needs an asset, and so the images header.
+    Box {
+        instructions: String,
+    },
+}
+
+/// One image sent beside the state. The key is how the state, instructions or criteria name it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Asset {
+    pub key: String,
+    /// "png" or "jpg".
+    pub format: String,
+    pub data_base64: String,
+}
+
+/// A box as fractions of the image, each 0..1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxAnswer {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
+    pub confidence: f64,
+}
+
+/// The header TypeSafe wants on any request with images or box questions.
+pub const IMAGES_HEADER: &str = "TypeSafe-Danger-Zone-Images";
+
+/// Whether a request must carry the images header.
+pub fn needs_images_header(questions: &[(String, Question)], assets: &[Asset]) -> bool {
+    !assets.is_empty()
+        || questions
+            .iter()
+            .any(|(_, q)| matches!(q, Question::Box { .. }))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,9 +101,11 @@ pub struct ChoiceAnswer {
 pub enum Answer {
     Choice(ChoiceAnswer),
     Noul(f64),
+    Box(BoxAnswer),
 }
 
 pub struct TypeSafe {
+    last_input_tokens: std::sync::atomic::AtomicU64,
     key: String,
     base_url: String,
     model: String,
@@ -108,6 +144,7 @@ impl TypeSafe {
             .expect("an HTTP client with only a timeout set always builds");
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
+            last_input_tokens: std::sync::atomic::AtomicU64::new(0),
             key,
             base_url,
             model,
@@ -121,19 +158,44 @@ impl TypeSafe {
         state: &Value,
         questions: &[(String, Question)],
     ) -> Result<Vec<(String, Answer)>, ApiError> {
-        let body = request_body(state, &self.model, questions);
-        let response = self
+        self.system_one_with(state, questions, &[])
+    }
+
+    /// Input tokens the server reported for the last successful call.
+    pub fn last_input_tokens(&self) -> u64 {
+        self.last_input_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`Self::system_one`] with images. No assets and no box question is the same request as
+    /// before, byte for byte, without the header.
+    pub fn system_one_with(
+        &self,
+        state: &Value,
+        questions: &[(String, Question)],
+        assets: &[Asset],
+    ) -> Result<Vec<(String, Answer)>, ApiError> {
+        let body = request_body_with(state, &self.model, questions, assets);
+        let mut request = self
             .client
             .post(format!("{}/v1/systemone", self.base_url))
             .bearer_auth(&self.key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .map_err(ApiError::transport)?;
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if needs_images_header(questions, assets) {
+            request = request.header(IMAGES_HEADER, "true");
+        }
+        let response = request.body(body).send().map_err(ApiError::transport)?;
         let status = response.status();
         let text = response.text().map_err(ApiError::transport)?;
         if !status.is_success() {
             return Err(ApiError::new(Some(status.as_u16()), error_message(&text)));
+        }
+        if let Some(n) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.pointer("/usage/input_tokens").and_then(Value::as_u64))
+        {
+            self.last_input_tokens
+                .store(n, std::sync::atomic::Ordering::Relaxed);
         }
         parse_response(&text, questions)
     }
@@ -157,7 +219,18 @@ fn quote(s: &str) -> String {
 }
 
 /// The JSON body, written by hand so questions and criteria keep the caller's order.
+#[cfg(test)]
 pub(crate) fn request_body(state: &Value, model: &str, questions: &[(String, Question)]) -> String {
+    request_body_with(state, model, questions, &[])
+}
+
+/// [`request_body`] plus a top-level `assets` object when there are images.
+pub(crate) fn request_body_with(
+    state: &Value,
+    model: &str,
+    questions: &[(String, Question)],
+    assets: &[Asset],
+) -> String {
     let mut out = String::new();
     out.push_str("{\"state\":");
     out.push_str(&state.to_string());
@@ -196,9 +269,30 @@ pub(crate) fn request_body(state: &Value, model: &str, questions: &[(String, Que
                 out.push_str(&quote(instructions));
                 out.push('}');
             }
+            Question::Box { instructions } => {
+                out.push_str("{\"type\":\"box\",\"instructions\":");
+                out.push_str(&quote(instructions));
+                out.push('}');
+            }
         }
     }
-    out.push_str("}}");
+    out.push('}');
+    if !assets.is_empty() {
+        out.push_str(",\"assets\":{");
+        for (i, a) in assets.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&quote(&a.key));
+            out.push_str(":{\"type\":\"image\",\"format\":");
+            out.push_str(&quote(&a.format));
+            out.push_str(",\"data_base64\":");
+            out.push_str(&quote(&a.data_base64));
+            out.push('}');
+        }
+        out.push('}');
+    }
+    out.push('}');
     out
 }
 
@@ -261,6 +355,23 @@ pub(crate) fn parse_response(
                     .and_then(Value::as_f64)
                     .ok_or_else(|| bad(format!("{name} has no noul")))?,
             ),
+            Question::Box { .. } => {
+                let b = a
+                    .get("box")
+                    .ok_or_else(|| bad(format!("{name} has no box")))?;
+                let side = |k: &str| {
+                    b.get(k)
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| bad(format!("{name} box has no {k}")))
+                };
+                Answer::Box(BoxAnswer {
+                    top: side("top")?,
+                    bottom: side("bottom")?,
+                    left: side("left")?,
+                    right: side("right")?,
+                    confidence: a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
+                })
+            }
         };
         out.push((name.clone(), answer));
     }
@@ -360,6 +471,62 @@ mod tests {
                 ),
                 ("ok".to_string(), Answer::Noul(0.92)),
             ]
+        );
+    }
+
+    fn tiny_asset() -> Asset {
+        Asset {
+            key: "shot".into(),
+            format: "jpg".into(),
+            data_base64: "AAAA".into(),
+        }
+    }
+
+    #[test]
+    fn text_only_body_has_no_assets_and_no_header() {
+        let q = questions(WAIT_FIRST);
+        assert_eq!(
+            request_body_with(&json!({"goal": "x"}), "jev-latest", &q, &[]),
+            request_body(&json!({"goal": "x"}), "jev-latest", &q)
+        );
+        assert!(!request_body(&json!({}), "m", &q).contains("assets"));
+        assert!(!needs_images_header(&q, &[]));
+    }
+
+    #[test]
+    fn images_add_assets_and_the_header() {
+        let q = questions(WAIT_FIRST);
+        let body = request_body_with(&json!({"screen_image": "shot"}), "m", &q, &[tiny_asset()]);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["assets"]["shot"]["type"], "image");
+        assert_eq!(v["assets"]["shot"]["format"], "jpg");
+        assert_eq!(v["assets"]["shot"]["data_base64"], "AAAA");
+        assert!(needs_images_header(&q, &[tiny_asset()]));
+    }
+
+    #[test]
+    fn a_box_question_needs_the_header_and_parses() {
+        let q = vec![(
+            "where".to_string(),
+            Question::Box {
+                instructions: "Locate the Save button in shot".into(),
+            },
+        )];
+        assert!(needs_images_header(&q, &[]));
+        let body = request_body_with(&json!({}), "m", &q, &[tiny_asset()]);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["questions"]["where"]["type"], "box");
+        let text = r#"{"answers":{"where":{"type":"box","box":{"top":0.1,"bottom":0.2,"left":0.3,"right":0.4},"confidence":0.19}}}"#;
+        let got = parse_response(text, &q).unwrap();
+        assert_eq!(
+            got[0].1,
+            Answer::Box(BoxAnswer {
+                top: 0.1,
+                bottom: 0.2,
+                left: 0.3,
+                right: 0.4,
+                confidence: 0.19
+            })
         );
     }
 
