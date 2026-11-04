@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pointer buddy</title>
+    <link rel="stylesheet" href="styles/tokens.css" />
+    <style>
+      /* The presence pill. A small capsule that says what Pointer is doing, and opens into the
+         conversation, tasks and controls when the pointer rests on it. The window is transparent and
+         click-through; only .shell receives the mouse (see pill.js). */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+      }
+      body {
+        font: 400 var(--type-body) / 20px var(--font-text);
+        color: var(--text-primary);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .stage {
+        height: 100%;
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+      }
+      .stage[data-dir="up"] {
+        align-items: flex-end;
+      }
+
+      .shell {
+        width: max-content;
+        max-width: 420px;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+      }
+      .stage[data-dir="up"] .shell {
+        flex-direction: column-reverse;
+      }
+      .shell.open {
+        width: 420px;
+      }
+
+      /* ---- the capsule */
+      .pill {
+        position: relative;
+        height: 44px;
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        padding: 0 var(--space-4) 0 var(--space-3);
+        border-radius: var(--radius-pill);
+        background: var(--surface-flyout);
+        backdrop-filter: blur(30px) saturate(1.4);
+        box-shadow: var(--elevation-flyout);
+        cursor: grab;
+        touch-action: none;
+      }
+      .pill:active {
+        cursor: grabbing;
+      }
+      .pill[data-state="control"] {
+        background: var(--danger-subtle);
+        box-shadow: 0 0 0 2px var(--danger), var(--elevation-flyout);
+      }
+      .pill[data-state="control"] .label {
+        color: var(--danger);
+        font-weight: 600;
+      }
+
+      .orb {
+        position: relative;
+        flex: none;
+        width: 14px;
+        height: 14px;
+        display: grid;
+        place-items: center;
+      }
+      .orb::before {
+        content: "";
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--text-tertiary);
+      }
+      .orb::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        border: 2px solid transparent;
+      }
+      [data-state="listening"] .orb::before {
+        background: var(--accent);
+      }
+      [data-state="listening"] .orb::after {
+        border-color: var(--accent);
+        animation: ripple 1.5s var(--ease-out) infinite;
+      }
+      [data-state="thinking"] .orb::before {
+        background: var(--warning);
+        animation: breathe 1s var(--ease-standard) infinite;
+      }
+      [data-state="working"] .orb::before {
+        background: transparent;
+      }
+      [data-state="working"] .orb::after {
+        border-color: var(--accent) var(--accent) transparent transparent;
+        animation: spin 0.9s linear infinite;
+      }
+      [data-state="speaking"] .orb::before {
+        background: var(--accent);
+        border-radius: 2px;
+        width: 3px;
+        height: 10px;
+        box-shadow: -5px 0 0 var(--accent), 5px 0 0 var(--accent);
+        animation: voice 0.7s var(--ease-standard) infinite;
+      }
+      [data-state="control"] .orb::before {
+        background: var(--danger);
+      }
+
+      @keyframes ripple {
+        from {
+          transform: scale(0.8);
+          opacity: 0.9;
+        }
+        to {
+          transform: scale(1.7);
+          opacity: 0;
+        }
+      }
+      @keyframes breathe {
+        50% {
+          opacity: 0.3;
+        }
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @keyframes voice {
+        50% {
+          transform: scaleY(0.45);
+        }
+      }
+
+      .label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-primary);
+      }
+      .label .detail {
+        color: var(--text-secondary);
+      }
+
+      .cam {
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 8px;
+        border-radius: var(--radius-pill);
+        background: var(--danger);
+        color: var(--text-on-danger);
+        font: 600 11px/16px var(--font-text);
+      }
+      .cam::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        animation: breathe 1.2s var(--ease-standard) infinite;
+      }
+      .cam[hidden] {
+        display: none;
+      }
+
+      /* ---- the panel */
+      .panel {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        max-height: 500px;
+        animation: rise var(--dur-normal) var(--ease-out);
+      }
+      .panel[hidden] {
+        display: none;
+      }
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(-4px);
+        }
+      }
+      .stage[data-dir="up"] .panel {
+        animation-name: rise-up;
+      }
+      @keyframes rise-up {
+        from {
+          opacity: 0;
+          transform: translateY(4px);
+        }
+      }
+
+      .card {
+        border-radius: var(--radius-card);
+        background: var(--surface-flyout);
+        backdrop-filter: blur(30px) saturate(1.4);
+        box-shadow: var(--elevation-flyout);
+        padding: var(--space-3);
+      }
+      .card[hidden] {
+        display: none;
+      }
+      .card h2 {
+        margin: 0 0 var(--space-2);
+        font: 600 11px/16px var(--font-text);
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--text-tertiary);
+      }
+
+      /* ---- confirm */
+      .confirm {
+        box-shadow: 0 0 0 2px var(--warning), var(--elevation-flyout);
+      }
+      .confirm p {
+        margin: 0 0 var(--space-3);
+        font: var(--type-body-strong);
+        overflow-wrap: anywhere;
+      }
+      .confirm .ask {
+        margin: 0 0 var(--space-1);
+        font: 600 11px/16px var(--font-text);
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--warning);
+      }
+      .confirm + .confirm {
+        margin-top: calc(var(--space-2) * -0.5);
+      }
+      .row {
+        display: flex;
+        gap: var(--space-2);
+        align-items: center;
+      }
+
+      /* ---- conversation */
+      .log {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-height: 140px;
+        overflow-y: auto;
+        user-select: text;
+      }
+      .msg {
+        max-width: 88%;
+        padding: 6px 10px;
+        border-radius: 12px;
+        font-size: 13px;
+        line-height: 18px;
+        overflow-wrap: anywhere;
+      }
+      .msg.you {
+        align-self: flex-end;
+        background: var(--accent-subtle);
+      }
+      .msg.pointer {
+        align-self: flex-start;
+        background: var(--control);
+        border: 1px solid var(--stroke);
+      }
+      .msg.ignored {
+        align-self: flex-end;
+        border: 1px dashed var(--stroke-strong);
+        background: transparent;
+        color: var(--text-tertiary);
+        cursor: pointer;
+      }
+      .msg.ignored:hover {
+        background: var(--subtle-hover);
+        color: var(--text-secondary);
+      }
+      .msg.ignored:focus-visible {
+        outline: 2px solid var(--focus-ring);
+        outline-offset: 1px;
+      }
+      .msg.ignored small {
+        display: block;
+        font-size: 11px;
+        line-height: 14px;
+      }
+      .msg.note {
+        align-self: center;
+        color: var(--warning);
+        font-size: 12px;
+      }
+      .empty {
+        margin: 0;
+        color: var(--text-tertiary);
+        font-size: 13px;
+      }
+
+      /* ---- tasks */
+      .task {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 2px var(--space-2);
+        align-items: center;
+        padding: 6px 0;
+        border-top: 1px solid var(--divider);
+      }
+      .task:first-of-type {
+        border-top: 0;
+      }
+      .task b {
+        font-weight: 600;
+        font-size: 13px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .task small {
+        grid-column: 1;
+        color: var(--text-secondary);
+        font-size: 12px;
+        line-height: 16px;
+        overflow-wrap: anywhere;
+      }
+      .status {
+        font: 600 11px/16px var(--font-text);
+        padding: 0 8px;
+        border-radius: var(--radius-pill);
+        background: var(--control);
+        border: 1px solid var(--stroke);
+        color: var(--text-secondary);
+        white-space: nowrap;
+      }
+      .status[data-s="running"] {
+        color: var(--accent);
+        background: var(--accent-subtle);
+        border-color: transparent;
+      }
+      .status[data-s="done"] {
+        color: var(--success);
+        background: var(--success-subtle);
+        border-color: transparent;
+      }
+      .status[data-s="failed"] {
+        color: var(--danger);
+        background: var(--danger-subtle);
+        border-color: transparent;
+      }
+
+      /* ---- controls */
+      button {
+        font: 400 13px/16px var(--font-text);
+        height: 28px;
+        padding: 0 var(--space-3);
+        border-radius: var(--radius-control);
+        border: 1px solid var(--stroke);
+        background: var(--control);
+        color: var(--text-primary);
+        cursor: default;
+      }
+      button:hover {
+        background: var(--control-hover);
+      }
+      button:active {
+        background: var(--control-pressed);
+      }
+      button:focus-visible {
+        outline: 2px solid var(--focus-ring);
+        outline-offset: 1px;
+      }
+      button.accent {
+        background: var(--accent);
+        color: var(--text-on-accent);
+        border-color: transparent;
+      }
+      button.accent:hover {
+        background: var(--accent-hover);
+      }
+      button.danger {
+        color: var(--danger);
+      }
+      button[aria-pressed="true"] {
+        background: var(--accent);
+        color: var(--text-on-accent);
+        border-color: transparent;
+      }
+      button.tiny {
+        height: 22px;
+        padding: 0 8px;
+        font-size: 12px;
+      }
+      .composer {
+        display: flex;
+        gap: var(--space-2);
+      }
+      .composer input {
+        flex: 1;
+        min-width: 0;
+        height: 32px;
+        padding: 0 var(--space-3);
+        border-radius: var(--radius-control);
+        border: 1px solid var(--stroke-strong);
+        background: var(--control);
+        color: var(--text-primary);
+        font: 400 13px/20px var(--font-text);
+        user-select: text;
+      }
+      .composer input:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: -1px;
+      }
+      .composer input::placeholder {
+        color: var(--text-tertiary);
+      }
+      .foot {
+        margin-top: var(--space-3);
+        justify-content: space-between;
+      }
+      .foot .grow {
+        flex: 1;
+      }
+      .hint {
+        color: var(--text-tertiary);
+        font-size: 12px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .orb::before,
+        .orb::after,
+        .cam::before,
+        .panel {
+          animation: none !important;
+        }
+        [data-state="working"] .orb::after {
+          border-color: var(--accent);
+        }
+        [data-state="listening"] .orb::after {
+          border-color: var(--accent);
+          opacity: 0.35;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage" id="stage" data-dir="down">
+      <div class="shell" id="shell">
+        <header class="pill" id="pill" data-state="resting">
+          <span class="orb" aria-hidden="true"></span>
+          <span class="label" id="label" role="status" aria-live="polite">Resting</span>
+          <span class="cam" id="cam" hidden>Camera on</span>
+        </header>
+
+        <div class="panel" id="panel" hidden>
+          <div id="confirms"></div>
+
+          <section class="card" id="details" hidden>
+            <h2>Conversation</h2>
+            <div class="log" id="log" aria-live="polite"></div>
+            <div id="tasksWrap" hidden>
+              <h2 style="margin-top: var(--space-3)">Tasks</h2>
+              <div id="tasks"></div>
+            </div>
+            <div class="row foot">
+              <form class="composer grow" id="composer" autocomplete="off">
+                <input id="text" type="text" placeholder="Type to Pointer" aria-label="Type to Pointer" spellcheck="false" />
+                <button class="accent" type="submit">Send</button>
+              </form>
+            </div>
+            <div class="row foot" style="margin-top: var(--space-2)">
+              <button id="mic" type="button" aria-pressed="false" title="Keep the microphone open to talk">Microphone</button>
+              <span class="hint" id="hint"></span>
+              <button id="stop" class="danger" type="button">Stop</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const stage = $("stage"), shell = $("shell"), capsule = $("pill"), panel = $("panel"), details = $("details");
+      const LABELS = {
+        resting: "Resting",
+        listening: "Listening",
+        thinking: "Thinking",
+        working: "Working",
+        speaking: "Speaking",
+        control: "Controlling your computer. Esc twice to stop",
+      };
+      let snap = null;
+      let hovering = false;
+      let typing = false;
+      let collapseTimer = null;
+      let dragging = false;
+
+      /* ---- state to DOM */
+      function el(tag, attrs, ...kids) {
+        const n = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs || {})) {
+          if (k === "text") n.textContent = v;
+          else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+          else if (v === true) n.setAttribute(k, "");
+          else if (v !== false && v != null) n.setAttribute(k, v);
+        }
+        n.append(...kids.filter(Boolean));
+        return n;
+      }
+
+      const TERMINAL = new Set(["done", "completed", "failed", "stopped", "cancelled", "canceled", "error"]);
+      const statusClass = (s) => (s === "completed" ? "done" : s === "error" ? "failed" : s);
+
+      function paint() {
+        if (!snap) return;
+        capsule.dataset.state = snap.display;
+        const label = $("label");
+        label.textContent = LABELS[snap.display] || "Resting";
+        if (snap.display === "working" && snap.detail) label.append(el("span", { class: "detail", text: " · " + snap.detail }));
+        $("cam").hidden = !snap.camera;
+        stage.dataset.dir = snap.dir || "down";
+
+        // confirmations: always shown, whether or not the pointer is here
+        const confirms = $("confirms");
+        confirms.replaceChildren(
+          ...snap.confirms.map((c) =>
+            el(
+              "section",
+              { class: "card confirm", role: "alertdialog", "aria-label": "Pointer needs your permission" },
+              el("div", { class: "ask", text: "Pointer asks" }),
+              el("p", { text: c.summary }),
+              el(
+                "div",
+                { class: "row" },
+                el("button", { class: "accent", type: "button", text: "Allow", onclick: () => window.pill.confirm(c.id, true) }),
+                el("button", { type: "button", text: "Deny", onclick: () => window.pill.confirm(c.id, false) }),
+              ),
+            ),
+          ),
+        );
+
+        // conversation
+        const log = $("log");
+        const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+        log.replaceChildren();
+        if (!snap.items.length) log.append(el("p", { class: "empty", text: "Nothing yet. Say or type what you need." }));
+        for (const item of snap.items) {
+          if (item.role === "ignored") {
+            const m = el("div", { class: "msg ignored", role: "button", tabindex: "0", title: "Send this to Pointer anyway" }, el("span", { text: item.text }), el("small", { text: "Ignored. Click to send" }));
+            m.addEventListener("click", () => window.pill.sendIgnored(item.id));
+            m.addEventListener("keydown", (e) => (e.key === "Enter" || e.key === " ") && window.pill.sendIgnored(item.id));
+            log.append(m);
+          } else {
+            log.append(el("div", { class: "msg " + item.role, text: item.text }));
+          }
+        }
+        if (atBottom) log.scrollTop = log.scrollHeight;
+
+        // tasks
+        const tasks = $("tasks");
+        tasks.replaceChildren();
+        for (const t of snap.tasks) {
+          const running = !TERMINAL.has(String(t.status).toLowerCase());
+          tasks.append(
+            el(
+              "div",
+              { class: "task" },
+              el("b", { text: t.title || t.id }),
+              el("span", { class: "status", "data-s": statusClass(String(t.status).toLowerCase()), text: t.status }),
+              t.summary ? el("small", { text: t.summary }) : null,
+              running ? el("button", { class: "tiny danger", type: "button", text: "Stop", "aria-label": "Stop task " + (t.title || t.id), onclick: () => window.pill.taskStop(t.id) }) : null,
+            ),
+          );
+        }
+        $("tasksWrap").hidden = !snap.tasks.length;
+
+        const mic = $("mic");
+        mic.setAttribute("aria-pressed", String(snap.mic));
+        mic.textContent = snap.mic ? "Microphone on" : "Microphone off";
+        $("hint").textContent = snap.camera ? "Camera is on" : "";
+        layout();
+      }
+
+      /* ---- hover, focus and the open panel */
+      function wantOpen() {
+        return hovering || typing || dragging;
+      }
+      function layout() {
+        const confirms = snap ? snap.confirms.length : 0;
+        const open = wantOpen();
+        shell.classList.toggle("open", open || confirms > 0);
+        details.hidden = !open;
+        panel.hidden = !(open || confirms > 0);
+      }
+
+      shell.addEventListener("mouseenter", () => {
+        hovering = true;
+        clearTimeout(collapseTimer);
+        window.pill.hit(true);
+        layout();
+      });
+      shell.addEventListener("mouseleave", () => {
+        if (dragging) return;
+        clearTimeout(collapseTimer);
+        collapseTimer = setTimeout(() => {
+          hovering = false;
+          if (!typing) window.pill.hit(false);
+          layout();
+        }, 350);
+      });
+
+      /* ---- typing: the window takes the keyboard only while the box has the focus */
+      const text = $("text");
+      text.addEventListener("focus", () => {
+        typing = true;
+        layout();
+      });
+      text.addEventListener("pointerdown", () => window.pill.focus());
+      text.addEventListener("blur", () => {
+        typing = false;
+        window.pill.blur();
+        if (!hovering) window.pill.hit(false);
+        layout();
+      });
+      text.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") text.blur();
+      });
+      $("composer").addEventListener("submit", (e) => {
+        e.preventDefault();
+        const value = text.value.trim();
+        if (!value) return;
+        window.pill.send(value);
+        text.value = "";
+      });
+      $("mic").addEventListener("click", () => window.pill.mic());
+      $("stop").addEventListener("click", () => window.pill.stop());
+
+      /* ---- dragging by the capsule */
+      capsule.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        dragging = true;
+        capsule.setPointerCapture(e.pointerId);
+        window.pill.drag("start", e.screenX, e.screenY);
+      });
+      capsule.addEventListener("pointermove", (e) => {
+        if (dragging) window.pill.drag("move", e.screenX, e.screenY);
+      });
+      const endDrag = (e) => {
+        if (!dragging) return;
+        dragging = false;
+        window.pill.drag("end", e.screenX, e.screenY);
+      };
+      capsule.addEventListener("pointerup", endDrag);
+      capsule.addEventListener("pointercancel", endDrag);
+
+      window.pill.onState((next) => {
+        snap = next;
+        paint();
+      });
+      window.pill.ready();
+    </script>
+  </body>
+</html>

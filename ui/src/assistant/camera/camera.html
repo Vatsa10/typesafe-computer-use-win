@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pointer buddy</title>
+  </head>
+  <body>
+    <video id="v" autoplay muted playsinline></video>
+    <canvas id="c"></canvas>
+    <script>
+      // Hidden window, opened for one capture and closed straight after. Frames are grabbed from the
+      // live camera into memory, encoded as small JPEGs and handed to the shell. Nothing is written
+      // to disk. The pill shows a camera indicator for as long as this window exists.
+      const seconds = Math.min(10, Math.max(1, Number(new URLSearchParams(location.search).get("seconds")) || 2));
+      const FRAMES = Math.min(4, Math.max(1, Math.round(seconds)));
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      (async () => {
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+          const video = document.getElementById("v");
+          video.srcObject = stream;
+          await new Promise((resolve) => (video.onloadeddata = resolve));
+          await wait(400); // exposure settles after the first frames
+          const canvas = document.getElementById("c");
+          const scale = Math.min(1, 768 / video.videoWidth);
+          canvas.width = Math.round(video.videoWidth * scale);
+          canvas.height = Math.round(video.videoHeight * scale);
+          const ctx = canvas.getContext("2d");
+          const images = [];
+          for (let i = 0; i < FRAMES; i++) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            images.push(canvas.toDataURL("image/jpeg", 0.72).split(",")[1]); // base64, no prefix
+            if (i < FRAMES - 1) await wait(Math.max(100, (seconds * 1000) / FRAMES));
+          }
+          window.hidden.send("camera-result", { images });
+        } catch (e) {
+          window.hidden.send("camera-result", { error: String((e && e.name) || e) });
+        } finally {
+          if (stream) stream.getTracks().forEach((t) => t.stop());
+        }
+      })();
+    </script>
+  </body>
+</html>

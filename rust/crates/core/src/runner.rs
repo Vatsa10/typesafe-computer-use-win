@@ -392,6 +392,17 @@ pub struct RunResult {
     pub answer: Option<Answer>,
     pub history: Vec<String>,
     pub seconds: f64,
+    /// Why a crashed run failed, in words a person can act on.
+    pub failure: Option<String>,
+}
+
+/// A crash reason worth saying out loud. A rejected key is the common one, and "something went
+/// wrong" leaves the user nothing to do about it.
+pub fn failure_words(why: &str) -> String {
+    if why.contains("authentication_error") || why.contains("401") {
+        return "TypeSafe rejected the API key. Add a new TYPESAFE_API_KEY in Settings.".into();
+    }
+    why.chars().take(200).collect()
 }
 
 /// Why the loop left early: the user's stop, or a failure the Python would have raised.
@@ -527,6 +538,7 @@ fn wait_watching(control: &Control, d: Duration) -> Result<(), Abort> {
 }
 
 struct Runner<'r, 'a, A> {
+    failure: Option<String>,
     goal: String,
     act: bool,
     control: &'r Control,
@@ -566,6 +578,7 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
             consecutive_noops: 0,
             last_url: None,
             outcome: "crashed".into(), // every way out names its own; only a failure leaves this
+            failure: None,
             ocr_cache: OcrCache::new(),
             view: None,
             answer: None,
@@ -652,6 +665,7 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
             Err(Stop::Crash(why)) => {
                 self.outcome = "crashed".into();
                 self.log(&format!("\ncrashed: {why}"));
+                self.failure = Some(failure_words(&why));
             }
         }
         let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
@@ -663,6 +677,7 @@ impl<'r, 'a, A: actions::Desktop<Handle = PressHandle>> Runner<'r, 'a, A> {
             answer: self.answer.clone(),
             history: self.ctx.history.clone(),
             seconds,
+            failure: self.failure.clone(),
         }
     }
 
@@ -1178,6 +1193,14 @@ pub fn save_png(screen: &Screen, path: &Path) -> Result<(), String> {
         .ok_or("bad capture size")?
         .save(path)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn a_rejected_key_is_named_and_other_failures_pass_through() {
+    let auth = r#"{"detail":{"error_type":"authentication_error"}}"#;
+    assert!(failure_words(auth).contains("TYPESAFE_API_KEY"));
+    assert_eq!(failure_words("boom"), "boom");
 }
 
 #[cfg(test)]

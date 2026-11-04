@@ -538,12 +538,16 @@ fn execute_live(job: &Job, control: &wcore::runner::Control) -> Option<RunSummar
         result.seconds,
         result.out.display()
     ));
+    if let Some(why) = &result.failure {
+        job.events.line(format!("run failed: {why}"));
+    }
     Some(RunSummary {
         outcome: result.outcome.clone(),
         answer: result
             .answer
             .as_ref()
             .map(|a| a.text.clone())
+            .or_else(|| result.failure.clone())
             .unwrap_or_default(),
         seconds: result.seconds,
     })

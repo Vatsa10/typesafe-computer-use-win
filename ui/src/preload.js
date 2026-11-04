@@ -17,3 +17,35 @@ contextBridge.exposeInMainWorld("bar", {
   reportFocus: (report) => ipcRenderer.send("bar-focus-report", report),
   listenOnOpen,
 });
+
+// The presence pill. It reports what the user does (hover, drag, typing, buttons); the shell owns
+// every decision and sends back one snapshot of everything the pill shows.
+contextBridge.exposeInMainWorld("pill", {
+  onState: (handler) => ipcRenderer.on("pill-state", (_event, snapshot) => handler(snapshot)),
+  ready: () => ipcRenderer.send("pill-ready"),
+  hit: (over) => ipcRenderer.send("pill-hit", Boolean(over)),
+  drag: (phase, sx, sy) => ipcRenderer.send("pill-drag", { phase, sx, sy }),
+  focus: () => ipcRenderer.send("pill-focus"),
+  blur: () => ipcRenderer.send("pill-blur"),
+  send: (text) => ipcRenderer.send("pill-send", String(text || "")),
+  mic: () => ipcRenderer.send("pill-mic"),
+  stop: () => ipcRenderer.send("pill-stop"),
+  taskStop: (id) => ipcRenderer.send("pill-task-stop", String(id)),
+  confirm: (id, allow) => ipcRenderer.send("pill-confirm", String(id), allow === true),
+  sendIgnored: (id) => ipcRenderer.send("pill-send-ignored", Number(id)),
+});
+
+// Shell-local preferences (wake phrase, camera) for the Settings view.
+contextBridge.exposeInMainWorld("assistant", {
+  getPrefs: () => ipcRenderer.invoke("assistant-prefs-get"),
+  setPrefs: (patch) => ipcRenderer.invoke("assistant-prefs-set", patch),
+  onWake: (handler) => ipcRenderer.on("assistant-wake", (_event, state) => handler(state)),
+});
+
+// The hidden microphone and camera pages talk back on these channels and no others.
+const HIDDEN_CHANNELS = new Set(["wake-audio", "wake-status", "camera-result"]);
+contextBridge.exposeInMainWorld("hidden", {
+  send: (channel, payload) => {
+    if (HIDDEN_CHANNELS.has(channel)) ipcRenderer.send(channel, payload);
+  },
+});

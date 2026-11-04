@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pointer buddy</title>
+  </head>
+  <body>
+    <script>
+      // Hidden window, never shown. It opens the microphone and sends 16 kHz mono samples to the
+      // shell, which runs the on-device keyword spotter. Nothing here records, stores or uploads
+      // audio; samples live in memory for as long as the spotter needs them.
+      (async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          });
+          const ctx = new AudioContext({ sampleRate: 16000 });
+          const source = ctx.createMediaStreamSource(stream);
+          const node = ctx.createScriptProcessor(4096, 1, 1);
+          node.onaudioprocess = (e) => window.hidden.send("wake-audio", new Float32Array(e.inputBuffer.getChannelData(0)));
+          const mute = ctx.createGain();
+          mute.gain.value = 0; // the processor only runs when connected to an output
+          source.connect(node);
+          node.connect(mute);
+          mute.connect(ctx.destination);
+          await ctx.resume();
+          window.hidden.send("wake-status", { ok: true });
+        } catch (e) {
+          window.hidden.send("wake-status", { ok: false, error: String((e && e.name) || e) });
+        }
+      })();
+    </script>
+  </body>
+</html>

@@ -7,12 +7,26 @@
 // already running its own loop. Separate processes mean neither has to give up its loop — and a
 // crash in the UI leaves a run that is already driving the machine able to finish or be aborted.
 
-const { app, BrowserWindow, ipcMain, nativeTheme, screen, systemPreferences } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeTheme, screen, session, systemPreferences } = require("electron");
 const { spawn } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 const { createBridge } = require("./stt/bridge");
+const prefsStore = require("./assistant/prefs");
+const { createConversation } = require("./assistant/conversation");
+const { createPill } = require("./assistant/pill");
+const { createWake } = require("./assistant/wake");
+const { createCamera } = require("./assistant/camera");
+const { modeFromRows, isMissingMethod } = require("./assistant/mode");
+
+// Development checks that need a fake microphone or camera must set the switches before Electron is
+// ready. Chromium then supplies a synthetic device; the real ones are never opened.
+if (process.env.POINTER_CAMERA_SELFTEST === "1" || process.env.POINTER_WAKE_SELFTEST === "1") {
+  app.commandLine.appendSwitch("use-fake-device-for-media-stream");
+  app.commandLine.appendSwitch("use-fake-ui-for-media-stream");
+  if (process.env.POINTER_WAKE_SELFTEST_WAV) app.commandLine.appendSwitch("use-file-for-fake-audio-capture", process.env.POINTER_WAKE_SELFTEST_WAV);
+}
 
 const DEV_CORE = path.join(__dirname, "..", "..", "rust", "target", "debug", "pointer-core.exe");
 const PACKED_CORE = path.join(process.resourcesPath || "", "core.exe");
@@ -61,6 +75,7 @@ function startCore() {
   // The core's stderr is for us, not the user: a panic belongs in the feed, not swallowed.
   readline.createInterface({ input: core.stderr }).on("line", (text) => toPanel({ event: "line", text }));
   core.on("exit", (code) => toPanel({ event: "line", text: `the core exited (${code})` }));
+  core.on("error", (e) => toPanel({ event: "line", text: `the core exited (could not start: ${e.message})` })); // a missing binary must not crash the shell
 }
 
 function call(method, params) {
@@ -88,6 +103,215 @@ const speech = createBridge({
   },
 });
 
+/* ------------------------------------------------------- the assistant layer */
+
+// docs/superpowers/specs/2026-11-04-assistant-layer-design.md. In assistant mode the bar, the talk
+// key, typed text and the wake phrase all go to the core's `chat`; the core's events (`assistant`,
+// `reply`, `speech`, `task`, `confirm`, `camera`) become the presence pill. In quick mode none of this
+// is visible and routing is what it always was.
+
+const ASSIST_DEBUG = process.env.POINTER_ASSISTANT_DEBUG === "1" || ["PILL", "CONV", "WAKE", "CAMERA", "OVERLAY", "SETTINGS"].some((n) => process.env[`POINTER_${n}_SELFTEST`] === "1");
+const ASSISTANT_EVENTS = new Set(["assistant", "reply", "speech", "task", "confirm", "camera"]);
+const TERMINAL_TASK = /^(done|completed|failed|stopped|cancelled|canceled|error)$/i;
+
+let prefs = prefsStore.load();
+let mode = "quick"; // "assistant" | "quick", learned from the core's settings (assistant/mode.js)
+let modeLocked = false; // self-tests pin the mode
+let pillCtl = null;
+let pushQueued = false;
+let cameraOpen = false;
+let confirms = [];
+const tasks = new Map();
+const SELFTEST_HOOKS = {};
+
+function assistLog(text) {
+  if (ASSIST_DEBUG) console.log(`[assistant] ${text}`);
+}
+
+const conv = createConversation({ call, speech, notify: schedulePill, log: assistLog });
+
+const camera = createCamera({
+  onOpen: () => {
+    cameraOpen = true;
+    toPanel({ event: "line", text: "camera: capturing for your request" });
+    schedulePill();
+  },
+  onClose: () => {
+    cameraOpen = false;
+    schedulePill();
+  },
+});
+
+const wake = createWake({
+  log: (text) => toPanel({ event: "line", text }),
+  onWake: () => {
+    assistLog("wake phrase heard");
+    if (SELFTEST_HOOKS.wake) SELFTEST_HOOKS.wake();
+    if (mode === "assistant") conv.begin();
+    else openBar(); // quick mode: the bar opens straight into listening
+  },
+  onState: (state) => {
+    if (state.state === "error" && prefs.wake) {
+      prefs.wake = false; // do not retry on every start; the user turns it on again
+      prefsStore.save(prefs);
+    }
+    if (panel && !panel.isDestroyed()) panel.webContents.send("assistant-wake", state);
+  },
+});
+
+function pillSnapshot() {
+  const c = conv.snapshot();
+  let display = ["listening", "thinking", "working", "speaking", "control"].includes(c.coreState) ? c.coreState : "resting";
+  if (display === "resting" && c.listening) display = "listening";
+  return { display, detail: c.detail, mic: c.listening, items: c.items, tasks: [...tasks.values()].slice(-6), confirms, camera: cameraOpen };
+}
+
+function schedulePill() {
+  if (pushQueued) return;
+  pushQueued = true;
+  queueMicrotask(() => {
+    pushQueued = false;
+    if (pillCtl && pillCtl.visible()) pillCtl.push(pillSnapshot());
+  });
+}
+
+function ensurePill() {
+  if (pillCtl) return;
+  pillCtl = createPill({
+    onSend: (text) => text.trim() && routeText(text.trim(), "typed"),
+    onMic: async () => {
+      if (conv.isListening()) return conv.end("mic toggle");
+      const r = await conv.begin();
+      if (!r.ok) conv.note(`Microphone: ${r.error}`);
+    },
+    onStop: stopAll,
+    onTaskStop: async (id) => {
+      const r = await call("task_stop", { id });
+      if (!r.ok) conv.note(`Could not stop the task: ${r.error}`);
+    },
+    onConfirm: answerConfirm,
+    onSendIgnored: (id) => conv.sendItem(id),
+    onMoved: (anchor) => {
+      prefs.pill = anchor;
+      prefsStore.save(prefs);
+    },
+  });
+}
+
+function stopAll() {
+  conv.end("stop");
+  hideBuddy();
+  return call("stop_all");
+}
+
+async function answerConfirm(id, allow) {
+  // Nothing here ever answers for the user: a card stays until they click, and only their click sends.
+  confirms = confirms.filter((c) => c.id !== id);
+  schedulePill();
+  const r = await call("confirm_reply", { id, allow });
+  if (!r.ok) conv.note(`Could not send your answer: ${r.error}`);
+}
+
+function applyMode(next) {
+  if (next === mode) return;
+  mode = next;
+  assistLog(`mode: ${mode}`);
+  if (mode === "assistant") {
+    ensurePill();
+    pillCtl.show(prefs.pill);
+    schedulePill();
+    refreshTasks();
+  } else {
+    if (pillCtl) pillCtl.hide();
+    conv.end("quick mode");
+  }
+}
+
+async function refreshMode() {
+  if (modeLocked) return;
+  const rows = await call("settings");
+  if (rows.ok && Array.isArray(rows.result)) applyMode(modeFromRows(rows.result));
+}
+
+async function refreshTasks() {
+  const r = await call("tasks");
+  const list = r.ok && r.result ? (Array.isArray(r.result) ? r.result : r.result.tasks) : null;
+  if (Array.isArray(list)) for (const t of list) upsertTask(t);
+}
+
+function upsertTask(t) {
+  if (!t || t.id === undefined) return;
+  const id = String(t.id);
+  tasks.set(id, { id, title: String(t.title || ""), status: String(t.status || "running"), summary: String(t.summary || "") });
+  while (tasks.size > 12) {
+    const oldest = [...tasks.values()].find((x) => TERMINAL_TASK.test(x.status)) || tasks.values().next().value;
+    tasks.delete(oldest.id);
+  }
+  schedulePill();
+}
+
+// One way in for everything the user says or types.
+async function routeText(text, source, fallback) {
+  if (mode === "assistant") {
+    if (source === "voice") conv.begin(); // stay listening for the reply and what follows
+    const reply = await conv.send(text, source);
+    assistLog(`chat (${source}) -> ${reply.ok ? "ok" : reply.error}`);
+    if (reply.ok || !isMissingMethod(reply.error)) return reply;
+    toPanel({ event: "line", text: "assistant: this core has no `chat` yet, using quick routing" });
+  }
+  if (fallback) return fallback();
+  return source === "voice" ? call("say", { text }) : call("heard", { text, purpose: "talk" });
+}
+
+function onAssistantEvent(message) {
+  if (message.event === "task") upsertTask(message);
+  else if (message.event === "confirm") {
+    const id = String(message.id);
+    if (!confirms.some((c) => c.id === id)) confirms.push({ id, summary: String(message.summary || "") });
+    schedulePill();
+  } else if (message.event === "camera") {
+    if (message.action === "capture") onCamera(message);
+  } else {
+    conv.onCoreEvent(message); // assistant, reply, speech
+  }
+}
+
+// The camera opens only for a `camera` event, only when Settings allows it, in a hidden window that
+// closes the moment it has its frames. The frames go to the core and nowhere else.
+async function onCamera(message) {
+  const id = message.id;
+  if (!prefs.camera) return call("camera_frames", { id, error: "the camera is switched off in Settings" });
+  const result = await camera.capture(Number(message.seconds) || 2);
+  const reply = await call("camera_frames", result.error ? { id, error: result.error } : { id, images: result.images });
+  assistLog(`camera_frames -> ${reply.ok ? "ok" : reply.error} (${result.images ? result.images.length + " frames" : result.error})`);
+  if (SELFTEST_HOOKS.camera) SELFTEST_HOOKS.camera(result);
+  result.images = null; // nothing keeps the frames once the core has them
+  return reply;
+}
+
+// The hidden microphone and camera windows may use the media devices; nothing else may.
+function ownMediaPage(webContents) {
+  const url = (webContents && webContents.getURL && webContents.getURL()) || "";
+  return url.startsWith(require("node:url").pathToFileURL(path.join(__dirname, "assistant")).toString());
+}
+
+function guardMedia() {
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => callback(permission === "media" && ownMediaPage(webContents)));
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => permission === "media" && ownMediaPage(webContents));
+}
+
+ipcMain.handle("assistant-prefs-get", () => ({ wake: prefs.wake, camera: prefs.camera, wakeState: wake.state() }));
+ipcMain.handle("assistant-prefs-set", (_event, patch) => {
+  if (patch && typeof patch.wake === "boolean" && patch.wake !== prefs.wake) {
+    prefs.wake = patch.wake;
+    if (prefs.wake) wake.enable();
+    else wake.disable();
+  }
+  if (patch && typeof patch.camera === "boolean") prefs.camera = patch.camera;
+  prefsStore.save(prefs);
+  return { wake: prefs.wake, camera: prefs.camera, wakeState: wake.state() };
+});
+
 async function sttEngine() {
   const reply = await call("state");
   if (reply && reply.ok && reply.result.stt_lang) speech.setLang(reply.result.stt_lang);
@@ -96,6 +320,7 @@ async function sttEngine() {
 
 async function speechStart() {
   if (!voiceOn) return { ok: false, error: "voice is off" };
+  conv.end("another microphone user"); // the bar, the talk key and the panel share one recognizer
   try {
     return { ok: true, result: { listening: await speech.start() } };
   } catch (e) {
@@ -115,6 +340,8 @@ async function speechStop() {
 async function onSttEvent(message) {
   if (message.action === "start" && recordingHotkeys) return; // Settings is capturing a combo
   if (message.action === "start") {
+    // Pressing to talk over Pointer's voice is an interruption.
+    if (mode === "assistant" && message.purpose !== "dictate" && conv.snapshot().coreState === "speaking") call("interrupt");
     const started = await speechStart();
     if (!started.ok) toPanel({ event: "line", text: `voice: ${started.error}` });
   } else if (message.action === "stop") {
@@ -124,7 +351,7 @@ async function onSttEvent(message) {
     const purpose = message.purpose === "dictate" ? "dictate" : "talk";
     if (!result.heard) return toPanel({ event: "line", text: "heard nothing" });
     if (purpose === "talk") toPanel({ event: "line", text: `heard: ${result.heard}` });
-    const routed = await call("heard", { text: result.heard, purpose });
+    const routed = purpose === "talk" ? await routeText(result.heard, "voice") : await call("heard", { text: result.heard, purpose });
     if (!routed.ok) toPanel({ event: "line", text: `voice: ${routed.error}` });
   }
 }
@@ -137,6 +364,7 @@ function onEvent(message) {
   if (message.event === "hotkey" && recordingHotkeys && (message.name === "bar" || message.name === "goal")) return;
   if (message.event === "hotkey" && message.name === "bar") return openBar();
   if (message.event === "hotkey" && message.name === "goal") showPanel();
+  if (ASSISTANT_EVENTS.has(message.event)) onAssistantEvent(message); // then on to the panel below
   if (message.event === "point") return point(message);
   if (message.event === "highlight") return draw(message.marks || [], message.seconds || 5);
   if (message.event === "state" && message.running && panelHidesWhileActing) hidePanelForRun();
@@ -145,13 +373,21 @@ function onEvent(message) {
 }
 
 function toPanel(message) {
-  if (panel && !panel.isDestroyed()) panel.webContents.send("core", message);
+  try {
+    if (panel && !panel.isDestroyed()) panel.webContents.send("core", message);
+  } catch {
+    // the panel's frame is gone (quitting); there is nobody to tell
+  }
 }
 
 ipcMain.handle("call", async (_event, method, params) => {
   if (method === "ui_recording_hotkeys") {
     recordingHotkeys = Boolean(params && params.on);
     return { ok: true, result: { recording: recordingHotkeys } };
+  }
+  // In assistant mode a goal typed into the panel is a message to the assistant, not a bare run.
+  if (method === "start" && mode === "assistant" && params && typeof params.goal === "string" && params.goal.trim()) {
+    return routeText(params.goal.trim(), "typed", () => call(method, params));
   }
   if (method === "set_mode" && params) {
     panelHidesWhileActing = params.hide !== false;
@@ -161,7 +397,9 @@ ipcMain.handle("call", async (_event, method, params) => {
   if ((method === "listen_start" || method === "listen_stop") && (await sttEngine()) === "chrome") {
     return method === "listen_start" ? speechStart() : speechStop();
   }
-  return call(method, params);
+  const reply = await call(method, params);
+  if (method === "save_settings" && reply.ok) refreshMode(); // the mode may have just changed
+  return reply;
 });
 
 /* --------------------------------------------------------------- the panel */
@@ -376,8 +614,9 @@ ipcMain.handle("bar-done", async (_event, text, spoken, purpose) => {
     return call("heard", { text, purpose: "dictate" });
   }
   // Typed or spoken, the bar is classified: a goal runs, a question is taught, "stop" stops. Typed
-  // text was not misheard, so it goes in as `heard` (fully heard); speech goes through `say`.
-  return spoken ? call("say", { text }) : call("heard", { text, purpose: "talk" });
+  // text was not misheard, so it goes in as `heard` (fully heard); speech goes through `say`. In
+  // assistant mode both go to the assistant (routeText).
+  return routeText(text, spoken ? "voice" : "typed");
 });
 
 // A development check (POINTER_BAR_SELFTEST=1): open the bar directly, report whether it has the
@@ -596,7 +835,7 @@ async function point(message) {
   if (message.clear) return hideBuddy();
   const target = toDip(message);
   const hold = Number(message.hold) > 0 ? Number(message.hold) : 5;
-  draw([{ x: message.x, y: message.y, w: message.w, h: message.h, tone: message.tone }], hold); // the box; the bubble carries the label
+  draw([{ x: message.x, y: message.y, w: message.w, h: message.h, tone: message.tone, shape: message.shape, step: message.step }], hold); // the box; the bubble carries the label
   await ensureBuddy();
   if (!buddy || buddy.isDestroyed()) return;
   buddy.webContents.send("core", { event: "buddy", label: message.label, tone: message.tone, step: message.step, of: message.of });
@@ -635,9 +874,25 @@ function buddySelfTest() {
 
 /* ---------------------------------------------------------------- lifecycle */
 
+app.on("will-quit", () => {
+  wake.disable();
+  speech.shutdown(); // the speech browser this process started
+});
+
 app.whenReady().then(() => {
+  guardMedia();
   startCore();
   createPanel();
+  // The mode comes from the core's settings, which are not readable until it is up.
+  [800, 2500, 6000].forEach((ms) => setTimeout(refreshMode, ms));
+  setInterval(refreshMode, 15000);
+  if (prefs.wake) wake.enable(); // the user turned it on in Settings; the mic stays open while resting
+  if (process.env.POINTER_CONV_SELFTEST === "1") convSelfTest();
+  if (process.env.POINTER_PILL_SELFTEST === "1") pillSelfTest();
+  if (process.env.POINTER_OVERLAY_SELFTEST === "1") overlaySelfTest();
+  if (process.env.POINTER_CAMERA_SELFTEST === "1") cameraSelfTest();
+  if (process.env.POINTER_WAKE_SELFTEST === "1") wakeSelfTest();
+  if (process.env.POINTER_SETTINGS_SELFTEST === "1") panel.webContents.once("did-finish-load", settingsSelfTest);
   if (process.env.POINTER_STT_SELFTEST === "1") panel.webContents.once("did-finish-load", sttSelfTest);
   if (process.env.POINTER_BAR_SELFTEST === "1") panel.webContents.once("did-finish-load", barSelfTest);
   if (process.env.POINTER_BUDDY_SELFTEST === "1") panel.webContents.once("did-finish-load", buddySelfTest);
@@ -657,4 +912,182 @@ function sttSelfTest() {
       await click();
     }, Number(process.env.POINTER_STT_SELFTEST_MS || 6000));
   }, 2000);
+}
+
+/* -------------------------------------------------- assistant development checks */
+
+// All of these run with fake events and fake devices: no real camera or microphone is opened, no
+// input is sent to another app. Window captures go to POINTER_SELFTEST_DIR (else POINTER_BAR_SELFTEST_DIR).
+// Set the matching POINTER_*_SELFTEST=1 variable to run one; each prints [name-selftest] lines and quits.
+
+const selfDir = () => process.env.POINTER_SELFTEST_DIR || process.env.POINTER_BAR_SELFTEST_DIR;
+const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function selfShot(win, name, tint) {
+  const dir = selfDir();
+  if (!dir || !win || win.isDestroyed()) return;
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  // A transparent window captures as transparent pixels; this backdrop is only so the capture reads.
+  if (tint) await win.webContents.insertCSS(`html,body{background:${tint} !important}`);
+  const image = await win.webContents.capturePage();
+  require("node:fs").writeFileSync(path.join(dir, name), image.toPNG());
+  console.log(`[selftest] saved ${name}`);
+}
+
+function selfFinish(code = 0) {
+  if (core && !core.killed) core.kill(); // the core this process started
+  speech.shutdown();
+  wake.disable();
+  setTimeout(() => app.exit(code), 300);
+}
+
+async function convSelfTest() {
+  const ok = await require("./assistant/selftest-conversation").run();
+  selfFinish(ok ? 0 : 1);
+}
+
+async function pillSelfTest() {
+  modeLocked = true;
+  const log = (text) => console.log(`[pill-selftest] ${text}`);
+  applyMode("assistant");
+  await waitMs(1800);
+  const win = pillCtl.window();
+  if (!win) return log("the pill window did not open") || selfFinish(1);
+  win.webContents.on("console-message", (_event, level, message) => level >= 2 && log(`renderer: ${message}`));
+  const b = win.getBounds();
+  const area = screen.getPrimaryDisplay().workArea;
+  log(`title=${JSON.stringify(win.getTitle())} alwaysOnTop=${win.isAlwaysOnTop()} focusable=${win.isFocusable()} focused=${win.isFocused()} visible=${win.isVisible()}`);
+  log(`bounds=${JSON.stringify(b)} primaryWorkArea=${JSON.stringify(area)} pill centre x=${b.x + b.width / 2} (screen centre ${area.x + area.width / 2}) top=${b.y}`);
+  const tint = "#8fa3ba";
+  const states = [["idle", ""], ["listening", ""], ["thinking", ""], ["working", "Reading your inbox"], ["speaking", ""], ["control", ""]];
+  for (const [state, detail] of states) {
+    onEvent({ event: "assistant", state, detail });
+    await waitMs(350);
+    const label = await win.webContents.executeJavaScript(`document.getElementById("label").textContent`);
+    log(`state ${state} -> label ${JSON.stringify(label)}`);
+    await selfShot(win, `pill-${state}.png`, tint);
+  }
+  onEvent({ event: "assistant", state: "idle" });
+
+  // fake conversation, tasks and a confirmation; none of it reaches the core
+  conv.seedForSelfTest("you", "Can you tidy my downloads folder?");
+  onEvent({ event: "reply", text: "Sure. I found 41 files; I will sort them by type. Want me to delete the installers too?" });
+  conv.seedForSelfTest("ignored", "what time is it in Tokyo");
+  onEvent({ event: "task", id: "t1", title: "Sort downloads", status: "running", summary: "Moved 12 of 41 files" });
+  onEvent({ event: "task", id: "t2", title: "Check the weather", status: "done", summary: "14 degrees and clear" });
+  onEvent({ event: "confirm", id: "c1", summary: "Delete 6 installer files from Downloads" });
+  await waitMs(300);
+  await win.webContents.executeJavaScript(`shell.dispatchEvent(new MouseEvent("mouseenter"))`);
+  await waitMs(400);
+  log(`typed-input box present=${await win.webContents.executeJavaScript(`Boolean(document.getElementById("text"))`)} tasks=${await win.webContents.executeJavaScript(`document.querySelectorAll(".task").length`)} confirms=${await win.webContents.executeJavaScript(`document.querySelectorAll(".confirm").length`)}`);
+  await selfShot(win, "pill-hover-down.png", tint);
+
+  // Allow/Deny only ever send what the user clicked; here we click Deny and see the core's answer
+  await win.webContents.executeJavaScript(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent === "Deny").click()`);
+  await waitMs(500);
+  log(`after Deny: confirms left=${confirms.length}`);
+  // typed input through the pill's own form
+  await win.webContents.executeJavaScript(`document.getElementById("text").value = "hello there"; document.getElementById("composer").requestSubmit();`);
+  await waitMs(500);
+  log(`after typing: conversation lines=${conv.snapshot().items.length}`);
+  await win.webContents.executeJavaScript(`document.querySelector(".msg.ignored").click()`);
+  await waitMs(300);
+
+  // opening upward near the bottom of the screen
+  pillCtl.place({ cx: area.x + Math.round(area.width / 2), top: area.y + area.height - 80 });
+  await waitMs(400);
+  await win.webContents.executeJavaScript(`shell.dispatchEvent(new MouseEvent("mouseenter"))`);
+  await waitMs(400);
+  log(`near the bottom: dir=${pillCtl.dir()} bounds=${JSON.stringify(win.getBounds())}`);
+  await selfShot(win, "pill-hover-up.png", tint);
+
+  // dragging through the same messages the page sends, and the position being remembered
+  const before = pillCtl.anchor();
+  await win.webContents.executeJavaScript(`window.pill.drag("start", 500, 500); window.pill.drag("move", 360, 340); window.pill.drag("end", 360, 340);`);
+  await waitMs(300);
+  const after = pillCtl.anchor();
+  log(`drag: anchor ${JSON.stringify(before)} -> ${JSON.stringify(after)}; saved=${JSON.stringify(prefsStore.load().pill)}`);
+  log(`focus check: pill focused=${win.isFocused()}; a later window focused=${BrowserWindow.getFocusedWindow() ? BrowserWindow.getFocusedWindow().getTitle() : "none"}`);
+  selfFinish(0);
+}
+
+async function overlaySelfTest() {
+  const log = (text) => console.log(`[overlay-selftest] ${text}`);
+  const area = screen.getPrimaryDisplay().workArea;
+  const shapes = ["box", "circle", "arrow", "underline", "note", "step", "bogus"];
+  const marks = shapes.map((shape, i) => {
+    const dip = { x: area.x + 80 + (i % 4) * 230, y: area.y + 140 + Math.floor(i / 4) * 150, width: 170, height: 56 };
+    const r = screen.dipToScreenRect(null, dip);
+    return { x: r.x, y: r.y, w: r.width, h: r.height, label: shape === "note" ? "Check this field before you send it" : shape, shape, step: i + 1 };
+  });
+  // six marks at most per overlay; draw the first six, then the unknown shape alone
+  onEvent({ event: "highlight", marks: marks.slice(0, 6), seconds: 20 });
+  await waitMs(1200);
+  log(`overlay open=${Boolean(overlay && !overlay.isDestroyed())} focusable=${overlay ? overlay.isFocusable() : "n/a"}`);
+  await selfShot(overlay, "overlay-shapes.png", "#c9d3df");
+  onEvent({ event: "highlight", marks: marks.slice(6), seconds: 20 });
+  await waitMs(1000);
+  await selfShot(overlay, "overlay-unknown-shape.png", "#c9d3df");
+  selfFinish(0);
+}
+
+async function cameraSelfTest() {
+  const log = (text) => console.log(`[camera-selftest] ${text}`);
+  modeLocked = true;
+  applyMode("assistant");
+  await waitMs(1500);
+  const seen = [];
+  SELFTEST_HOOKS.camera = (result) => seen.push({ frames: result.images ? result.images.length : 0, bytes: result.images ? result.images.map((i) => i.length) : [], error: result.error });
+  // 1. the toggle is off (the default): the camera must not open
+  prefs.camera = false;
+  onEvent({ event: "camera", action: "capture", id: "cam-off", seconds: 1 });
+  await waitMs(800);
+  log(`toggle off -> window opened=${camera.isOpen()} (expected false)`);
+  // 2. on: capture with the synthetic device, watch the indicator
+  prefs.camera = true;
+  const statesSeen = [];
+  const poll = setInterval(() => statesSeen.push(cameraOpen), 100);
+  onEvent({ event: "camera", action: "capture", id: "cam-1", seconds: 2 });
+  await waitMs(300);
+  const win = pillCtl.window();
+  const indicator = win ? await win.webContents.executeJavaScript(`!document.getElementById("cam").hidden`) : "no pill";
+  log(`while capturing: cameraOpen=${cameraOpen} pill indicator visible=${indicator}`);
+  await selfShot(win, "pill-camera-on.png", "#8fa3ba");
+  await waitMs(6000);
+  clearInterval(poll);
+  log(`after capture: cameraOpen=${cameraOpen} window open=${camera.isOpen()} indicator seen open=${statesSeen.includes(true)}`);
+  log(`result: ${JSON.stringify(seen)}`);
+  selfFinish(0);
+}
+
+async function wakeSelfTest() {
+  const log = (text) => console.log(`[wake-selftest] ${text}`);
+  modeLocked = true;
+  mode = "quick";
+  let heard = 0;
+  SELFTEST_HOOKS.wake = () => heard++;
+  // In quick mode a wake would open the bar; this check only counts the detection.
+  openBar = () => {};
+  log(`electron=${process.versions.electron} node=${process.versions.node} model present=${wake.hasModel()}`);
+  const t0 = Date.now();
+  wake.enable();
+  const poll = setInterval(() => log(`state=${wake.state().state} ${wake.state().detail} fedSamples=${wake.fed()}`), 5000);
+  const deadline = Date.now() + Number(process.env.POINTER_WAKE_SELFTEST_MS || 90000);
+  while (Date.now() < deadline && heard === 0) await waitMs(250);
+  clearInterval(poll);
+  log(`detections=${heard} after ${Date.now() - t0}ms fedSamples=${wake.fed()} state=${wake.state().state}`);
+  selfFinish(heard > 0 ? 0 : 1);
+}
+
+async function settingsSelfTest() {
+  showPanel();
+  await waitMs(1500);
+  await panel.webContents.executeJavaScript(`document.querySelectorAll(".nav-item")[2].click()`);
+  await waitMs(1800);
+  console.log(`[settings-selftest] ${await panel.webContents.executeJavaScript(`[...document.querySelectorAll(".group legend")].map((l) => l.textContent).join(" | ")`)}`);
+  await selfShot(panel, "settings-assistant.png");
+  await panel.webContents.executeJavaScript(`document.querySelector(".settings-scroll").scrollTop = 99999`);
+  await waitMs(300);
+  await selfShot(panel, "settings-assistant-bottom.png");
+  selfFinish(0);
 }

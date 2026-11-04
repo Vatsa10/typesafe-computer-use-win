@@ -989,6 +989,13 @@ html:not(.mica) .card {
   grid-row: 1 / span 2;
 }
 
+.setting .toggle,
+.setting .segmented {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  justify-self: start;
+}
+
 .secret-state {
   display: inline-flex;
   align-items: center;

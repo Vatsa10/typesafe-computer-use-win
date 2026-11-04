@@ -48,6 +48,10 @@ on((message) => {
   }
   if (message.event === "state") paintState(message);
   if (message.event === "answer") run.feed.answer(message.text, message.spoken);
+  // The assistant's side of the conversation also lands in the feed, so it is not only in the pill.
+  if (message.event === "reply") run.feed.answer(message.text, false);
+  if (message.event === "task") run.feed.line(`task ${message.title || message.id}: ${message.status}${message.summary ? ` (${message.summary})` : ""}`);
+  if (message.event === "confirm") run.feed.line(`needs your answer: ${message.summary} (Allow or Deny in the pill)`);
   if (message.event === "hotkey" && message.name === "goal") {
     nav.show("run");
     run.focusGoal();

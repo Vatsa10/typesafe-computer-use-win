@@ -75,6 +75,7 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
   let lastError = "";
   let listening = false; // the page confirmed its recognizer started, since the last start()
   let quitting = false;
+  let sink = null; // { interim, segment }: set while a conversation owns the microphone
 
   const browser = findBrowser();
 
@@ -108,8 +109,16 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
       lastError = String(msg.error);
       log(`speech: ${lastError}`); // an error code such as no-speech, never a transcript
     }
-    // Live text goes to whoever asked (the command bar), never to a log.
-    if (!msg.final && typeof msg.interim === "string" && listening) onInterim(msg.interim);
+    // A finished sentence of a conversation (the page only posts these in conversation mode).
+    if (typeof msg.segment === "string") {
+      if (sink && sink.segment) sink.segment(msg.segment);
+      return;
+    }
+    // Live text goes to whoever asked (the conversation, else the command bar), never to a log.
+    if (!msg.final && typeof msg.interim === "string" && listening) {
+      if (sink && sink.interim) sink.interim(msg.interim);
+      else onInterim(msg.interim);
+    }
     if (msg.final) settleFinal(typeof msg.text === "string" ? msg.text.trim() : "");
   }
 
@@ -231,14 +240,15 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
     if (!(await waitForPage(READY_TIMEOUT_MS))) throw new Error("the speech browser did not load its page");
   }
 
-  /** Begin listening. Resolves true once the page has the command. */
-  async function start() {
+  /** Begin listening. Resolves true once the page has the command. `conv` keeps the session open and
+   *  reports each finished sentence to the sink instead of waiting for a stop. */
+  async function start({ conv = false } = {}) {
     if (!starting) starting = ensure().finally(() => (starting = null));
     await starting;
     lastError = "";
     listening = false;
     settleFinal(""); // a stop still in flight from an earlier utterance is over
-    if (!send("start")) throw new Error("the speech page is not connected");
+    if (!send("start", { conv })) throw new Error("the speech page is not connected");
     return true;
   }
 
@@ -284,8 +294,13 @@ function createBridge({ lang: initialLang = process.env.CLICKER_STT_LANG || "en-
     if (next) lang = next;
   }
 
+  function setSink(next) {
+    sink = next;
+  }
+
   return {
     setLang,
+    setSink,
     start,
     stop,
     cancel,
