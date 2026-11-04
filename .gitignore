@@ -10,3 +10,6 @@ panel.log
 rust/target/
 ui/node_modules/
 ui/dist/
+
+conversations/
+friday/
