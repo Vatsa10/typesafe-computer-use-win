@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn jev_decides_task_or_chat_and_keywords_only_name_the_kind() {
         // No keyword here, but Jev says it is a task.
-        let line = "sort my downloads into folders by year";
+        let line = "tidy up my desktop icons";
         assert!(Pursuit::begin(line, budget()).is_some() || classify(line).is_none());
         assert_eq!(Pursuit::begin_as(line, budget(), Some(TaskClass::Task)).unwrap().kind, GoalKind::General);
         // A keyword that would start a pursuit does not when Jev says chat.

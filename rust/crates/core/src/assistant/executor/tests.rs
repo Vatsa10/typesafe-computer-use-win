@@ -350,7 +350,23 @@ fn load_env() {
     }
 }
 
-/// Run with `cargo test -p pointer-core live_simulation -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn live_jev() {
+    load_env();
+    let ts = Arc::new(api::typesafe::TypeSafe::from_env().expect("a TypeSafe key in .env"));
+    let j = JevVerifier::new(ts, Duration::from_secs(5), Cancel::new());
+    let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let t = Instant::now();
+    let pick = j.pick_button("apply for the job", &b(&["Go on to the next part", "Save for later", "Cancel"]), "");
+    println!("JEV pick {pick:?} in {:?}", t.elapsed());
+    let t = Instant::now();
+    println!("JEV login page {:?} in {:?}", j.expected_page("apply for the job", "Sign in to continue. Email. Password. Forgot password?"), t.elapsed());
+    println!("JEV step page {:?}", j.expected_page("apply for the job", "Step 2 of 3. Years of experience. Why this role? Next"));
+    println!("JEV submitted {:?} / {:?}", j.submitted("apply", "Thank you, we received your application"), j.submitted("apply", "Step 2 of 3 Phone is invalid"));
+}
+
+/// Run with `cargo test -p core live_simulation -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn live_simulation() {
