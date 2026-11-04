@@ -300,6 +300,15 @@ impl Harness {
     }
 
     pub fn with(tag: &str, chat: Arc<FakeChat>, limits: Limits) -> Self {
+        Self::with_senses(tag, chat, limits, Arc::new(FakeSenses(Mutex::new(sample_observation()))))
+    }
+
+    pub fn with_senses(
+        tag: &str,
+        chat: Arc<FakeChat>,
+        limits: Limits,
+        senses: Arc<dyn Senses>,
+    ) -> Self {
         let root = fresh(tag);
         let (home, profile) = (root.join("home"), root.join("profile"));
         std::fs::create_dir_all(&home).unwrap();
@@ -318,7 +327,7 @@ impl Harness {
             chat: Arc::new(move || Ok(c.clone() as Arc<dyn Chat>)),
             emit: emit.clone(),
             voice: voice.clone(),
-            senses: Arc::new(FakeSenses(Mutex::new(sample_observation()))),
+            senses,
             hands: hands.clone(),
             shell: shell.clone(),
             act_mode: Arc::new(move || a.load(Ordering::SeqCst)),
@@ -355,6 +364,14 @@ impl Harness {
             self.svc.clone(),
             Gate::new(Arc::new(Unavailable)).with_enabled(Some(true)),
         )
+    }
+
+    /// An assistant whose decision model (gate and fast path) is `classifier`.
+    pub fn assistant_with(
+        &self,
+        classifier: Arc<dyn crate::decide::Classifier + Send + Sync>,
+    ) -> Arc<Assistant> {
+        Assistant::new(self.svc.clone(), Gate::new(classifier).with_enabled(Some(true)))
     }
 
     /// Answer the next `confirm` event, in the background.

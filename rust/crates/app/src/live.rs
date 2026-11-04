@@ -310,6 +310,14 @@ impl Senses for LiveSenses {
         wcore::assistant::forms::drive(&page, target, entries)
     }
 
+    fn focus_window(&self, hwnd: isize) -> Result<(), String> {
+        if platform::winlist::activate_window(hwnd, 1500) {
+            Ok(())
+        } else {
+            Err("the window would not come forward".into())
+        }
+    }
+
     fn switch_tab(&self, title: &str) -> Result<String, String> {
         let windows = platform::winlist::open_windows(platform::winlist::MIN_WINDOW_SIDE_PX);
         let mut tabs: Vec<(isize, String)> = Vec::new();
