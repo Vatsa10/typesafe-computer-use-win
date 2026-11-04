@@ -78,8 +78,45 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Token counts the service reported for one call. All zero when it reported none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    /// Prompt tokens that were not served from the cache.
+    pub input: u64,
+    pub output: u64,
+    /// Prompt tokens read from the cache.
+    pub cache_read: u64,
+    /// Prompt tokens written to the cache.
+    pub cache_write: u64,
+}
+
+impl Usage {
+    /// Every prompt token of the call, cached or not.
+    pub fn prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+    pub fn total(&self) -> u64 {
+        self.prompt() + self.output
+    }
+    pub fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+    }
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+    pub fn to_json(&self) -> Value {
+        json!({ "input": self.input, "output": self.output, "cache_read": self.cache_read,
+                "cache_write": self.cache_write, "total": self.total() })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatReply {
+    /// What the service reported for this call.
+    pub usage: Usage,
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     /// Claude's thinking blocks, kept so the next turn can send them back unchanged.
@@ -296,7 +333,18 @@ pub fn parse_reply(body: &Value) -> Result<ChatReply, ChatError> {
             arguments,
         });
     }
+    let u = |k: &str| body.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
+    let cached = body
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Ok(ChatReply {
+        usage: Usage {
+            input: u("prompt_tokens").saturating_sub(cached),
+            output: u("completion_tokens"),
+            cache_read: cached,
+            cache_write: 0,
+        },
         content,
         tool_calls,
         thinking: Vec::new(),

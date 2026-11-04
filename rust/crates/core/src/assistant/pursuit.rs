@@ -9,7 +9,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use api::typesafe::{Answer, Question};
+use serde_json::{json, Value};
+
+use crate::decide::Classifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalKind {
@@ -21,13 +28,23 @@ pub enum GoalKind {
     Find,
     /// Files, shell and other work with a checkable result.
     Work,
+    /// Any other task the decision model says needs the computer, which no keyword recognised.
+    General,
+}
+
+/// What the decision model (Jev) said about the line: a task for the computer, or conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClass {
+    Task,
+    Chat,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub steps: usize,
     pub seconds: f64,
-    /// Estimated prompt tokens sent to the model in this goal (characters / 4).
+    /// Prompt and output tokens used by the model in this goal: the counts the service reported,
+    /// or characters / 4 for a call that reported none.
     pub tokens: usize,
 }
 
@@ -161,10 +178,7 @@ fn changes_state(tool: &str) -> bool {
 /// pointing is the whole job and there is nothing to chase.
 pub fn classify(request: &str) -> Option<GoalKind> {
     let t = request.to_lowercase();
-    if any(
-        &t,
-        &["show me", "guide me", "walk me through", "teach me", "point at", "point to", "where is the"],
-    ) {
+    if is_guidance(&t) {
         return None;
     }
     if any(
@@ -209,13 +223,30 @@ fn done_condition(kind: GoalKind) -> &'static str {
              finished pointer_run)"
         }
         GoalKind::Work => "the file or command step succeeded and you read its result",
+        GoalKind::General => "the thing asked for is done and you have seen proof on screen or in a tool result",
     }
+}
+
+fn is_guidance(t: &str) -> bool {
+    any(t, &["show me", "guide me", "walk me through", "teach me", "point at", "point to", "where is the"])
 }
 
 impl Pursuit {
     /// A pursuit for an actionable request, or `None` for conversation.
     pub fn begin(request: &str, budget: Budget) -> Option<Pursuit> {
-        let kind = classify(request)?;
+        Self::begin_as(request, budget, None)
+    }
+
+    /// Like [`Self::begin`], with the decision model's verdict when there is one. Jev's `Chat`
+    /// ends the question; its `Task` is a task even when no keyword names the kind. Guidance
+    /// requests ("show me") stay guidance.
+    pub fn begin_as(request: &str, budget: Budget, class: Option<TaskClass>) -> Option<Pursuit> {
+        let kind = match class {
+            Some(TaskClass::Chat) => return None,
+            Some(TaskClass::Task) if is_guidance(&request.to_lowercase()) => return None,
+            Some(TaskClass::Task) => classify(request).unwrap_or(GoalKind::General),
+            None => classify(request)?,
+        };
         Some(Pursuit {
             goal: clip(request.trim(), 200),
             kind,
@@ -236,6 +267,11 @@ impl Pursuit {
             blockers_cleared: 0,
             plan: Plan::default(),
         })
+    }
+
+    /// Record that code or Jev saw the done condition on screen.
+    pub fn mark_verified(&mut self, why: &str) {
+        self.verified = Some(why.to_string());
     }
 
     pub fn met(&self) -> bool {
@@ -404,10 +440,10 @@ impl Pursuit {
                     && v.and_then(|v| v.get("outcome")).and_then(Value::as_str).is_some_and(|o| o == "done" || o == "dry run");
                 (looked || finished).then(|| "reached and read the page".to_string())
             }
-            GoalKind::Work => matches!(
+            GoalKind::Work | GoalKind::General => (matches!(
                 tool,
                 "write_file" | "run_shell" | "read_file" | "list_dir" | "find_documents" | "start_task"
-            )
+            ) || (self.kind == GoalKind::General && changes_state(tool)))
             .then(|| format!("{tool} succeeded")),
         }
     }
@@ -624,6 +660,136 @@ impl Pursuit {
     }
 }
 
+// ---------------------------------------------------------------- Jev as the verifier
+
+/// Probability at or above which Jev's yes counts.
+pub const YES: f64 = 0.6;
+/// At or below which its no counts; between the two the page is a surprise, not a failure.
+pub const NO: f64 = 0.35;
+
+/// The verifier: exact code checks first, then TypeSafe (a Noul or a Choice, about 0.4 s) for what
+/// code cannot read exactly. It never calls the large model.
+pub struct JevVerifier {
+    classifier: Arc<dyn Classifier + Send + Sync>,
+    timeout: Duration,
+    cancel: api::chat::Cancel,
+    calls: AtomicUsize,
+}
+
+impl JevVerifier {
+    pub fn new(classifier: Arc<dyn Classifier + Send + Sync>, timeout: Duration, cancel: api::chat::Cancel) -> Self {
+        Self { classifier, timeout, cancel, calls: AtomicUsize::new(0) }
+    }
+
+    /// How many TypeSafe requests this verifier has made.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn ask(&self, state: Value, questions: Vec<(String, Question)>) -> Option<Vec<(String, Answer)>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        super::fastpath::ask(self.classifier.clone(), state, questions, self.timeout, &self.cancel).ok()
+    }
+
+    fn noul(&self, state: Value, instructions: &str) -> Option<f64> {
+        let q = vec![("ok".to_string(), Question::Noul { instructions: instructions.to_string() })];
+        self.ask(state, q)?.into_iter().find_map(|(_, a)| match a {
+            Answer::Noul(p) => Some(p),
+            _ => None,
+        })
+    }
+
+    /// Exact checks on a tool result: `Some` when the result itself decides.
+    pub fn code_check(observed: &str) -> Option<Verdict> {
+        let v: Value = serde_json::from_str(observed).ok()?;
+        let non_empty = |k: &str| v.get(k).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        if let Some(rows) = v.get("results").and_then(Value::as_array) {
+            let bad: Vec<String> = rows
+                .iter()
+                .filter(|r| r["status"] != "ok")
+                .map(|r| format!("{} {}", r["field"].as_str().unwrap_or("?"), r["status"].as_str().unwrap_or("?")))
+                .collect();
+            if !bad.is_empty() {
+                return Some(Verdict::Fails(format!("not read back as typed: {}", bad.join(", "))));
+            }
+            return Some(Verdict::Holds);
+        }
+        if let Some(changed) = v.get("page_changed").and_then(Value::as_bool) {
+            if non_empty("errors") {
+                return Some(Verdict::Fails(format!("the page shows errors: {}", v["errors"])));
+            }
+            return Some(if changed {
+                Verdict::Holds
+            } else {
+                Verdict::Fails("the page did not change".into())
+            });
+        }
+        None
+    }
+
+    /// Is this page one the task expects? `page` is its visible text and labels.
+    pub fn expected_page(&self, goal: &str, page: &str) -> Verdict {
+        let state = json!({ "goal": goal, "page": page.chars().take(1500).collect::<String>() });
+        match self.noul(
+            state,
+            "Is this page part of getting the goal done: a step of the form or application, a review \
+             page, or the confirmation that follows it? Say no for a login wall, an error page, an \
+             unrelated site or a page that asks for payment the goal did not mention.",
+        ) {
+            Some(p) if p <= NO => Verdict::Surprise(format!("this page does not look like part of the task ({p:.2})")),
+            _ => Verdict::Holds,
+        }
+    }
+
+    /// Of the visible buttons, the one that moves the task forward: `Some((index, confidence))`.
+    pub fn pick_button(&self, goal: &str, buttons: &[String], hint: &str) -> Option<(usize, f64)> {
+        if buttons.is_empty() {
+            return None;
+        }
+        let mut criteria: Vec<(String, Option<String>)> =
+            buttons.iter().enumerate().map(|(i, b)| (format!("btn_{i}"), Some(format!("Button: {b}")))).collect();
+        criteria.push(("none".into(), Some("No listed button moves the task forward.".into())));
+        let q = Question::Choice {
+            instructions: "Which button moves the goal forward: Next, Continue, Review or the final Submit? \
+                           Never Back, Cancel, Save for later, Sign in or a social login."
+                .into(),
+            criteria,
+        };
+        let state = json!({ "goal": goal, "planner_hint": hint, "buttons": buttons });
+        let answers = self.ask(state, vec![("button".to_string(), q)])?;
+        answers.into_iter().find_map(|(_, a)| match a {
+            Answer::Choice(c) => c.choice.strip_prefix("btn_")?.parse::<usize>().ok().map(|i| (i, c.confidence)),
+            _ => None,
+        })
+    }
+
+    /// Does this text say the form was received? None when Jev could not answer.
+    pub fn submitted(&self, goal: &str, page: &str) -> Option<bool> {
+        let state = json!({ "goal": goal, "page": page.chars().take(1500).collect::<String>() });
+        self.noul(
+            state,
+            "Does the page say the submission or application was received, such as a thank you or a \
+             confirmation? Say no for a form that is still being filled or that shows errors.",
+        )
+        .map(|p| p >= YES)
+    }
+}
+
+impl Verifier for JevVerifier {
+    fn verify(&self, expect: &str, observed: &str) -> Verdict {
+        if let Some(v) = Self::code_check(observed) {
+            return v;
+        }
+        let state = json!({ "expected": expect, "observed": observed.chars().take(1500).collect::<String>() });
+        match self.noul(state, "Does what was observed show that the expected result happened?") {
+            Some(p) if p >= YES => Verdict::Holds,
+            Some(p) if p <= NO => Verdict::Fails(format!("the result does not show: {expect}")),
+            Some(_) => Verdict::Surprise(format!("unclear whether: {expect}")),
+            None => Verdict::Surprise("the verifier was unavailable".into()),
+        }
+    }
+}
+
 /// What to try next after a failed tool, for a result that gave no advice of its own.
 pub fn next_hint(tool: &str, result: &str) -> Option<String> {
     let r = result.trim_start();
@@ -790,6 +956,21 @@ mod tests {
         assert!(llm.replan(&esc, &p).is_none());
         assert!(matches!(p.step_verdict(Verdict::Fails("x".into())), Some(Escalation::FailedVerification { .. })));
         assert!(!p.plan.finished());
+    }
+
+    #[test]
+    fn jev_decides_task_or_chat_and_keywords_only_name_the_kind() {
+        // No keyword here, but Jev says it is a task.
+        let line = "sort my downloads into folders by year";
+        assert!(Pursuit::begin(line, budget()).is_some() || classify(line).is_none());
+        assert_eq!(Pursuit::begin_as(line, budget(), Some(TaskClass::Task)).unwrap().kind, GoalKind::General);
+        // A keyword that would start a pursuit does not when Jev says chat.
+        assert!(Pursuit::begin_as("what does a submit button do", budget(), Some(TaskClass::Chat)).is_none());
+        assert!(Pursuit::begin_as("what does a submit button do", budget(), None).is_some());
+        // Guidance stays guidance.
+        assert!(Pursuit::begin_as("show me how to save", budget(), Some(TaskClass::Task)).is_none());
+        // A task Jev named keeps its keyword kind.
+        assert_eq!(Pursuit::begin_as("apply to this job", budget(), Some(TaskClass::Task)).unwrap().kind, GoalKind::Form);
     }
 
     #[test]

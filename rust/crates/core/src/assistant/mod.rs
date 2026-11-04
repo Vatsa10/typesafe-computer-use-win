@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod answers;
 pub mod control;
+pub mod executor;
 pub mod fastpath;
 pub mod forms;
 pub mod gate;
@@ -212,6 +213,13 @@ pub trait Senses: Send + Sync {
         Err("pages cannot be clicked here".into())
     }
 
+    /// Scroll the page in window `target` one screen down (or up) so what is below comes into view,
+    /// with the wheel or the keyboard, after the same window checks as a click. Only called in Act
+    /// mode. Returns whether the view moved.
+    fn form_scroll(&self, _target: isize, _down: bool) -> Result<bool, String> {
+        Err("scrolling pages is not available here".into())
+    }
+
     /// Bring the window `hwnd` forward. Only called in Act mode.
     fn focus_window(&self, _hwnd: isize) -> Result<(), String> {
         Err("focusing windows is not available here".into())
@@ -351,6 +359,8 @@ pub struct Memory {
     pub profile_ok: bool,
     /// The profile get_profile read last, for form_answer.
     pub profile: Option<crate::documents::Profile>,
+    /// Jev's read of this turn's line (task or chat), when the fast path's classifier gave one.
+    pub task_class: Option<pursuit::TaskClass>,
 }
 
 struct TurnSlot {
@@ -452,6 +462,7 @@ impl Assistant {
         {
             let mut m = self.memory.lock().unwrap_or_else(|p| p.into_inner());
             m.current_request = text.to_string();
+            m.task_class = None;
         }
         self.svc.assistant_state("thinking", "");
         let _ = source; // voice and typed lines are handled alike
@@ -499,6 +510,7 @@ impl Assistant {
             max_iterations: self.svc.limits.max_iterations,
             max_tokens: self.svc.limits.turn_tokens,
             time: self.svc.limits.turn_time,
+            classifier: Some(self.classifier.clone()),
         };
         let mut ctx = TurnCtx::default();
         let dir = self.svc.conversations_dir();

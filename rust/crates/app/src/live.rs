@@ -239,6 +239,18 @@ impl Senses for LiveSenses {
         })
     }
 
+    fn form_scroll(&self, target: isize, down: bool) -> Result<bool, String> {
+        resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
+        if platform::winlist::foreground() != target {
+            return Err("the window in front is not the form's window: nothing was scrolled".into());
+        }
+        let before = platform::uia::page_scan(target).signature();
+        // Page Down and Page Up move a page's view without touching any control.
+        platform::input::press(if down { 0x22 } else { 0x21 }, false);
+        std::thread::sleep(Duration::from_millis(350));
+        Ok(platform::uia::page_scan(target).signature() != before)
+    }
+
     fn form_click(&self, target: isize, label: &str) -> Result<wcore::assistant::forms::ClickReport, String> {
         use wcore::assistant::forms::{looks_like_error, pick_button, verify_focus, ClickReport};
         resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;

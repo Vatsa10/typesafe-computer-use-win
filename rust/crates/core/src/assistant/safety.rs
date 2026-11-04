@@ -439,6 +439,14 @@ pub fn payment_goal(goal: &str) -> bool {
     )
 }
 
+/// A goal that has the run loop typing or entering something.
+pub fn typing_goal(goal: &str) -> bool {
+    has_phrase(
+        goal,
+        &["type", "enter", "fill", "input", "paste", "put", "write", "log in", "login", "sign in", "use", "apply", "submit"],
+    )
+}
+
 /// A goal that asks for a password or code to be typed: refused outright.
 pub fn password_goal(goal: &str) -> bool {
     let typing = has_phrase(

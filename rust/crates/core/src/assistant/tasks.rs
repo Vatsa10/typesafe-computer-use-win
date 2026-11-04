@@ -309,6 +309,7 @@ impl Tasks {
             max_iterations: self.svc.limits.task_iterations,
             max_tokens: self.svc.limits.turn_tokens,
             time: self.svc.limits.task_time,
+            classifier: None,
         };
         let dir = self.svc.conversations_dir();
         let name = format!("task-{id}");

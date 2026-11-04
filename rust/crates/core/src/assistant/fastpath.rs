@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use api::typesafe::{Answer, ApiError, ChoiceAnswer, Question};
 use serde_json::{json, Value};
 
+use super::pursuit::TaskClass;
 use super::tasks::Tasks;
 use super::tools::{self, Kind, ToolEnv, TurnCtx};
 use super::{Memory, Services};
@@ -37,6 +38,8 @@ use crate::world::{CatApp, Snapshot};
 /// The bar for both answers. Set from the labelled set (see `fastpath_eval`).
 pub const DEFAULT_THRESHOLD: f64 = 0.9;
 pub const CLASSIFY_TIMEOUT: Duration = Duration::from_millis(3000);
+/// How sure Jev must be that a line is a task or only chat before the agent loop trusts it over keywords.
+pub const TASK_CLASS_FLOOR: f64 = 0.6;
 const MAX_WORDS: usize = 12;
 const MAX_APPS: usize = 100;
 const MAX_WINDOWS: usize = 30;
@@ -301,7 +304,8 @@ fn action_question() -> Question {
         instructions: "What does the user want done with this one spoken line? Polite or chatty wording around one simple command (can you, please, hey) does not change it. Choose a direct \
             command only when the line is exactly that one simple command and nothing else. Anything \
             that is a question, needs several steps, needs the screen read, or is unclear is \
-            needs_agent."
+            not a direct command: it is chat when it only wants talk or information, task when it \
+            wants something done on the computer, and needs_agent when it is unclear."
             .into(),
         criteria: vec![
             c("open_app", "Launch one installed app by name, such as open calculator."),
@@ -310,7 +314,9 @@ fn action_question() -> Question {
             c("open_site", "Open one named website in the browser, such as open youtube."),
             c("stop", "Stop what Pointer is doing or saying right now: stop, cancel, never mind."),
             c("pause", "Pause: hold on, wait, pause."),
-            c("needs_agent", "Everything else: questions, more than one step (open an app and then do something in it), searching, typing, clicking, files, reading the screen, small talk, unclear lines, other requests."),
+            c("chat", "Small talk, a question, or a request for an answer or an explanation: nothing has to be done on the computer."),
+            c("task", "Something to do on the computer that is not one simple command: more than one step (open an app and then do something in it), a form or application to fill in, searching, typing, clicking, files, a shell command, working on what is on the screen."),
+            c("needs_agent", "Unclear lines and anything that fits neither of the others."),
         ],
     }
 }
@@ -374,7 +380,7 @@ fn choice(answers: &[(String, Answer)], name: &str) -> Option<ChoiceAnswer> {
 
 /// Ask TypeSafe, bounded in time. The classifier runs on its own thread so a slow answer cannot
 /// hold the turn.
-fn ask(
+pub(super) fn ask(
     classifier: Arc<dyn Classifier + Send + Sync>,
     state: Value,
     questions: Vec<(String, Question)>,
@@ -451,8 +457,8 @@ pub fn decide(
         target: tgt.choice.clone(),
         target_conf: tgt.confidence,
     };
-    if act.choice == "needs_agent" {
-        d.why = "needs_agent".into();
+    if matches!(act.choice.as_str(), "needs_agent" | "chat" | "task") {
+        d.why = act.choice.clone();
         return d;
     }
     if act.confidence < threshold {
@@ -636,6 +642,17 @@ pub fn try_fast(env: &FastEnv, text: &str, messages: &mut Vec<Value>) -> bool {
     );
     let ms = started.elapsed().as_millis();
     let Some(plan) = d.plan.clone() else {
+        // Jev's read of the line, for the agent loop: is there a task to pursue or only talk.
+        let class = if d.action_conf < TASK_CLASS_FLOOR {
+            None
+        } else {
+            match d.action.as_str() {
+                "chat" => Some(TaskClass::Chat),
+                "task" | "open_app" | "switch_window" | "switch_tab" | "open_site" => Some(TaskClass::Task),
+                _ => None,
+            }
+        };
+        env.memory.lock().unwrap_or_else(|p| p.into_inner()).task_class = class;
         log(
             env,
             format!(

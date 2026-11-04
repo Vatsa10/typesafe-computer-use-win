@@ -5,9 +5,10 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use api::chat::{Cancel, Chat, ChatError};
+use api::chat::{Cancel, Chat, ChatError, Usage};
 use serde_json::{json, Value};
 
+use super::executor;
 use super::pursuit::{self, Budget, Finish, Pursuit};
 use super::skills;
 use super::tasks::Tasks;
@@ -28,6 +29,8 @@ pub struct LoopCfg<'a> {
     /// Estimated prompt tokens one goal may use (cost budget).
     pub max_tokens: usize,
     pub time: std::time::Duration,
+    /// Jev, for the executor's verifier. None for background tasks.
+    pub classifier: Option<Arc<dyn crate::decide::Classifier + Send + Sync>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,19 +254,29 @@ pub fn run(
     let request = last_request(messages);
     let library = skill_library();
     let matched = if foreground { skills::pick(library, &request) } else { Vec::new() };
+    // Jev's read of the line (task or chat) decides whether there is a goal to pursue; keywords
+    // only name the kind, and stand in when Jev gave no answer.
+    let class = if foreground {
+        cfg.memory.lock().unwrap_or_else(|p| p.into_inner()).task_class
+    } else {
+        None
+    };
     let mut pursuit = if foreground {
-        Pursuit::begin(
+        Pursuit::begin_as(
             &request,
             Budget {
                 steps: cfg.max_iterations,
                 seconds: cfg.time.as_secs_f64(),
                 tokens: cfg.max_tokens,
             },
+            class,
         )
     } else {
         None
     };
     let mut tokens = 0usize;
+    let mut turn_usage = Usage::default();
+    let mut model_calls = 0usize;
     if foreground {
         // The turn starts by looking at the machine, once, and marks where its changes begin.
         tools::refresh_world(cfg.svc, cfg.memory, true);
@@ -272,6 +285,49 @@ pub fn run(
             .unwrap_or_else(|p| p.into_inner())
             .world
             .begin_turn();
+    }
+    // A form goal runs through the planner and executor first: one model call per page, the rest
+    // in code. If it cannot go on, the agent loop below takes over from where it stopped.
+    if let Some(p) = pursuit.as_mut().filter(|p| p.kind == pursuit::GoalKind::Form) {
+        let jev = cfg.classifier.as_ref().map(|c| {
+            pursuit::JevVerifier::new(c.clone(), std::time::Duration::from_secs(4), cfg.cancel.clone())
+        });
+        let ecfg = executor::ExecCfg {
+            svc: cfg.svc,
+            chat: cfg.chat,
+            tasks: cfg.tasks,
+            memory: cfg.memory,
+            cancel: cfg.cancel,
+            jev: jev.as_ref(),
+            started,
+            time: cfg.time,
+        };
+        cfg.svc.assistant_state("working", "form");
+        let (end, stats) = executor::run_form(&ecfg, ctx, p);
+        tokens += stats.usage.total() as usize;
+        turn_usage.add(&stats.usage);
+        model_calls += stats.plan_calls + stats.replan_calls;
+        cfg.svc.emit(
+            "line",
+            json!({ "text": format!("executor: {} page(s), {} plan call(s), {} replan(s), {} Jev call(s), {} tool call(s)",
+                        stats.pages, stats.plan_calls, stats.replan_calls, stats.jev_calls, stats.tool_calls),
+                    "usage": stats.usage.to_json(), "turn_usage": turn_usage.to_json(), "model_calls": model_calls,
+                    "jev_calls": stats.jev_calls, "seconds": started.elapsed().as_secs_f64() }),
+        );
+        match end {
+            executor::ExecEnd::Final(text) | executor::ExecEnd::NeedsUser(text) => {
+                note(messages, &text);
+                persist(messages);
+                return LoopEnd::Final(text);
+            }
+            executor::ExecEnd::Cancelled => return LoopEnd::Cancelled,
+            executor::ExecEnd::Handoff(why) => {
+                messages.push(json!({ "role": "user", "content": format!(
+                    "[runtime] The fast form path stopped: {why}. Carry on from the page as it is now with form_read, \
+                     form_fill and form_click. Fields already filled: {}.",
+                    ctx.checklist.iter().filter(|(_, s)| *s == "ok").map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")) }));
+            }
+        }
     }
     for step in 0..cfg.max_iterations {
         if cfg.cancel.is_cancelled() {
@@ -318,12 +374,20 @@ pub fn run(
             sent.push(json!({ "role": "system", "content": ctx_text }));
         }
         sent.extend(messages.iter().cloned());
-        tokens += size(&sent) / 4;
         let reply = match cfg.chat.complete(&sent, &schemas, cfg.cancel) {
             Ok(r) => r,
             Err(ChatError::Cancelled) => return LoopEnd::Cancelled,
             Err(e) => return LoopEnd::Failed(e.to_string()),
         };
+        // The service's own counts; characters / 4 only when it reported none.
+        model_calls += 1;
+        tokens += if reply.usage.is_empty() { size(&sent) / 4 } else { reply.usage.total() as usize };
+        turn_usage.add(&reply.usage);
+        cfg.svc.emit(
+            "line",
+            json!({ "text": format!("model: {} in ({} cached), {} out", reply.usage.prompt(), reply.usage.cache_read, reply.usage.output),
+                    "usage": reply.usage.to_json(), "turn_usage": turn_usage.to_json(), "model_calls": model_calls }),
+        );
         messages.push(reply.message());
         if reply.tool_calls.is_empty() {
             if let Some(p) = pursuit.as_mut() {

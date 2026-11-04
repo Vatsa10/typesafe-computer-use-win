@@ -15,7 +15,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::{json, Map, Value};
 
-use crate::chat::{ChatError, ChatReply, ToolCall};
+use crate::chat::{ChatError, ChatReply, ToolCall, Usage};
 pub use crate::typesafe::ApiError;
 use crate::typesafe::{env_var, error_message};
 
@@ -176,6 +176,29 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
     out
 }
 
+/// The system prompt as blocks. The first system message is the stable prompt and is its own
+/// cached block; every later system message (the clock, the machine note, the goal status) changes
+/// per turn and goes in a second block after the cache breakpoint, so it never invalidates the
+/// cached prefix.
+pub fn system_blocks(messages: &[Value]) -> Vec<Value> {
+    let texts: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    if let Some(first) = texts.first() {
+        out.push(json!({"type": "text", "text": first, "cache_control": {"type": "ephemeral"}}));
+    }
+    if texts.len() > 1 {
+        out.push(json!({"type": "text", "text": texts[1..].join("
+
+")}));
+    }
+    out
+}
+
 /// The request body for a tool-loop turn.
 pub fn build_request(model: &str, messages: &[Value], tools: &[Value]) -> Value {
     let (system, msgs) = convert_messages(messages);
@@ -185,10 +208,11 @@ pub fn build_request(model: &str, messages: &[Value], tools: &[Value]) -> Value 
         "output_config": {"effort": "low"},
         "messages": msgs,
     });
-    if !system.is_empty() {
-        body["system"] = json!([{"type": "text", "text": system,
-                                 "cache_control": {"type": "ephemeral"}}]);
+    let blocks = system_blocks(messages);
+    if !blocks.is_empty() {
+        body["system"] = json!(blocks);
     }
+    let _ = system;
     if !tools.is_empty() {
         body["tools"] = json!(convert_tools(tools));
     }
@@ -203,6 +227,13 @@ pub fn parse_reply(body: &Value) -> Result<ChatReply, ChatError> {
         .and_then(Value::as_array)
         .ok_or_else(|| ChatError::Bad("no content".into()))?;
     let mut reply = ChatReply::default();
+    let u = |k: &str| body.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
+    reply.usage = Usage {
+        input: u("input_tokens"),
+        output: u("output_tokens"),
+        cache_read: u("cache_read_input_tokens"),
+        cache_write: u("cache_creation_input_tokens"),
+    };
     for b in blocks {
         match b.get("type").and_then(Value::as_str) {
             Some("text") => reply
@@ -232,6 +263,7 @@ pub fn parse_reply(body: &Value) -> Result<ChatReply, ChatError> {
         Some("refusal") => {
             return Ok(ChatReply {
                 content: REFUSAL_SENTENCE.into(),
+                usage: reply.usage,
                 ..Default::default()
             })
         }
@@ -398,6 +430,33 @@ mod tests {
         assert_eq!(r["tools"][0]["cache_control"]["type"], "ephemeral");
         assert!(r["tools"][0].get("function").is_none());
         assert_eq!(build_request("claude-haiku-5-5", &history(), &tools), r);
+    }
+
+    #[test]
+    fn the_stable_prompt_is_cached_and_the_per_turn_note_follows_the_breakpoint() {
+        let msgs = [
+            json!({"role": "system", "content": "stable prompt"}),
+            json!({"role": "system", "content": "It is Monday. Goal: x."}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let r = build_request("m", &msgs, &[]);
+        assert_eq!(r["system"][0]["text"], "stable prompt");
+        assert_eq!(r["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(r["system"][1]["text"], "It is Monday. Goal: x.");
+        assert!(r["system"][1].get("cache_control").is_none());
+        // A different note leaves the cached block byte for byte the same.
+        let msgs2 = [msgs[0].clone(), json!({"role": "system", "content": "Tuesday"}), msgs[2].clone()];
+        assert_eq!(build_request("m", &msgs2, &[])["system"][0], r["system"][0]);
+    }
+
+    #[test]
+    fn usage_is_read_from_the_reply() {
+        let r = parse_reply(&json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "x"}],
+            "usage": {"input_tokens": 12, "output_tokens": 5, "cache_read_input_tokens": 900,
+                      "cache_creation_input_tokens": 30}}))
+        .unwrap();
+        assert_eq!((r.usage.input, r.usage.output, r.usage.cache_read, r.usage.cache_write), (12, 5, 900, 30));
+        assert_eq!(r.usage.prompt(), 942);
     }
 
     #[test]

@@ -718,6 +718,25 @@ fn switch_window(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     Ok(json!({ "acted": true, "focused": full }).to_string())
 }
 
+/// What the page in front shows, checked before anything acts on it: a password box refuses a run
+/// that would type, and a payment page needs the user's yes whatever the goal's wording says.
+/// Pages that cannot be read as a form (not a browser, nothing there) pass; the goal checks still
+/// apply to them.
+pub(super) fn screen_guard(env: &ToolEnv, goal: &str) -> Result<(), String> {
+    let Ok(view) = env.svc.senses.form_read(&super::forms::Target::Foreground) else {
+        return Ok(());
+    };
+    if view.fields.iter().any(|f| f.password) && safety::typing_goal(goal) {
+        return Err("refused: a password box is on the screen and Pointer never types passwords or codes; ask the user to enter it themselves".into());
+    }
+    let fields: Vec<String> = view.fields.iter().map(|f| f.label.clone()).collect();
+    let buttons: Vec<String> = view.buttons.iter().map(|b| b.0.clone()).collect();
+    if safety::payment_context(&fields, &view.texts, &buttons) {
+        confirm(env, &format!("PAYMENT page on screen: let the run act on it ({})", clip(goal, 120)))?;
+    }
+    Ok(())
+}
+
 fn pointer_run(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     let goal = need_str(args, "goal")?;
     let act = (env.svc.act_mode)();
@@ -728,6 +747,7 @@ fn pointer_run(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
         if safety::payment_goal(goal) {
             confirm(env, &format!("PAYMENT or checkout: {}", clip(goal, 160)))?;
         }
+        screen_guard(env, goal)?;
     }
     if act {
         env.svc.assistant_state(
@@ -817,7 +837,7 @@ fn waited(d: std::time::Duration) -> String {
 }
 
 /// Ask the user. Denied by default: no reply in the wait, a cancel or an error all mean no.
-fn confirm(env: &ToolEnv, summary: &str) -> Result<(), String> {
+pub(super) fn confirm(env: &ToolEnv, summary: &str) -> Result<(), String> {
     let svc = env.svc;
     let summary = match env.label {
         Some(l) => format!("[background task: {l}] {summary}"),
@@ -970,7 +990,7 @@ fn get_profile(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
 
 /// One field's answer: personal and legal questions from the saved answers only, the rest from the
 /// profile.
-fn answer_for(
+pub(super) fn answer_for(
     home: &std::path::Path,
     profile: Option<&crate::documents::Profile>,
     label: &str,
@@ -1068,7 +1088,7 @@ pub fn pick_years_option(years: i32, options: &[String]) -> Option<String> {
 
 /// A link a form asks for needs its scheme: a resume says linkedin.com/in/x, a url field wants
 /// https://linkedin.com/in/x. The same address, written the way the field takes it.
-fn with_scheme(label: &str, a: crate::documents::FormAnswer) -> crate::documents::FormAnswer {
+pub(super) fn with_scheme(label: &str, a: crate::documents::FormAnswer) -> crate::documents::FormAnswer {
     use crate::documents::FormAnswer;
     let l = label.to_lowercase();
     let linky = ["linkedin", "github", "portfolio", "website", "url", "link", "profile"].iter().any(|w| l.contains(w));
@@ -1100,7 +1120,7 @@ fn form_answer(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
 
 /// Bind the form tools to a window and read it. With `window` that named window; else the
 /// window already bound this turn; else the window in front, which must be a browser.
-fn bind_form(env: &mut ToolEnv, window: Option<&str>) -> Result<super::forms::PageView, String> {
+pub(super) fn bind_form(env: &mut ToolEnv, window: Option<&str>) -> Result<super::forms::PageView, String> {
     use super::forms::Target;
     let senses = &env.svc.senses;
     let view = match (window.map(str::trim).filter(|w| !w.is_empty()), env.ctx.form_target) {
@@ -1147,16 +1167,17 @@ fn confirm_payment_click(env: &ToolEnv, view: &super::forms::PageView, label: &s
     Ok(())
 }
 
-fn form_autofill(env: &mut ToolEnv) -> Result<String, String> {
-    use super::forms::{norm, plan, FormEntry};
+/// The answers code can give for a page without any model: each field from the saved answers, the
+/// resume and the form_answer rules. Returns the entries to fill and, for what it could not answer,
+/// rows saying why (and the options on this page for a radio group).
+pub(super) fn autofill_entries(
+    home: &std::path::Path,
+    profile: &crate::documents::Profile,
+    fields: &[super::forms::FormField],
+    page_buttons: &[String],
+) -> (Vec<super::forms::FormEntry>, Vec<Value>) {
+    use super::forms::{norm, FormEntry};
     use crate::documents::FormAnswer;
-    let view = bind_form(env, None)?;
-    let target = view.hwnd;
-    let fields = view.fields;
-    let page_buttons: Vec<String> = view.buttons.iter().filter(|(_, e)| *e).map(|(l, _)| l.clone()).collect();
-    let profile = env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile.clone();
-    let profile = profile.ok_or("call get_profile first")?;
-    let home = env.svc.home.clone();
     let mut entries: Vec<FormEntry> = Vec::new();
     let mut remaining: Vec<Value> = Vec::new();
     let mut groups_done: Vec<String> = Vec::new();
@@ -1165,14 +1186,14 @@ fn form_autofill(env: &mut ToolEnv) -> Result<String, String> {
             remaining.push(json!({ "field": label, "needs_user": "payment details are never filled automatically" }));
             return;
         }
-        match with_scheme(label, answer_for(&home, Some(&profile), label, options)) {
+        match with_scheme(label, answer_for(home, Some(profile), label, options)) {
             FormAnswer::Value { value, .. } => entries.push(FormEntry { field: label.to_string(), value }),
             FormAnswer::NeedsUser { reason } => {
                 remaining.push(json!({ "field": label, "needs_user": reason }))
             }
         }
     };
-    for f in &fields {
+    for f in fields {
         match f.kind.as_str() {
             "text" | "select" if f.password => {
                 remaining.push(json!({ "field": f.label, "needs_user": "password fields are never filled by Pointer" }))
@@ -1233,6 +1254,19 @@ fn form_autofill(env: &mut ToolEnv) -> Result<String, String> {
             _ => {}
         }
     }
+    (entries, remaining)
+}
+
+fn form_autofill(env: &mut ToolEnv) -> Result<String, String> {
+    use super::forms::plan;
+    let view = bind_form(env, None)?;
+    let target = view.hwnd;
+    let fields = view.fields;
+    let page_buttons: Vec<String> = view.buttons.iter().filter(|(_, e)| *e).map(|(l, _)| l.clone()).collect();
+    let profile = env.memory.lock().unwrap_or_else(|p| p.into_inner()).profile.clone();
+    let profile = profile.ok_or("call get_profile first")?;
+    let home = env.svc.home.clone();
+    let (entries, remaining) = autofill_entries(&home, &profile, &fields, &page_buttons);
     // A radio group whose answer is not among its options was reported by ask as needs_user.
     if !(env.svc.act_mode)() {
         let (planned, failed) = plan(&fields, &entries);
