@@ -804,6 +804,19 @@ pub fn focus(handle: &PressHandle) -> bool {
     unsafe { handle.element.SetFocus().is_ok() }
 }
 
+/// Whether the element holding the keyboard focus is exactly this one.
+pub fn is_focused(handle: &PressHandle) -> bool {
+    with_automation(|automation| {
+        let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
+            return false;
+        };
+        unsafe { automation.CompareElements(&focused, &handle.element) }
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 /// Write an element's value. A read-only or unwilling element reports false rather than pretending.
 pub fn set_value(handle: &PressHandle, text: &str) -> bool {
     unsafe {
@@ -2046,6 +2059,8 @@ pub struct FormControl {
     pub value: String,
     pub checked: bool,
     pub required: bool,
+    /// UIA IsPassword: a password box. Its value is never read and nothing is ever typed in it.
+    pub password: bool,
     pub offscreen: bool,
     pub handle: PressHandle,
 }
@@ -2171,13 +2186,15 @@ pub fn page_scan(hwnd: isize) -> PageScan {
                         String::new()
                     };
                     prev_option = option;
+                    let password = unsafe { el.CurrentIsPassword() }.map(|b| b.as_bool()).unwrap_or(false);
                     scan.controls.push(FormControl {
                         kind: kind.to_string(),
                         label: name.clone(),
                         group,
-                        value: if option { String::new() } else { value_of(&el).unwrap_or_default() },
+                        value: if option || password { String::new() } else { value_of(&el).unwrap_or_default() },
                         checked: option && toggled(&el).unwrap_or(false),
                         required: unsafe { el.CurrentIsRequiredForForm() }.map(|b| b.as_bool()).unwrap_or(false),
+                        password,
                         offscreen: unsafe { el.CurrentIsOffscreen() }.map(|b| b.as_bool()).unwrap_or(false),
                         handle: PressHandle {
                             element: el.clone(),

@@ -186,21 +186,26 @@ pub trait Senses: Send + Sync {
         Err("launching apps is not available here".into())
     }
 
-    /// The form controls of the front window (text fields, radios, checkboxes, selects), read
-    /// from the page, including those scrolled out of view.
-    fn form_read(&self) -> Result<forms::PageView, String> {
+    /// The form controls of a window (text fields, radios, checkboxes, selects), read from the
+    /// page, including those scrolled out of view. `Foreground` must be a browser; `Named` is a
+    /// window the caller named; `Bound` is the window an earlier read chose. The view says which
+    /// window it came from.
+    fn form_read(&self, _target: &forms::Target) -> Result<forms::PageView, String> {
         Err("forms cannot be read here".into())
     }
 
-    /// Fill entries into the front window's form with real focus and keystrokes, then read the
-    /// page back and say per entry whether it holds. Only called in Act mode.
-    fn form_fill(&self, _entries: &[forms::FormEntry]) -> Result<Vec<forms::FormResult>, String> {
+    /// Fill entries into the window `target` (a handle from `form_read`) with real focus and
+    /// keystrokes, then read the page back and say per entry whether it holds. Before every
+    /// keystroke it must check that the front window is `target` and the focused element is the
+    /// expected field, and stop with an error if not. Only called in Act mode.
+    fn form_fill(&self, _target: isize, _entries: &[forms::FormEntry]) -> Result<Vec<forms::FormResult>, String> {
         Err("forms cannot be filled here".into())
     }
 
-    /// Press the page button or link named `label` with real focus and keys, wait for the page to
+    /// Press the button or link named `label` in window `target` with real focus and keys, after
+    /// checking the front window is `target` and the button holds the focus; wait for the page to
     /// settle, and say whether it changed. Only called in Act mode.
-    fn form_click(&self, _label: &str) -> Result<forms::ClickReport, String> {
+    fn form_click(&self, _target: isize, _label: &str) -> Result<forms::ClickReport, String> {
         Err("pages cannot be clicked here".into())
     }
 

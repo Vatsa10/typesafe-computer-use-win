@@ -448,26 +448,10 @@ pub fn read_only(command: &str, base: &Path, profile: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// Whether a command deletes or overwrites files (or the machine's state): those still ask in
-/// full autonomy. A coarse word check, because it only ever adds a question.
+/// Whether a command deletes, overwrites or changes machine state: those still ask in full
+/// autonomy. Parsed by statement, see [`safety::destructive_command`].
 pub fn destructive(command: &str) -> bool {
-    let c = command.to_lowercase();
-    if c.contains('>') {
-        return true;
-    }
-    c.split(|ch: char| !(ch.is_alphanumeric() || ch == '-' || ch == '_'))
-        .any(|w| {
-            matches!(
-                w,
-                "remove-item" | "rm" | "del" | "erase" | "rmdir" | "rd" | "ri" | "set-content"
-                    | "sc" | "out-file" | "clear-content" | "clc" | "move-item" | "mv" | "move"
-                    | "mi" | "rename-item" | "ren" | "rni" | "copy-item" | "cp" | "copy" | "cpi"
-                    | "new-item" | "ni" | "format-volume" | "clear-disk" | "remove-itemproperty"
-                    | "set-itemproperty" | "stop-computer" | "restart-computer" | "expand-archive"
-                    | "compress-archive" | "add-content" | "ac" | "tee-object" | "tee" | "invoke-expression"
-                    | "iex" | "start-process" | "invoke-webrequest" | "iwr" | "curl" | "wget"
-            ) || w.starts_with("remove-") || w.starts_with("set-") || w.starts_with("clear-")
-        })
+    safety::destructive_command(command)
 }
 
 #[cfg(test)]

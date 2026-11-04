@@ -225,28 +225,27 @@ impl Senses for LiveSenses {
         }
     }
 
-    fn form_read(&self) -> Result<wcore::assistant::forms::PageView, String> {
-        let hwnd = platform::winlist::foreground();
-        if hwnd == 0 {
-            return Err("no window is in front".into());
-        }
+    fn form_read(&self, target: &wcore::assistant::forms::Target) -> Result<wcore::assistant::forms::PageView, String> {
+        let (hwnd, _app) = resolve_form_window(target)?;
         let scan = platform::uia::page_scan(hwnd);
         if scan.controls.is_empty() && scan.buttons.is_empty() && scan.texts.is_empty() {
-            return Err("no page was found in the front window".into());
+            return Err("no page was found in that window".into());
         }
         Ok(wcore::assistant::forms::PageView {
+            hwnd,
             fields: scan.controls.iter().map(as_field).collect(),
             buttons: scan.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect(),
             texts: scan.texts.clone(),
         })
     }
 
-    fn form_click(&self, label: &str) -> Result<wcore::assistant::forms::ClickReport, String> {
-        use wcore::assistant::forms::{looks_like_error, pick_button, ClickReport};
-        let hwnd = platform::winlist::foreground();
-        if hwnd == 0 {
-            return Err("no window is in front".into());
+    fn form_click(&self, target: isize, label: &str) -> Result<wcore::assistant::forms::ClickReport, String> {
+        use wcore::assistant::forms::{looks_like_error, pick_button, verify_focus, ClickReport};
+        resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
+        if platform::winlist::foreground() != target {
+            return Err("the window in front is not the form's window: nothing was pressed".into());
         }
+        let hwnd = target;
         let before = platform::uia::page_scan(hwnd);
         let labels: Vec<(String, bool)> = before.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect();
         let i = pick_button(&labels, label)?;
@@ -255,6 +254,8 @@ impl Senses for LiveSenses {
         // Real focus and a real key: Space presses a button, Enter follows a link.
         platform::uia::focus(&button.handle);
         std::thread::sleep(Duration::from_millis(120));
+        verify_focus(platform::winlist::foreground(), target, platform::uia::is_focused(&button.handle))
+            .map_err(|e| format!("{e}: nothing was pressed"))?;
         platform::input::press(if button.link { 0x0D } else { 0x20 }, false);
         // Settle: the page's content must stop moving for three looks in a row, and a loading
         // message must be gone. No fixed sleep: a slow page is waited for, a fast one is not.
@@ -301,55 +302,12 @@ impl Senses for LiveSenses {
 
     fn form_fill(
         &self,
+        target: isize,
         entries: &[wcore::assistant::forms::FormEntry],
     ) -> Result<Vec<wcore::assistant::forms::FormResult>, String> {
-        use wcore::assistant::forms::{holds, plan, FormResult, Op};
-        let hwnd = platform::winlist::foreground();
-        if hwnd == 0 {
-            return Err("no window is in front".into());
-        }
-        let controls = platform::uia::form_controls(hwnd);
-        let fields: Vec<_> = controls.iter().map(as_field).collect();
-        if fields.is_empty() {
-            return Err("no form fields were found in the front window".into());
-        }
-        let (planned, mut results) = plan(&fields, entries);
-        let pause = |ms| std::thread::sleep(Duration::from_millis(ms));
-        for p in &planned {
-            let c = &controls[p.control];
-            // Focusing a web control scrolls it into view; then real keys.
-            platform::uia::focus(&c.handle);
-            pause(120);
-            match &p.op {
-                Op::Type(text) => {
-                    platform::input::press(0x41, true); // Ctrl+A: replace what is there
-                    pause(40);
-                    platform::input::type_text(text);
-                    pause(80);
-                }
-                Op::Check(want) => {
-                    if platform::uia::is_checked(&c.handle) != Some(*want) {
-                        platform::input::press(0x20, false); // Space
-                        pause(100);
-                        if platform::uia::is_checked(&c.handle) != Some(*want) {
-                            platform::uia::press(&c.handle);
-                            pause(100);
-                        }
-                    }
-                }
-            }
-        }
-        // Read the page back: it is what holds, not what was sent.
-        pause(200);
-        let after: Vec<_> = platform::uia::form_controls(hwnd).iter().map(as_field).collect();
-        for p in &planned {
-            let ok = after.len() == fields.len() && holds(&after, p);
-            results.push(FormResult {
-                field: entries[p.entry].field.clone(),
-                status: if ok { "ok" } else { "mismatch" }.into(),
-            });
-        }
-        Ok(results)
+        resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
+        let page = LivePage { hwnd: target, controls: std::cell::RefCell::new(Vec::new()) };
+        wcore::assistant::forms::drive(&page, target, entries)
     }
 
     fn switch_tab(&self, title: &str) -> Result<String, String> {
@@ -426,6 +384,92 @@ pub fn profile_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// The window a form tool reads. The front window must be a browser; any other app only when the
+/// caller named it; a bound handle only while that window still exists.
+fn resolve_form_window(target: &wcore::assistant::forms::Target) -> Result<(isize, String), String> {
+    use wcore::assistant::forms::Target;
+    let wins = platform::winlist::open_windows(platform::winlist::MIN_WINDOW_SIDE_PX);
+    match target {
+        Target::Foreground => {
+            let h = platform::winlist::foreground();
+            let w = wins.iter().find(|w| w.hwnd == h).ok_or("no window is in front")?;
+            if !wcore::world::BROWSER_PROCESSES.contains(&w.app.to_lowercase().as_str()) {
+                return Err(format!(
+                    "the window in front is {} (not a browser): refusing to read or fill it; bring the form's browser window forward, or name the window",
+                    w.app
+                ));
+            }
+            Ok((h, w.app.clone()))
+        }
+        Target::Named(name) => {
+            let n = name.to_lowercase();
+            let hits: Vec<_> = wins
+                .iter()
+                .filter(|w| w.app.to_lowercase().contains(&n) || w.title.to_lowercase().contains(&n))
+                .collect();
+            match hits.as_slice() {
+                [w] => Ok((w.hwnd, w.app.clone())),
+                [] => Err(format!("no window matches {name:?}")),
+                _ => Err(format!("{} windows match {name:?}: name it more exactly", hits.len())),
+            }
+        }
+        Target::Bound(h) => wins
+            .iter()
+            .find(|w| w.hwnd == *h)
+            .map(|w| (*h, w.app.clone()))
+            .ok_or_else(|| "the form's window is gone".to_string()),
+    }
+}
+
+/// The real page: UI Automation to find and focus, real keys to type.
+struct LivePage {
+    hwnd: isize,
+    controls: std::cell::RefCell<Vec<platform::uia::FormControl>>,
+}
+
+impl wcore::assistant::forms::Page for LivePage {
+    fn foreground(&self) -> isize {
+        platform::winlist::foreground()
+    }
+    fn focus(&self, i: usize) -> bool {
+        // Focusing a web control scrolls it into view.
+        let ok = self.controls.borrow().get(i).is_some_and(|c| platform::uia::focus(&c.handle));
+        std::thread::sleep(Duration::from_millis(120));
+        ok
+    }
+    fn focused_is(&self, i: usize) -> bool {
+        self.controls.borrow().get(i).is_some_and(|c| platform::uia::is_focused(&c.handle))
+    }
+    fn select_all(&self) {
+        platform::input::press(0x41, true);
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    fn type_text(&self, text: &str) {
+        platform::input::type_text(text);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    fn press_space(&self) {
+        platform::input::press(0x20, false);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    fn press_element(&self, i: usize) {
+        if let Some(c) = self.controls.borrow().get(i) {
+            platform::uia::press(&c.handle);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    fn checked(&self, i: usize) -> Option<bool> {
+        self.controls.borrow().get(i).and_then(|c| platform::uia::is_checked(&c.handle))
+    }
+    fn read(&self) -> Vec<wcore::assistant::forms::FormField> {
+        std::thread::sleep(Duration::from_millis(100));
+        let controls = platform::uia::form_controls(self.hwnd);
+        let fields = controls.iter().map(as_field).collect();
+        *self.controls.borrow_mut() = controls;
+        fields
+    }
+}
+
 fn as_field(c: &platform::uia::FormControl) -> wcore::assistant::forms::FormField {
     wcore::assistant::forms::FormField {
         kind: c.kind.clone(),
@@ -434,6 +478,7 @@ fn as_field(c: &platform::uia::FormControl) -> wcore::assistant::forms::FormFiel
         value: c.value.clone(),
         checked: c.checked,
         required: c.required,
+        password: c.password,
     }
 }
 
@@ -808,10 +853,10 @@ mod tests {
         fn world(&self) -> Result<wcore::world::Snapshot, String> { LiveSenses.world() }
         fn catalog(&self) -> Vec<CatApp> { LiveSenses.catalog() }
         fn open_app(&self, a: &CatApp) -> Result<String, String> { LiveSenses.open_app(a) }
-        fn form_read(&self) -> Result<wcore::assistant::forms::PageView, String> { LiveSenses.form_read() }
-        fn form_click(&self, l: &str) -> Result<wcore::assistant::forms::ClickReport, String> { LiveSenses.form_click(l) }
-        fn form_fill(&self, e: &[wcore::assistant::forms::FormEntry]) -> Result<Vec<wcore::assistant::forms::FormResult>, String> {
-            LiveSenses.form_fill(e)
+        fn form_read(&self, t: &wcore::assistant::forms::Target) -> Result<wcore::assistant::forms::PageView, String> { LiveSenses.form_read(t) }
+        fn form_click(&self, h: isize, l: &str) -> Result<wcore::assistant::forms::ClickReport, String> { LiveSenses.form_click(h, l) }
+        fn form_fill(&self, h: isize, e: &[wcore::assistant::forms::FormEntry]) -> Result<Vec<wcore::assistant::forms::FormResult>, String> {
+            LiveSenses.form_fill(h, e)
         }
         fn switch_tab(&self, _title: &str) -> Result<String, String> {
             Err("test guard: tabs are not switched in tests".into())
@@ -969,7 +1014,7 @@ mod tests {
 
         if std::env::var("POINTER_JOBFORM_KIND").as_deref() == Ok("pages") {
             // The single-page app prints what it submitted: read it from the page's own text.
-            let view = LiveSenses.form_read().unwrap_or_default();
+            let view = LiveSenses.form_read(&wcore::assistant::forms::Target::Foreground).unwrap_or_default();
             let sub = view.texts.iter().find(|t| t.starts_with("SUBMITTED")).cloned().unwrap_or_default();
             let data: Value = serde_json::from_str(sub.trim_start_matches("SUBMITTED").trim()).unwrap_or(Value::Null);
             let get = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -992,7 +1037,7 @@ mod tests {
             return;
         }
         // Read the page back: the values the page itself holds, field names and PASS/FAIL only.
-        let page = LiveSenses.form_read().unwrap_or_default().fields;
+        let page = LiveSenses.form_read(&wcore::assistant::forms::Target::Foreground).unwrap_or_default().fields;
         println!("LIVE page fields read: {}", page.len());
         for f in page.iter().filter(|f| f.kind != "text") {
             println!("LIVE   {} [{}] group {:?} checked {}", f.label, f.kind, f.group, f.checked);
