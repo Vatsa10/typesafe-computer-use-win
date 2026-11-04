@@ -20,7 +20,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
 
 // USD per million tokens, [input, output]. Estimates for the table only; edit to match your plan.
-export const PRICES = { openai: [2.0, 8.0], claude: [3.0, 15.0] };
+export const PRICES = { openai: [0.10, 0.50], claude: [0.10, 0.50] }; // gpt-6-luna, claude-haiku-5-5, USD per 1M tokens
 
 // ---- success checks -------------------------------------------------------------------------
 
