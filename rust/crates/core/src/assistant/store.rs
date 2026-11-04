@@ -133,9 +133,34 @@ pub fn strip_images(messages: &mut [Value]) {
 
 /// Write a conversation, atomically, with secrets scrubbed and images dropped. Best effort: a
 /// full disk must not end the turn.
+/// Tools whose results hold what was on the screen or in front of the camera.
+const NOT_SAVED: [&str; 2] = ["observe", "camera_look"];
+
+/// A screen read holds window titles, chats and documents, and goes stale at once, so only the
+/// conversation is kept on disk. The live conversation keeps it until the turn is compacted.
+fn drop_screen_reads(messages: &mut [Value]) {
+    let ids: Vec<String> = messages
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter(|c| {
+            let name = c.pointer("/function/name").and_then(Value::as_str);
+            name.is_some_and(|n| NOT_SAVED.contains(&n))
+        })
+        .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    for m in messages.iter_mut() {
+        let id = m.get("tool_call_id").and_then(Value::as_str);
+        if id.is_some_and(|id| ids.iter().any(|x| x == id)) {
+            m["content"] = json!("[screen read, not saved]");
+        }
+    }
+}
+
 pub fn save(dir: &Path, id: &str, messages: &[Value]) {
     let mut kept = messages.to_vec();
     strip_images(&mut kept);
+    drop_screen_reads(&mut kept);
     let body = json!({ "id": id, "messages": kept }).to_string();
     let body = scrub(&body, &env_secrets());
     if std::fs::create_dir_all(dir).is_err() {
@@ -287,5 +312,41 @@ mod tests {
         assert_eq!(hits[0]["conversation"], "chat-1");
         assert!(search(&dir, "", 5).is_empty());
         assert!(search(&dir, "nothing here", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod screen_read_tests {
+    use super::*;
+
+    #[test]
+    fn screen_reads_are_not_written_and_the_talk_is() {
+        let dir = std::env::temp_dir().join(format!("pointer-store-{}", std::process::id()));
+        let call = |id: &str, name: &str| {
+            json!({ "role": "assistant", "content": "", "tool_calls": [
+                { "id": id, "type": "function", "function": { "name": name, "arguments": "{}" } }
+            ] })
+        };
+        let result =
+            |id: &str, text: &str| json!({ "role": "tool", "tool_call_id": id, "content": text });
+        let messages = vec![
+            json!({ "role": "user", "content": "what is this" }),
+            call("a", "observe"),
+            result("a", "private chat title"),
+            call("b", "interact"),
+            result("b", "ok: spoken"),
+        ];
+        save(&dir, "chat-test", &messages);
+        let text = std::fs::read_to_string(dir.join("chat-test.json")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!text.contains("private chat title"));
+        assert!(text.contains("what is this") && text.contains("ok: spoken"));
+        // Every call still has a result, so the saved history stays valid for the API.
+        let mut back = serde_json::from_str::<Value>(&text).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        repair(&mut back);
+        assert_eq!(back.len(), 5);
     }
 }

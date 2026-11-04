@@ -150,6 +150,15 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// The app actually in front. `app` is the one being read, which for a question is the app on
+    /// the monitor under the mouse: the two differ whenever the mouse is on another display.
+    pub fn front_app(&self) -> &str {
+        self.windows
+            .iter()
+            .find(|w| w.foreground)
+            .map_or(self.app.as_str(), |w| w.app.as_str())
+    }
+
     pub fn size_pt(&self) -> (f64, f64) {
         (
             self.width as f64 / self.scale,
@@ -330,5 +339,49 @@ mod tests {
         assert!(f.is_text());
         f.role = "AXButton".into();
         assert!(!f.is_text());
+    }
+}
+
+#[cfg(test)]
+mod front_app_tests {
+    use super::*;
+    use platform::winlist::WindowInfo;
+
+    fn window(app: &str, foreground: bool) -> WindowInfo {
+        WindowInfo {
+            hwnd: 1,
+            title: "t".into(),
+            app: app.into(),
+            pid: 1,
+            rect: (0, 0, 100, 100),
+            monitor: 0,
+            minimized: false,
+            foreground,
+        }
+    }
+
+    #[test]
+    fn the_front_app_is_the_foreground_window_not_the_one_being_read() {
+        let mut s = Screen {
+            bgra: Vec::new(),
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            app: "Code".into(),
+            field: None,
+            url: None,
+            pid: None,
+            window: None,
+            origin: (0.0, 0.0),
+            monitor: 0,
+            pointer: None,
+            windows: vec![window("Code", false), window("chrome", true)],
+            monitors: Vec::new(),
+            ax_refs: Default::default(),
+            offscreen: Vec::new(),
+        };
+        assert_eq!(s.front_app(), "chrome");
+        s.windows.clear(); // our own panel is in front, so nothing listed is
+        assert_eq!(s.front_app(), "Code");
     }
 }

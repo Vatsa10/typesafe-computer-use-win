@@ -346,7 +346,8 @@ pub fn launch_with(app: &App, opener: impl FnOnce(&str) -> bool) -> bool {
 
 /// Where the built app list is cached.
 pub fn cache_path() -> PathBuf {
-    crate::catalog::local_dir().join("apps.json")
+    // v2: lists without Store apps must not survive in the old cache for a day.
+    crate::catalog::local_dir().join("apps-v2.json")
 }
 
 fn now_seconds() -> f64 {
@@ -414,7 +415,69 @@ fn write_cache(path: &Path, apps: &[App]) {
 /// Rebuilds on `refresh=true`, when the cache is absent, corrupt, or more than 24 hours old.
 /// Walking two Start Menu trees is far too slow to repeat on every step of a run.
 pub fn list_apps(refresh: bool) -> Vec<App> {
-    list_apps_with(refresh, &start_menu_roots(), &cache_path())
+    if !refresh {
+        if let Some(cached) = read_cache(&cache_path()) {
+            return cached;
+        }
+    }
+    let apps = with_store_apps(read_start_menu(&start_menu_roots()), &read_start_apps());
+    write_cache(&cache_path(), &apps);
+    apps
+}
+
+/// Store apps, as (name, AppID) pairs, from `Get-StartApps`. Notepad, Calculator, Paint and Settings
+/// are packaged apps on Windows 11: they have no Start Menu shortcut, so the walk never sees them.
+/// A machine where this fails just keeps the shortcuts.
+fn read_start_apps() -> Vec<(String, String)> {
+    use std::os::windows::process::CommandExt;
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;                   Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress";
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    match output {
+        Ok(out) if out.status.success() => parse_start_apps(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// `ConvertTo-Json` output: an array, or a bare object when there is exactly one app.
+fn parse_start_apps(text: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let rows = match value {
+        Value::Array(rows) => rows,
+        one @ Value::Object(_) => vec![one],
+        _ => return Vec::new(),
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let name = row.get("Name")?.as_str()?.trim();
+            let id = row.get("AppID")?.as_str()?.trim();
+            Some((name.to_string(), id.to_string()))
+        })
+        .collect()
+}
+
+/// Add the packaged apps the shortcuts missed. Only an id with `!` is packaged: the rest of
+/// `Get-StartApps` is file paths and shortcuts the walk already judged. The same drop list applies,
+/// so the accessibility tools stay out. The id comes from Windows, never from model text.
+fn with_store_apps(mut apps: Vec<App>, start_apps: &[(String, String)]) -> Vec<App> {
+    let mut known: HashSet<String> = apps.iter().map(|a| a.label.to_lowercase()).collect();
+    for (name, id) in start_apps {
+        if !id.contains('!') || dropped(name, Path::new("")) || !known.insert(name.to_lowercase()) {
+            continue;
+        }
+        apps.push(App {
+            key: String::new(),
+            label: name.clone(),
+            url: format!("shell:AppsFolder\\{id}"),
+            weight: TOP_WEIGHT,
+            source: SOURCE.to_string(),
+        });
+    }
+    unique_keys(apps)
 }
 
 /// `list_apps` with explicit roots and cache file.
@@ -433,6 +496,34 @@ pub fn list_apps_with(refresh: bool, roots: &[PathBuf], cache: &Path) -> Vec<App
 mod tests {
     use super::*;
     use crate::catalog::tests::TempDir;
+
+    #[test]
+    fn store_apps_join_the_list_but_not_duplicates_paths_or_blocked_tools() {
+        let shortcut = App {
+            key: "paint".into(),
+            label: "Paint".into(),
+            url: "C:\\paint.lnk".into(),
+            weight: 1.0,
+            source: SOURCE.into(),
+        };
+        let raw = r#"[{"Name":"Notepad","AppID":"Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"},
+                      {"Name":"Paint","AppID":"Microsoft.Paint_8wekyb3d8bbwe!App"},
+                      {"Name":"Narrator","AppID":"Some.Narrator_x!App"},
+                      {"Name":"Loose","AppID":"C:\\tools\\loose.exe"}]"#;
+        let apps = with_store_apps(vec![shortcut], &parse_start_apps(raw));
+        let notepad = apps.iter().find(|a| a.label == "Notepad").unwrap();
+        assert_eq!(notepad.url, "shell:AppsFolder\\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App");
+        assert_eq!(notepad.key, "notepad");
+        assert_eq!(apps.iter().filter(|a| a.label == "Paint").count(), 1);
+        assert!(!apps.iter().any(|a| a.label == "Narrator" || a.label == "Loose"));
+    }
+
+    #[test]
+    fn one_app_or_bad_output_from_powershell_is_tolerated() {
+        let one = parse_start_apps(r#"{"Name":"Notepad","AppID":"x!App"}"#);
+        assert_eq!(one, vec![("Notepad".to_string(), "x!App".to_string())]);
+        assert!(parse_start_apps("not json").is_empty());
+    }
     use crate::shortlist::shortlist;
 
     fn slug_shape() -> Regex {

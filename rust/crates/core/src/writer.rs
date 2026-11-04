@@ -190,7 +190,8 @@ pub fn compose_text(
     let packet = json!({
         "goal": goal,
         "now": now_context(),
-        "frontmost_app": screen.app,
+        "frontmost_app": screen.front_app(),
+        "app_being_read": screen.app,
         "previous_actions": last(history, 8),
         "focused_field": screen.field.as_ref().map(Field::summary),
         "text_near_field": near_field(screen, items, 160.0),
@@ -290,7 +291,8 @@ pub fn compose_answer(
         "now": now_context(),
         "why_the_run_stopped": stopped,
         "actions_taken": history,
-        "frontmost_app": screen.app,
+        "frontmost_app": screen.front_app(),
+        "app_being_read": screen.app,
         "browser_active_tab_url": screen.url,
         "screen_text_in_reading_order": text,
     });
@@ -324,7 +326,8 @@ pub fn compose_explanation(
     let mut packet = json!({
         "question": question,
         "now": now_context(),
-        "frontmost_app": screen.app,
+        "frontmost_app": screen.front_app(),
+        "app_being_read": screen.app,
         "browser_active_tab_url": screen.url,
         "screen_text_in_reading_order": text,
     });
@@ -405,7 +408,8 @@ pub fn compose_teach(
     let mut packet = json!({
         "question": question,
         "now": now_context(),
-        "frontmost_app": screen.app,
+        "frontmost_app": screen.front_app(),
+        "app_being_read": screen.app,
         "browser_active_tab_url": screen.url,
         "items": listed,
     });
