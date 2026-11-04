@@ -311,7 +311,7 @@ fn low_confidence_goes_to_the_agent() {
         "open calculator",
     );
     assert!(r.desk.opened.lock().unwrap().is_empty());
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
     assert!(lines(&r).iter().any(|l| l.starts_with("path: agent")));
     let r = rig("fast-low2", true, vec![saying("ok")]);
     say_to(
@@ -320,14 +320,14 @@ fn low_confidence_goes_to_the_agent() {
         "open calculator",
     );
     assert!(r.desk.opened.lock().unwrap().is_empty());
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
 }
 
 #[test]
 fn needs_agent_and_a_dead_classifier_go_to_the_agent() {
     let r = rig("fast-na", true, vec![saying("ok")]);
     say_to(&r, pick("needs_agent", 1.0, "none", 1.0), "what time is it");
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
     let r = rig("fast-dead", true, vec![saying("ok")]);
     let mut c = Pick {
         fail: true,
@@ -342,7 +342,7 @@ fn needs_agent_and_a_dead_classifier_go_to_the_agent() {
     };
     c.fail = true;
     say_to(&r, Arc::new(c), "open calculator");
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn a_confident_wrong_guess_cannot_launch_anything() {
             line,
         );
         assert!(r.desk.opened.lock().unwrap().is_empty(), "{line}");
-        assert_eq!(r.chat.calls().len(), 1, "{line}");
+        assert!(!r.chat.calls().is_empty(), "{line}"); // reached the agent; pursuit may nudge it again
     }
 }
 
@@ -443,7 +443,7 @@ fn stop_and_pause_only_for_bare_lines() {
         pick("stop", 1.0, "none", 0.0),
         "stop the music in spotify",
     );
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
 }
 
 #[test]
@@ -457,7 +457,7 @@ fn the_switch_turns_it_off() {
     });
     a.run_turn("open calculator", "typed", &Cancel::new());
     assert_eq!(c.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
 }
 
 #[test]
@@ -487,5 +487,5 @@ fn an_app_that_already_has_a_window_goes_to_the_agent() {
         "open slack",
     );
     assert!(r.desk.opened.lock().unwrap().is_empty());
-    assert_eq!(r.chat.calls().len(), 1);
+    assert!(!r.chat.calls().is_empty()); // reached the agent; pursuit may nudge it again
 }
