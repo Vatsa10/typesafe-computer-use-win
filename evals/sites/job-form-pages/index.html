@@ -1,0 +1,22 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Application - page 1 of 3</title>
+<style>body{background:#f0ebf8;font:16px Segoe UI,sans-serif;margin:0}.w{max-width:680px;margin:20px auto;padding:0 12px}.c{background:#fff;border:1px solid #dadce0;border-radius:8px;padding:22px;margin-bottom:12px}.h{border-top:10px solid #673ab7}label{display:block;margin-bottom:12px}input[type=text],input[type=email],textarea{width:100%;border:0;border-bottom:1px solid #bbb;font:inherit;padding:6px 0;box-sizing:border-box}button{background:#673ab7;color:#fff;border:0;border-radius:4px;font:inherit;padding:9px 24px;margin-right:8px}.e{color:#d93025;display:none}.spin{padding:60px;text-align:center}.pad{height:900px}#jobs li{margin:8px 0}</style></head><body><div class="w"><div class="c h"><h1 id="t">Application</h1><div id="p">Page 1 of 3</div></div><div id="v"></div></div>
+<script>
+// A web app: pages swap with no reload, after a delay, and required fields block Next.
+const data={};let page=0;const delay=900;
+const jobs=["Data Analyst","QA Engineer","Designer","Support Lead","Product Manager","Software Engineer","Sales Rep","Writer"];let jp=0;
+const pages=[
+()=>`<div class=c><label for=n>Full name *</label><input id=n type=text data-k=full_name required></div>
+<div class=c><label for=e>Email *</label><input id=e type=email data-k=email required></div><div class=e id=err>This is a required question</div>`,
+()=>{const s=jobs.slice(jp*3,jp*3+3);return `<div class=c><div>Choose the role: Software Engineer *</div><ul id=jobs>${s.map(j=>`<li><label><input type=radio name=role value="${j}"> ${j}</label></li>`).join('')}</ul>
+<button type=button id=more ${jp*3+3>=jobs.length?'disabled':''}>Next results</button> <span>Results page ${jp+1} of 3</span></div><div class=e id=err>Pick the role</div>`},
+()=>`<div class=pad></div><div class=c><label for=c>Most recent company *</label><input id=c type=text data-k=company required></div>
+<div class=c><label for=w>Why this role?</label><textarea id=w data-k=why rows=3></textarea></div><div class=e id=err>This is a required question</div>`];
+function render(){document.title=`Application - page ${page+1} of 3`;p.textContent=`Page ${page+1} of 3`;v.innerHTML=pages[page]()+`<div class=c>${page?'<button type=button id=back>Back</button>':''}<button type=button id=next>${page==2?'Submit':'Next'}</button></div>`;
+for(const i of v.querySelectorAll('[data-k]'))i.value=data[i.dataset.k]||'';
+if(window.next)next.onclick=go;if(window.back)back.onclick=()=>load(page-1);
+const m=document.getElementById('more');if(m)m.onclick=()=>{jp++;v.innerHTML='<div class="c spin">Loading results...</div>';setTimeout(render,delay)}}
+function load(n){page=n;v.innerHTML='<div class="c spin">Loading...</div>';setTimeout(render,delay)}
+function go(){let ok=true;for(const i of v.querySelectorAll('[data-k]')){data[i.dataset.k]=i.value;if(i.required&&!i.value)ok=false}
+const r=v.querySelector('input[name=role]:checked');if(page==1){if(r)data.role=r.value;else ok=false}
+if(!ok){err.style.display='block';return}if(page<2)return load(page+1);v.innerHTML='<div class=c id=out></div>';out.textContent='SUBMITTED '+JSON.stringify(data);document.title='SUBMITTED'}
+render()</script><script src="/_report.js"></script></body></html>
