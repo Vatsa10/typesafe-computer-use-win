@@ -282,15 +282,13 @@ impl Pursuit {
             ));
         }
         if tool == "switch_tab" && self.kind == GoalKind::Form && self.form_touched && !self.met() && !self.switch_warned {
-            if !self.switch_warned {
-                self.switch_warned = true;
-                return Some(
-                    "error: you are in the middle of a form and switching tabs loses your place. Try: \
-                     form_read the current page and form_click its Next or Submit; call world first if \
-                     the form really moved to another tab, then switch_tab again."
-                        .to_string(),
-                );
-            }
+            self.switch_warned = true;
+            return Some(
+                "error: you are in the middle of a form and switching tabs loses your place. Try: \
+                 form_read the current page and form_click its Next or Submit; call world first if \
+                 the form really moved to another tab, then switch_tab again."
+                    .to_string(),
+            );
         }
         None
     }
