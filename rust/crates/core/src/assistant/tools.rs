@@ -104,9 +104,7 @@ fn schema_of(name: &str) -> Value {
     match name {
         "interact" => func(
             "interact",
-            "The only way to reach the user. Speak a short line, show a short text and mark items on the \
-             screen, all together in one call. Give at least one of speech, text, marks. A mark names an \
-             item number from your latest observe, or a box from locate (located: L1).",
+            "Reach the user: speak, show text and mark screen items in one call (at least one of speech, text, marks). Marks use item numbers from your latest observe, or a locate box (L1).",
             json!({
                 "speech": {"type": "string", "description": "What to say aloud: one or two plain sentences."},
                 "text": {"type": "string", "description": "Text to show on screen. Defaults to the speech."},
@@ -122,52 +120,37 @@ fn schema_of(name: &str) -> Value {
         ),
         "observe" => func(
             "observe",
-            "Look at the screen under the mouse: numbered items (text and controls), open windows, \
-             displays and where the mouse is. Call it before pointing at anything.",
+            "Numbered items, windows and displays under the mouse. Call before pointing. On error: world, then observe again.",
             json!({}),
             &[],
         ),
         "locate" => func(
             "locate",
-            "Find something on the screen that observe did not list (an icon, an image, a region) by \
-             asking a vision model where it is, and get a box you can point at with interact \
-             (located: L1). It only looks: it never clicks, and the box is a guess, so say so if \
-             unsure. If observe already lists the thing, use its item number instead.",
+            "Find what observe did not list (icon, image, region) with vision; returns a box (L1) to mark. Looks only, never clicks; the box is a guess. Use observe's number if it lists the thing.",
             json!({"what": {"type": "string", "description": "What to find, in plain words."}}),
             &["what"],
         ),
         "world" => func(
             "world",
-            "What Pointer knows about the machine: every open window by display, browser tab \
-             titles and the active address, installed apps and their keys, what changed lately and \
-             what Pointer did. A short version is already in each turn; call this for the full \
-             list. section: windows, tabs, apps, changes or actions (default all).",
+            "Full machine state: windows by display, tab titles, app keys, recent changes and actions. A short version arrives each turn. section: windows, tabs, apps, changes, actions, all.",
             json!({"section": {"type": "string", "enum": ["windows", "tabs", "apps", "changes", "actions", "all"]}}),
             &[],
         ),
         "open_app" => func(
             "open_app",
-            "Launch an installed app by its key from the world tool's apps (Store apps such as \
-             Notepad and Calculator included). Prefer it to pointer_run for plain launches. In Dry \
-             mode it launches nothing and reports what it would launch: call it anyway and tell the \
-             user.",
+            "Launch an app by its key from world's apps. Prefer it to pointer_run for launches. Dry mode: reports what it would launch; call it anyway. On error: world for the key.",
             json!({"key": {"type": "string", "description": "An app key from the world tool, such as notepad."}}),
             &["key"],
         ),
         "switch_tab" => func(
             "switch_tab",
-            "Bring a Chrome or Edge tab forward by its title (from the world tool's tabs). It only \
-             selects the tab. In Dry mode it presses nothing and reports which tab it would select: \
-             call it anyway and tell the user.",
+            "Bring a Chrome or Edge tab forward by title (from world's tabs). Dry mode: reports the tab; call it anyway. Never mid-form. On error: world for the exact title.",
             json!({"title": {"type": "string", "description": "The tab's title, or enough of it to be unique."}}),
             &["title"],
         ),
         "pointer_run" => func(
             "pointer_run",
-            "Operate the computer toward one goal with Pointer's own look-and-act loop, and wait for \
-             it. Not for web forms or their buttons (Next, Submit): use form_read, form_autofill,              form_fill and form_click for those. In Dry mode it presses nothing and only reports what it would do: that is the point \
-             of Dry mode, so call it anyway and tell the user what would happen. Returns the outcome \
-             and its answer.",
+            "Operate the screen toward one goal and wait. Not for web form fields or buttons: use form_read, form_autofill, form_fill, form_click. Dry mode: reports what it would do; call it anyway and say so. Returns outcome and answer. On failure: reword the goal or change route.",
             json!({"goal": {"type": "string", "description": "One clear goal in plain English."}}),
             &["goal"],
         ),
@@ -205,8 +188,7 @@ fn schema_of(name: &str) -> Value {
         ),
         "start_task" => func(
             "start_task",
-            "Start a background task (at most three at once) for a longer job that needs no screen. \
-             It reports back on its own.",
+            "Start a background task (max three) for a longer job that needs no screen; it reports back itself.",
             json!({"title": {"type": "string"}, "instructions": {"type": "string"}}),
             &["title", "instructions"],
         ),
@@ -231,9 +213,7 @@ fn schema_of(name: &str) -> Value {
         ),
         "find_documents" => func(
             "find_documents",
-            "Find documents on this computer (resumes, PDFs, Word files, notes) by what they are about. \
-             kind resume ranks files that read like a resume, newest first. Returns file names, paths \
-             and dates, never contents.",
+            "Find documents (resumes, PDFs, notes) by topic; kind resume ranks resume-like files newest first. Returns names, paths and dates, not contents. Nothing found: try a shorter word or list_dir.",
             json!({"query": {"type": "string", "description": "Words about the document, such as resume."},
                    "kind": {"type": "string", "enum": ["resume", "any"]},
                    "limit": {"type": "integer"}}),
@@ -241,18 +221,13 @@ fn schema_of(name: &str) -> Value {
         ),
         "get_profile" => func(
             "get_profile",
-            "Read one resume found by find_documents into a structured profile (name, contact, work, \
-             education, skills). Use form_answer for each form field rather than reading values off it.",
+            "Read a resume from find_documents into a profile (name, contact, work, education, skills). Use form_answer per field.",
             json!({"path": {"type": "string", "description": "A path from find_documents."}}),
             &["path"],
         ),
         "form_answer" => func(
             "form_answer",
-            "Answer one form field. Returns a value to type, or needs_user when there is no answer to \
-             give: personal questions (salary, notice period, visa, gender, disability, race, veteran, \
-             relocation, criminal history, attestations) are answered only from the answers the user \
-             saved, never from the resume, and never invent one. needs_user on an optional field means \
-             leave it empty; on a required one, ask the user once for all the missing ones together.",
+            "Answer one form field: a value to type, or needs_user. Personal questions (salary, notice, visa, gender, disability, race, veteran, relocation, criminal history, attestations) come only from saved answers; never invent one. needs_user: skip if optional, ask once for all if required.",
             json!({"label": {"type": "string", "description": "The field's label as the form shows it."},
                    "options": {"type": "array", "items": {"type": "string"},
                                "description": "The choices, for a radio group or a select."}}),
@@ -260,45 +235,26 @@ fn schema_of(name: &str) -> Value {
         ),
         "form_read" => func(
             "form_read",
-            "Read the form in the front window straight from the page: every text field, radio \
-             group, checkbox and select, in order, with its label, its question (radios and \
-             checkboxes), whether it is required and what it holds now. Includes fields scrolled out \
-             of view.",
+            "Read the form in the front window from the page: every field, radio group, checkbox and select with label, question, required flag and current value, including below the fold.",
             json!({}),
             &[],
         ),
         "form_fill" => func(
             "form_fill",
-            "Fill the form in the front window, field by field, with real focus and typing, scrolling \
-             to each field itself, then read the page back and report per entry ok, mismatch, \
-             not_found, ambiguous or skipped (empty value). Prefer it to pointer_run for a form. Each \
-             entry is a field label (or a radio or checkbox question) and a value: the text to type, \
-             the option to choose, or true or false for a checkbox. Pass only values you have from \
-             form_answer or the profile; leave out what you have no answer for. Never tick a box the \
-             resume does not support.",
+            "Fill fields in the front window with real typing, scrolling to each, then read back; reports per entry ok, mismatch, not_found, ambiguous or skipped. entries: field label or question, and value (text, option, true/false). Only values you were given; never tick an unsupported box. Retry a mismatch once.",
             json!({"entries": {"type": "array", "items": {"type": "object", "properties": {
                 "field": {"type": "string"}, "value": {"type": "string"}}, "required": ["field", "value"]}}}),
             &["entries"],
         ),
         "form_click" => func(
             "form_click",
-            "Press a button or link of the page in the front window by its label (Next, Continue, \
-             Back, Submit, Next results, More...) with real focus and keys, wait until the page has \
-             settled, and report whether the page changed, any validation errors shown, and the \
-             required fields still empty. In Dry mode it presses nothing. If changed is false, do \
-             not press it again: read the errors, fix the fields, or tell the user what is blocking.",
+            "Press a page button or link by label (Next, Continue, Back, Submit, More...) and wait for the page to settle; reports page_changed, errors and required_still_empty. Dry mode: presses nothing. page_changed false: do not press again; fix the errors or report the blocker.",
             json!({"label": {"type": "string"}}),
             &["label"],
         ),
         "form_autofill" => func(
             "form_autofill",
-            "Fill the whole form in the front window in one call: it reads the fields, answers every \
-             one it can from the profile and the user's saved answers (get_profile first), types them \
-             into the page, ticks only the skills the resume lists, and reads the page back. Returns \
-             what was filled and `remaining`: the fields it had no answer for, each with a reason. \
-             Answer the rest yourself with form_fill when you can from the resume (a free-text \
-             question, years of experience), and leave sensitive ones empty unless a saved answer \
-             exists.",
+            "Fill the whole form in the front window in one call from the profile and saved answers (get_profile first). Returns what was filled and `remaining` with reasons: answer those with form_fill from the resume, leave sensitive ones empty unless saved.",
             json!({}),
             &[],
         ),
@@ -311,9 +267,7 @@ fn schema_of(name: &str) -> Value {
         ),
         "confirm" => func(
             "confirm",
-            "Ask the user yes or no, with a plain summary. Only before a payment or purchase, deleting \
-             or overwriting the user's files, or entering a password. Denied or unanswered means do not \
-             go ahead.",
+            "Ask the user yes or no with a plain summary: before a payment, deleting or overwriting files, or entering a password. Denied or unanswered means stop.",
             json!({"summary": {"type": "string"}}),
             &["summary"],
         ),

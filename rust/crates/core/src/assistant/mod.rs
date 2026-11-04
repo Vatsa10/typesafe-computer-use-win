@@ -15,9 +15,11 @@ pub mod control;
 pub mod forms;
 pub mod gate;
 pub mod pending;
+pub mod pursuit;
 pub mod readonly;
 pub mod safety;
 pub mod shell;
+pub mod skills;
 pub mod store;
 pub mod tasks;
 pub mod testing;
@@ -245,6 +247,8 @@ pub struct Limits {
     /// Model calls in one foreground turn.
     pub max_iterations: usize,
     pub turn_time: Duration,
+    /// Estimated prompt tokens one goal may use.
+    pub turn_tokens: usize,
     pub task_iterations: usize,
     pub task_time: Duration,
     pub confirm_wait: Duration,
@@ -262,6 +266,7 @@ impl Default for Limits {
         Self {
             max_iterations: 12,
             turn_time: Duration::from_secs(180),
+            turn_tokens: 500_000,
             task_iterations: 30,
             task_time: Duration::from_secs(900),
             confirm_wait: Duration::from_secs(60),
@@ -452,6 +457,7 @@ impl Assistant {
                 (self.svc.autonomy_full)(),
             ),
             max_iterations: self.svc.limits.max_iterations,
+            max_tokens: self.svc.limits.turn_tokens,
             time: self.svc.limits.turn_time,
         };
         let mut ctx = TurnCtx::default();
@@ -474,6 +480,9 @@ impl Assistant {
                 );
                 self.svc
                     .emit("line", json!({ "text": format!("assistant: {why}") }));
+            }
+            LoopEnd::Stuck(report) => {
+                self.svc.emit("reply", json!({ "text": report }));
             }
             LoopEnd::OutOfSteps => {
                 self.svc.emit("reply", json!({ "text":

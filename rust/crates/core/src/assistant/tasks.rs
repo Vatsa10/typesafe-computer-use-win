@@ -307,6 +307,7 @@ impl Tasks {
             memory: &memory,
             system: agent::task_prompt(title),
             max_iterations: self.svc.limits.task_iterations,
+            max_tokens: self.svc.limits.turn_tokens,
             time: self.svc.limits.task_time,
         };
         let dir = self.svc.conversations_dir();
@@ -324,6 +325,7 @@ impl Tasks {
             LoopEnd::Failed(e) => ("failed", e),
             LoopEnd::OutOfSteps => ("failed", "ran out of steps".into()),
             LoopEnd::OutOfTime => ("failed", "ran out of time".into()),
+            LoopEnd::Stuck(r) => ("failed", r),
         }
     }
 }

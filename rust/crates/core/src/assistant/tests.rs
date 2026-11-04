@@ -240,7 +240,7 @@ fn cancelling_a_running_pointer_run_leaves_a_consistent_history() {
     a.chat("never mind, what time is it", "voice").unwrap();
     wait(|| !h.emit.of("reply").is_empty());
     wait(|| !a.busy());
-    assert_eq!(tool_result(&h, "1"), "error: the run was stopped");
+    assert!(tool_result(&h, "1").starts_with("error: the run was stopped"));
     // Every call in the saved history has its result.
     let dir = h.svc.conversations_dir();
     let id = std::fs::read_dir(&dir)
