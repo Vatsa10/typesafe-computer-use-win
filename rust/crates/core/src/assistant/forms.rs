@@ -46,20 +46,10 @@ pub struct ClickReport {
     /// Whether the page's content differs from before the click.
     pub changed: bool,
     pub settle_ms: u64,
-    /// Visible text that looks like a validation error.
-    pub errors: Vec<String>,
     /// Required fields still empty, by label.
     pub required_empty: Vec<String>,
     /// Text that appeared on the page because of the click (first few, clipped).
     pub new_text: Vec<String>,
-}
-
-/// Text that reads as a validation message.
-pub fn looks_like_error(t: &str) -> bool {
-    let l = t.to_lowercase();
-    ["required", "invalid", "error", "must ", "please ", "incorrect", "try again", "cannot be", "can't be", "pick the"]
-        .iter()
-        .any(|w| l.contains(w))
 }
 
 /// The enabled button `label` names: exact first, else a single partial match.
@@ -470,7 +460,6 @@ mod tests {
         assert_eq!(pick_button(&b, "next"), Ok(1));
         assert!(pick_button(&b, "Next results").unwrap_err().contains("disabled"));
         assert!(pick_button(&b, "Submit").is_err());
-        assert!(looks_like_error("This is a required question") && !looks_like_error("Page 2 of 3"));
     }
 
     #[test]

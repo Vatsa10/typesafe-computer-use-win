@@ -225,21 +225,6 @@ fn run_tool(cfg: &LoopCfg, ctx: &mut TurnCtx, name: &str, args: &Value) -> Strin
     tools::dispatch(&mut env, name, args)
 }
 
-/// Close a cookie banner, popup or overlay generically: the least committing button first. Returns
-/// the label that worked.
-fn clear_blocker(cfg: &LoopCfg, ctx: &mut TurnCtx) -> Option<&'static str> {
-    for label in pursuit::BLOCKER_LABELS {
-        if cfg.cancel.is_cancelled() {
-            return None;
-        }
-        let r = run_tool(cfg, ctx, "form_click", &json!({ "label": label }));
-        if !r.trim_start().starts_with("error") {
-            return Some(label);
-        }
-    }
-    None
-}
-
 /// Run the loop over `messages` (which already end with the user's message). `persist` is called
 /// after every round so a crash loses at most one step.
 pub fn run(
@@ -441,17 +426,6 @@ pub fn run(
             }
             if let Some(p) = pursuit.as_mut() {
                 let looped = p.after_call(&call.name, &args, &result);
-                let blocked_page = call.name != "interact"
-                    && !call.name.starts_with("form_click")
-                    && pursuit::blocker_in(&result);
-                if (looped.is_some() || blocked_page) && p.blockers_cleared < 3 {
-                    p.blockers_cleared += 1;
-                    if let Some(label) = clear_blocker(cfg, ctx) {
-                        result.push_str(&format!(
-                            "\n[runtime] Cleared a banner or overlay by pressing {label:?}. Look again, then retry."
-                        ));
-                    }
-                }
                 if let Some(note) = looped {
                     result.push_str(&note);
                 }

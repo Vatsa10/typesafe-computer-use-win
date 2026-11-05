@@ -66,39 +66,6 @@ pub const FORM_STRATEGIES: [&str; 5] = [
     "tell the user exactly what blocks the form",
 ];
 
-/// Labels tried, least commitment first, to clear a cookie banner, popup or overlay.
-pub const BLOCKER_LABELS: [&str; 9] = [
-    "Reject all",
-    "Reject",
-    "Decline",
-    "Only necessary",
-    "No thanks",
-    "Not now",
-    "Close",
-    "Dismiss",
-    "Accept all",
-];
-
-const BLOCKER_WORDS: [&str; 11] = [
-    "cookie",
-    "consent",
-    "overlay",
-    "popup",
-    "pop-up",
-    "modal",
-    "banner",
-    "intercept",
-    "obscured",
-    "covered by",
-    "subscribe to our newsletter",
-];
-
-/// Does a tool result suggest something is sitting on top of the page?
-pub fn blocker_in(result: &str) -> bool {
-    let r = result.to_lowercase();
-    BLOCKER_WORDS.iter().any(|w| r.contains(w))
-}
-
 #[derive(Debug, Clone)]
 pub struct Attempt {
     pub tool: String,
@@ -674,12 +641,16 @@ pub const NO: f64 = 0.35;
 pub enum Move {
     Press(String),
     Scroll,
+    /// The page has not finished showing what it is going to show.
+    Wait,
     Stuck,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub done: bool,
+    /// The page rejected what was just done and said why.
+    pub objected: bool,
     pub step: Move,
 }
 
@@ -777,6 +748,7 @@ impl JevVerifier {
         if can_scroll {
             criteria.push(("scroll".into(), Some("Scroll down: what is needed may be further down this page.".into())));
         }
+        criteria.push(("wait".into(), Some("The page is still loading: wait for it to finish.".into())));
         criteria.push(("stuck".into(), Some("Nothing on this page helps with what is left of the goal.".into())));
         let questions = vec![
             (
@@ -784,6 +756,15 @@ impl JevVerifier {
                 Question::Noul {
                     instructions: "Going by `page_text` and `progress`, has the whole of `goal` been achieved, with \
                                    nothing left to do? A page that still expects input or shows errors is not done."
+                        .into(),
+                },
+            ),
+            (
+                "objected".to_string(),
+                Question::Noul {
+                    instructions: "Did the page just reject the last move, by showing a problem the user must fix, \
+                                   going by what appeared since the last look in \
+                                   `what_pointer_knows_about_this_page`?"
                         .into(),
                 },
             ),
@@ -820,13 +801,16 @@ impl JevVerifier {
         });
         let answers = self.ask(state, questions)?;
         let mut done = false;
+        let mut objected = false;
         let mut step = Move::Stuck;
         for (name, a) in answers {
             match (name.as_str(), a) {
                 ("done", Answer::Noul(p)) => done = p >= YES,
+                ("objected", Answer::Noul(p)) => objected = p >= YES,
                 ("next", Answer::Choice(c)) => {
                     step = match c.choice.as_str() {
                         "scroll" => Move::Scroll,
+                        "wait" => Move::Wait,
                         other => other
                             .strip_prefix('c')
                             .and_then(|i| i.parse::<usize>().ok())
@@ -837,7 +821,7 @@ impl JevVerifier {
                 _ => {}
             }
         }
-        Some(Decision { done, step })
+        Some(Decision { done, objected, step })
     }
 
     /// Does this text say the form was received? None when Jev could not answer.
@@ -1048,11 +1032,5 @@ mod tests {
         assert!(Pursuit::begin_as("show me how to save", budget(), Some(TaskClass::Task)).is_none());
         // A task Jev named keeps its keyword kind.
         assert_eq!(Pursuit::begin_as("apply to this job", budget(), Some(TaskClass::Task)).unwrap().kind, GoalKind::Form);
-    }
-
-    #[test]
-    fn blockers_are_recognised() {
-        assert!(blocker_in("click intercepted by the cookie banner"));
-        assert!(!blocker_in("{\"page_changed\":true}"));
     }
 }

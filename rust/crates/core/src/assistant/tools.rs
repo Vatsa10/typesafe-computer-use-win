@@ -1427,8 +1427,8 @@ fn form_click(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     }
     let r = env.svc.senses.form_click(target, label)?;
     if std::env::var("POINTER_DEBUG_FORMS").is_ok() {
-        println!("FORMDBG form_click {:?}: changed {}, settle {} ms, errors {:?}, required_empty {:?}, new text items {} (first starts submitted: {})",
-            r.clicked, r.changed, r.settle_ms, r.errors, r.required_empty, r.new_text.len(),
+        println!("FORMDBG form_click {:?}: changed {}, settle {} ms, required_empty {:?}, new text items {} (first starts submitted: {})",
+            r.clicked, r.changed, r.settle_ms, r.required_empty, r.new_text.len(),
             r.new_text.first().is_some_and(|t| t.starts_with("SUBMITTED")));
     }
     env.ctx.clicks.push((label.to_string(), r.changed));
@@ -1441,10 +1441,10 @@ fn form_click(env: &mut ToolEnv, args: &Value) -> Result<String, String> {
     let open: Vec<&String> = env.ctx.checklist.iter().filter(|(_, s)| *s != "ok").map(|(k, _)| k).collect();
     Ok(json!({ "data_trust": "untrusted", "notice": super::forms::UNTRUSTED_NOTICE,
         "pressed": r.clicked, "page_changed": r.changed, "settled_ms": r.settle_ms,
-        "errors": r.errors, "required_still_empty": r.required_empty, "new_on_page": r.new_text,
+        "required_still_empty": r.required_empty, "new_on_page": r.new_text,
         "filled_so_far": done, "not_filled": open,
         "next": if r.changed { "read new_on_page: if it says the form was submitted or thanks you, you are done, report it and stop; otherwise form_read the new page and form_autofill" } else {
-            "the page did not change: read the errors, fix those fields, then try again" } })
+            "the page did not change: read new_on_page, fix what it asks for, then try again" } })
     .to_string())
 }
 

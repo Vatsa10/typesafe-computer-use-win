@@ -32,6 +32,7 @@ pub(super) struct Site {
     pub scrolls: AtomicUsize,
     /// The first press of Next shows an error and stays.
     pub fail_next_once: Mutex<bool>,
+    pub objection: Mutex<Option<String>>,
     pub password_page: bool,
 }
 
@@ -66,6 +67,7 @@ impl Site {
             clicks: Mutex::new(vec![]),
             scrolls: AtomicUsize::new(0),
             fail_next_once: Mutex::new(false),
+            objection: Mutex::new(None),
             password_page: false,
         })
     }
@@ -91,7 +93,7 @@ impl Site {
             hwnd: 77,
             fields,
             buttons: buttons.iter().map(|b| (b.to_string(), true)).collect(),
-            texts: texts.iter().map(|t| t.to_string()).collect(),
+            texts: texts.iter().map(|t| t.to_string()).chain(self.objection.lock().unwrap().clone()).collect(),
         }
     }
 }
@@ -127,8 +129,10 @@ impl Senses for Site {
         let mut fail = self.fail_next_once.lock().unwrap();
         if label == "Next" && *fail {
             *fail = false;
-            return Ok(ClickReport { clicked: label.into(), changed: false, errors: vec!["Phone is invalid".into()], ..Default::default() });
+            *self.objection.lock().unwrap() = Some("Phone is invalid".into());
+            return Ok(ClickReport { clicked: label.into(), changed: true, ..Default::default() });
         }
+        *self.objection.lock().unwrap() = None;
         let mut page = self.page.lock().unwrap();
         let before = *page;
         if label == "Next" {
@@ -160,6 +164,7 @@ impl Classifier for Jev {
             .iter()
             .map(|(n, q)| {
                 let a = match q {
+                    Question::Noul { .. } if n == "objected" => Answer::Noul(if page.contains("invalid") { 0.9 } else { 0.1 }),
                     Question::Noul { .. } => Answer::Noul(if done || !state.get("page_text").is_some() { 0.9 } else { 0.1 }),
                     Question::Choice { criteria, .. } => Answer::Choice(ChoiceAnswer {
                         choice: criteria.first().map(|c| c.0.clone()).unwrap_or_else(|| "stuck".into()),

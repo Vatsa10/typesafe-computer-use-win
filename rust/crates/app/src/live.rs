@@ -252,7 +252,7 @@ impl Senses for LiveSenses {
     }
 
     fn form_click(&self, target: isize, label: &str) -> Result<wcore::assistant::forms::ClickReport, String> {
-        use wcore::assistant::forms::{looks_like_error, pick_button, verify_focus, ClickReport};
+        use wcore::assistant::forms::{pick_button, verify_focus, ClickReport};
         resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
         if platform::winlist::foreground() != target {
             return Err("the window in front is not the form's window: nothing was pressed".into());
@@ -269,19 +269,15 @@ impl Senses for LiveSenses {
         verify_focus(platform::winlist::foreground(), target, platform::uia::is_focused(&button.handle))
             .map_err(|e| format!("{e}: nothing was pressed"))?;
         platform::input::press(if button.link { 0x0D } else { 0x20 }, false);
-        // Settle: the page's content must stop moving for three looks in a row, and a loading
-        // message must be gone. No fixed sleep: a slow page is waited for, a fast one is not.
+        // Settle: the page's content must stop moving for three looks in a row. No fixed sleep. A
+        // page sitting on a spinner looks settled here; Jev sees that and chooses to wait.
         let t0 = Instant::now();
         let mut last = platform::uia::page_scan(hwnd);
         let mut steady = 0;
         while t0.elapsed() < Duration::from_secs(12) {
             std::thread::sleep(Duration::from_millis(150));
             let now = platform::uia::page_scan(hwnd);
-            let loading = now.texts.iter().any(|t| {
-                let l = t.to_lowercase();
-                l.contains("loading") || l.contains("please wait")
-            });
-            if now.signature() == last.signature() && !loading {
+            if now.signature() == last.signature() {
                 steady += 1;
             } else {
                 steady = 0;
@@ -295,7 +291,6 @@ impl Senses for LiveSenses {
             clicked: button.label.clone(),
             changed: last.signature() != sig0,
             settle_ms: t0.elapsed().as_millis() as u64,
-            errors: last.texts.iter().filter(|t| looks_like_error(t)).take(6).cloned().collect(),
             new_text: last
                 .texts
                 .iter()

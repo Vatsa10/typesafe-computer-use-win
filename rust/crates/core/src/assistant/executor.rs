@@ -26,6 +26,8 @@ use crate::documents::{is_sensitive_field, Profile};
 const MAX_MOVES: usize = 40;
 const MAX_REPLANS_PER_PAGE: usize = 2;
 const MAX_IDLE_MOVES: usize = 3;
+const MAX_WAITS: usize = 20;
+const WAIT: Duration = Duration::from_millis(400);
 
 /// How the executor ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +413,8 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
     let mut idle = 0;
     let mut planned_once = false;
     let mut can_scroll = true;
+    let mut waits = 0;
+    let mut just_pressed = false;
     let mut state = PageState::default();
     for _ in 0..MAX_MOVES {
         if cfg.cancel.is_cancelled() {
@@ -539,6 +543,17 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
         if std::env::var("POINTER_DEBUG_FORMS").is_ok() {
             println!("DRIVER done={} step={:?} wanted={wanted:?} controls={controls:?}", decision.done, decision.step);
         }
+        // The page objected: that was not a dead move, it asked for a fix. Think again with its words.
+        let answer_to_a_press = std::mem::take(&mut just_pressed);
+        if decision.objected && answer_to_a_press && !decision.done {
+            replans += 1;
+            if replans > MAX_REPLANS_PER_PAGE {
+                return ExecEnd::Handoff(format!("the page keeps objecting; so far: {}", progress.join("; ")));
+            }
+            state.forget_tried();
+            problems = Some(format!("the page objected: {}", state.summary()["appeared_since_last_look"]));
+            continue;
+        }
         if decision.done && pending.is_empty() {
             pursuit.mark_verified("the page shows the goal is done");
             return ExecEnd::Final(report(pursuit, stats));
@@ -549,6 +564,13 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
         match decision.step {
             Move::Stuck => {
                 return ExecEnd::Handoff(format!("no control on this page moves the goal on; so far: {}", progress.join("; ")))
+            }
+            Move::Wait => {
+                waits += 1;
+                if waits > MAX_WAITS {
+                    return ExecEnd::Handoff("the page never finished loading".into());
+                }
+                std::thread::sleep(WAIT);
             }
             Move::Scroll => {
                 let moved = cfg.svc.senses.form_scroll(view.hwnd, true).unwrap_or(false);
@@ -574,25 +596,12 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
                 }
                 let v: Value = serde_json::from_str(&r).unwrap_or(Value::Null);
                 let changed = v["page_changed"].as_bool().unwrap_or(false);
-                let errors: Vec<String> = v["errors"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
                 let outcome = if changed { "the page changed" } else { NOTHING_CHANGED };
                 progress.push(format!("pressed {label:?}: {outcome}"));
                 can_scroll = can_scroll || changed;
                 idle = if changed { 0 } else { idle + 1 };
-                // A press the page objected to did something: it asked for a fix. It can be pressed again.
-                if errors.is_empty() {
-                    state.tried(&label, outcome);
-                }
-                if !errors.is_empty() {
-                    replans += 1;
-                    if replans > MAX_REPLANS_PER_PAGE {
-                        return ExecEnd::Handoff(format!("the page keeps objecting: {}", errors.join("; ")));
-                    }
-                    problems = Some(format!("after pressing {label:?} the page said: {}", errors.join("; ")));
-                }
+                state.tried(&label, outcome);
+                just_pressed = true;
             }
         }
         if idle >= MAX_IDLE_MOVES {

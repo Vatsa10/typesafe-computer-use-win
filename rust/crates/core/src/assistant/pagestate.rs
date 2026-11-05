@@ -63,6 +63,11 @@ impl PageState {
         self.tried.entry(self.screen.clone()).or_default().insert(action.to_string(), outcome.to_string());
     }
 
+    /// The page asked for a fix, so what was tried here may work now.
+    pub fn forget_tried(&mut self) {
+        self.tried.remove(&self.screen);
+    }
+
     /// Controls that are still worth pressing here: a move that changed nothing on this exact screen
     /// will not change anything the second time.
     pub fn worth_trying(&self, controls: &[String]) -> Vec<String> {
