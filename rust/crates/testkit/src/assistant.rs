@@ -70,7 +70,7 @@ fn parse_view(v: &Value) -> PageView {
         .filter(|(l, _)| !l.is_empty())
         .collect();
     let texts = v["texts"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
-    PageView { hwnd: WINDOW_HWND, fields, buttons, texts }
+    PageView { hwnd: WINDOW_HWND, fields, buttons: forms::number_repeats(buttons), texts }
 }
 
 fn read_view(d: &HeadlessDesktop) -> Result<PageView, String> {

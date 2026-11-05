@@ -234,7 +234,7 @@ impl Senses for LiveSenses {
         Ok(wcore::assistant::forms::PageView {
             hwnd,
             fields: scan.controls.iter().map(as_field).collect(),
-            buttons: scan.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect(),
+            buttons: wcore::assistant::forms::number_repeats(scan.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect()),
             texts: scan.texts.clone(),
         })
     }
@@ -259,7 +259,7 @@ impl Senses for LiveSenses {
         }
         let hwnd = target;
         let before = platform::uia::page_scan(hwnd);
-        let labels: Vec<(String, bool)> = before.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect();
+        let labels = wcore::assistant::forms::number_repeats(before.buttons.iter().map(|b| (b.label.clone(), b.enabled)).collect());
         let i = pick_button(&labels, label)?;
         let button = &before.buttons[i];
         let sig0 = before.signature();

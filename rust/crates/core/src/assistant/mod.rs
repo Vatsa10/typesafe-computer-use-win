@@ -284,8 +284,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_iterations: 12,
-            turn_time: Duration::from_secs(180),
+            max_iterations: 40,
+            turn_time: Duration::from_secs(300),
             turn_tokens: 500_000,
             task_iterations: 30,
             task_time: Duration::from_secs(900),

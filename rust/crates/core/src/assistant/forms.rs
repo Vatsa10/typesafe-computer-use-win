@@ -52,6 +52,29 @@ pub struct ClickReport {
     pub new_text: Vec<String>,
 }
 
+/// Controls with the same label, told apart by order on the page: a row of nine "Select" buttons
+/// becomes "Select (1 of 9)" and so on. Without this none of them can be named at all.
+pub fn number_repeats(buttons: Vec<(String, bool)>) -> Vec<(String, bool)> {
+    let mut total: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (l, _) in &buttons {
+        *total.entry(norm(l)).or_default() += 1;
+    }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    buttons
+        .into_iter()
+        .map(|(l, on)| {
+            let key = norm(&l);
+            let n = total[&key];
+            if n < 2 || key.is_empty() {
+                return (l, on);
+            }
+            let i = seen.entry(key).or_default();
+            *i += 1;
+            (format!("{l} ({i} of {n})"), on)
+        })
+        .collect()
+}
+
 /// The enabled button `label` names: exact first, else a single partial match.
 pub fn pick_button(buttons: &[(String, bool)], label: &str) -> Result<usize, String> {
     let w = norm(label);
@@ -370,6 +393,15 @@ pub fn drive(page: &dyn Page, target: isize, entries: &[FormEntry]) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_controls_can_be_told_apart() {
+        let b = |l: &str| (l.to_string(), true);
+        let named = number_repeats(vec![b("Select"), b("Next"), b("Select")]);
+        assert_eq!(named[0].0, "Select (1 of 2)");
+        assert_eq!(named[1].0, "Next");
+        assert_eq!(pick_button(&named, "Select (2 of 2)").unwrap(), 2);
+    }
 
     #[test]
     fn a_checkbox_group_takes_several_answers() {
