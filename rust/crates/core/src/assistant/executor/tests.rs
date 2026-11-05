@@ -247,6 +247,7 @@ fn a_two_page_form_takes_one_model_call_per_page_and_none_for_the_rest() {
             plan_reply(json!([]), "Next", false),
             plan_reply(json!([{ "field": "Why do you want this role?", "value": "I build engines and want to build yours." },
                               { "field": "Expected salary", "value": "999999" }]), "Submit application", true),
+            crate::assistant::testing::saying("DONE"),
         ],
     );
     let (end, stats) = go(&r);
@@ -254,7 +255,7 @@ fn a_two_page_form_takes_one_model_call_per_page_and_none_for_the_rest() {
         ExecEnd::Final(t) => assert!(t.starts_with("Done, and checked"), "{t}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(r.chat.calls().len(), 2, "one plan call per page, nothing per field");
+    assert_eq!(r.chat.calls().len(), 3, "one plan call per page and one check of done, nothing per field");
     assert_eq!((stats.plan_calls, stats.replan_calls), (2, 0));
     let typed = r.site.typed.lock().unwrap().clone();
     assert_eq!(typed.get("full name").map(String::as_str), Some("Ada Lovelace"));
@@ -270,7 +271,7 @@ fn a_two_page_form_takes_one_model_call_per_page_and_none_for_the_rest() {
 #[test]
 fn a_saved_answer_is_typed_for_a_sensitive_field() {
     let site = Site::new();
-    let r = rig("exec-saved", site, vec![plan_reply(json!([]), "Next", false), plan_reply(json!([{ "field": "Why do you want this role?", "value": "Because." }]), "Submit application", true)]);
+    let r = rig("exec-saved", site, vec![plan_reply(json!([]), "Next", false), plan_reply(json!([{ "field": "Why do you want this role?", "value": "Because." }]), "Submit application", true), crate::assistant::testing::saying("DONE")]);
     crate::assistant::answers::learn(&r.h.svc.home, "Expected salary", "FAKE-77").unwrap();
     let (end, _) = go(&r);
     assert!(matches!(end, ExecEnd::Final(_)), "{end:?}");
@@ -288,6 +289,7 @@ fn a_failed_next_is_one_replan_and_then_goes_on() {
             plan_reply(json!([]), "Next", false),
             plan_reply(json!([]), "Next", false),
             plan_reply(json!([{ "field": "Why do you want this role?", "value": "Because." }]), "Submit application", true),
+            crate::assistant::testing::saying("DONE"),
         ],
     );
     let (end, stats) = go(&r);

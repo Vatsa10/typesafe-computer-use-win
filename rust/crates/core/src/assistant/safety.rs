@@ -414,7 +414,7 @@ pub fn payment_button(label: &str, checkout_page: bool) -> bool {
     let w = words(label);
     let weak = w
         .split_whitespace()
-        .any(|t| matches!(t, "pay" | "buy" | "purchase" | "order" | "checkout" | "donate"));
+        .any(|t| matches!(t, "pay" | "buy" | "purchase" | "order" | "donate"));
     weak && (checkout_page || w.starts_with(" pay "))
 }
 

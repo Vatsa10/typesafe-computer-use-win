@@ -434,6 +434,8 @@ pub fn parse_responses_reply(body: &Value) -> Result<ChatReply, ChatError> {
     })
 }
 
+const RETRIES: usize = 3;
+
 impl Chat for ChatClient {
     fn complete(
         &self,
@@ -460,10 +462,21 @@ impl Chat for ChatClient {
         std::thread::Builder::new()
             .name("chat".into())
             .spawn(move || {
-                let r = match provider {
-                    Provider::OpenAi => post(&url, &key, &body, timeout),
-                    Provider::Claude => crate::anthropic::post(&url_base, &key, &body, timeout),
-                };
+                let mut r = Err(ChatError::Timeout);
+                for attempt in 0..RETRIES {
+                    if attempt > 0 {
+                        std::thread::sleep(Duration::from_millis(500 * attempt as u64));
+                    }
+                    r = match provider {
+                        Provider::OpenAi => post(&url, &key, &body, timeout),
+                        Provider::Claude => crate::anthropic::post(&url_base, &key, &body, timeout),
+                    };
+                    let again = matches!(&r, Err(ChatError::Network(_)))
+                        || matches!(&r, Err(ChatError::Http(c, _)) if *c == 429 || *c >= 500);
+                    if !again {
+                        break;
+                    }
+                }
                 let _ = tx.send(r);
             })
             .map_err(|e| ChatError::Network(e.to_string()))?;
