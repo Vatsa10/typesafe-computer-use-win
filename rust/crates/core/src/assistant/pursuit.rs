@@ -768,6 +768,7 @@ impl JevVerifier {
         view: &super::forms::PageView,
         hint: &str,
         can_scroll: bool,
+        known: &super::pagestate::PageState,
     ) -> Option<Decision> {
         const MAX_CONTROLS: usize = 200;
         let shown: Vec<&String> = controls.iter().filter(|c| !c.trim().is_empty()).take(MAX_CONTROLS).collect();
@@ -790,7 +791,8 @@ impl JevVerifier {
                 "next".to_string(),
                 Question::Choice {
                     instructions: "Given `goal`, what has been done in `progress`, what could not be placed yet in \
-                                   `still_needed` and what is on the page, which one move gets closer to the goal? \
+                                   `still_needed`, `what_pointer_knows_about_this_page` and what is on the page, \
+                                   which one move gets closer to the goal? \
                                    Something needed but not shown may appear after moving through the page's content. \
                                    Anything covering the page should be cleared first. Do not repeat a move that \
                                    changed nothing, and do not move away from the goal."
@@ -812,6 +814,7 @@ impl JevVerifier {
             "progress": progress.iter().rev().take(12).rev().collect::<Vec<_>>(),
             "still_needed": still_needed,
             "suggested_by_planner": hint,
+            "what_pointer_knows_about_this_page": known.summary(),
             "inputs": inputs,
             "page_text": view.texts.iter().take(80).cloned().collect::<Vec<_>>().join("\n"),
         });

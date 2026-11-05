@@ -16,6 +16,7 @@ use api::chat::{Cancel, Chat, ChatError, Usage};
 use serde_json::{json, Value};
 
 use super::forms::{norm, FormEntry, FormField, PageView};
+use super::pagestate::{PageState, NOTHING_CHANGED};
 use super::pursuit::{Escalation, JevVerifier, Move, Plan, PlanStep, Pursuit, Replan, StepStatus};
 use super::tasks::Tasks;
 use super::tools::{self, Kind, ToolEnv, TurnCtx};
@@ -410,6 +411,7 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
     let mut idle = 0;
     let mut planned_once = false;
     let mut can_scroll = true;
+    let mut state = PageState::default();
     for _ in 0..MAX_MOVES {
         if cfg.cancel.is_cancelled() {
             return ExecEnd::Cancelled;
@@ -513,13 +515,17 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
                         .collect()
                 })
                 .unwrap_or_default();
+            for e in entries.iter().filter(|e| !unplaced.contains(&e.field)) {
+                state.entered(&e.field, &e.value);
+            }
             pending = entries.into_iter().filter(|e| unplaced.contains(&e.field)).collect();
         }
         // Decide, from what is really on this page.
         let wanted: Vec<String> = pending.iter().map(|e| format!("{}: {}", e.field, e.value)).collect();
         let view = read(cfg, ctx).unwrap_or(view);
-        let controls = enabled_buttons(&view);
-        let Some(mut decision) = jev.next_move(&goal, &progress, &wanted, &controls, &view, &hint, can_scroll) else {
+        state.look(&view);
+        let controls = state.worth_trying(&enabled_buttons(&view));
+        let Some(mut decision) = jev.next_move(&goal, &progress, &wanted, &controls, &view, &hint, can_scroll, &state) else {
             return ExecEnd::Handoff("Jev gave no answer about this page".into());
         };
         // The LLM read the page and named its next move: if that is a real control here, it stands.
@@ -572,10 +578,14 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
                     .as_array()
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                let outcome = if changed { "the page changed" } else { "nothing changed" };
+                let outcome = if changed { "the page changed" } else { NOTHING_CHANGED };
                 progress.push(format!("pressed {label:?}: {outcome}"));
                 can_scroll = can_scroll || changed;
                 idle = if changed { 0 } else { idle + 1 };
+                // A press the page objected to did something: it asked for a fix. It can be pressed again.
+                if errors.is_empty() {
+                    state.tried(&label, outcome);
+                }
                 if !errors.is_empty() {
                     replans += 1;
                     if replans > MAX_REPLANS_PER_PAGE {

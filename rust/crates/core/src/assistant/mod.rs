@@ -17,6 +17,7 @@ pub mod fastpath;
 pub mod forms;
 pub mod gate;
 pub mod pending;
+pub mod pagestate;
 pub mod pursuit;
 pub mod readonly;
 pub mod safety;
