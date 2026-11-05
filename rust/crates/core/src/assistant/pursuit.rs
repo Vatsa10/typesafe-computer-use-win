@@ -839,7 +839,7 @@ impl JevVerifier {
     /// never be guessed. No answer from Jev means no.
     pub fn user_stated(&self, goal: &str, field: &str, value: &str) -> bool {
         let state = json!({ "request": goal, "field": field, "answer": value });
-        self.noul(state, "Does `request` itself clearly give `answer` for `field`, in the user's own words?")
+        self.noul(state, "Did the user, in `request`, ask for `field` to be set to `answer`, in any wording? Telling Pointer to tick, accept or confirm something counts. Say no if the request never mentions it.")
             .is_some_and(|p| p >= YES)
     }
 

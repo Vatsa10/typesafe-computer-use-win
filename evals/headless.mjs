@@ -12,7 +12,7 @@ const args = Object.fromEntries(process.argv.slice(2).join(" ").split("--").filt
   const [k, ...v] = a.trim().split(" ");
   return [k, v.join(" ")];
 }));
-const base = "http://127.0.0.1:8787";
+const base = process.env.EVAL_BASE || "http://127.0.0.1:8787";
 const providers = !args.provider || args.provider === "both" ? ["openai", "claude"] : [args.provider];
 let tasks = JSON.parse(readFileSync(path.join(here, "tasks.json"), "utf8"));
 tasks = (Array.isArray(tasks) ? tasks : tasks.tasks).filter((t) => t.category !== "teach");
@@ -51,7 +51,7 @@ for (const provider of providers) {
 }
 const dir = path.join(here, "results");
 mkdirSync(dir, { recursive: true });
-writeFileSync(path.join(dir, "headless-latest.json"), JSON.stringify(rows, null, 1));
+writeFileSync(path.join(dir, process.env.EVAL_OUT || "headless-latest.json"), JSON.stringify(rows, null, 1));
 for (const provider of providers) {
   const mine = rows.filter((r) => r.provider === provider);
   const passed = mine.filter((r) => r.pass);

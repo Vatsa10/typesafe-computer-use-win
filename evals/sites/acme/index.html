@@ -6,7 +6,7 @@ let cookieDone=false;try{cookieDone=localStorage.getItem('acme_cookie')}catch(e)
 if(cookieDone)hide('cookie');
 const cookieOk=()=>{try{localStorage.setItem('acme_cookie','1')}catch(e){}hide('cookie')};
 document.getElementById('cookie-ok').onclick=()=>{cookieOk();ptrReport('cookie-dismissed')};document.getElementById('cookie-no').onclick=()=>{cookieOk();ptrReport('cookie-dismissed')};
-setTimeout(()=>{let seen=false;try{seen=sessionStorage.getItem('acme_pop')}catch(e){}if(!seen)document.getElementById('pop').style.display='flex'},2000);
+setTimeout(()=>{let seen=false;try{seen=sessionStorage.getItem('acme_pop')}catch(e){}if(!seen)document.getElementById('pop').style.display='flex'},300);
 const closePop=()=>{try{sessionStorage.setItem('acme_pop','1')}catch(e){}hide('pop')};
 document.getElementById('nl-close').onclick=()=>{closePop();ptrReport('popup-dismissed')};
 document.getElementById('nl-go').onclick=()=>{closePop();ptrReport('newsletter-subscribed',{email:document.getElementById('nl').value})};

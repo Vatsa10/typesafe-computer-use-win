@@ -129,8 +129,10 @@ pub fn norm(s: &str) -> String {
         .join(" ")
 }
 
-fn truthy(v: &str) -> bool {
-    matches!(norm(v).as_str(), "true" | "yes" | "y" | "checked" | "on" | "1" | "tick")
+/// Whether an entry for a single checkbox means tick it. Naming a box means tick it, whatever the
+/// wording ("Ticked", "x", "I agree"), unless the value plainly says not to.
+fn truthy(value: &str) -> bool {
+    !matches!(norm(value).as_str(), "" | "no" | "false" | "0" | "off" | "unticked" | "unchecked" | "untick" | "uncheck" | "leave empty" | "n")
 }
 
 enum Found {
@@ -393,6 +395,16 @@ pub fn drive(page: &dyn Page, target: isize, entries: &[FormEntry]) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn naming_a_box_ticks_it_unless_the_value_says_no() {
+        for yes in ["Ticked", "true", "yes", "x", "I agree"] {
+            assert!(truthy(yes), "{yes}");
+        }
+        for no in ["no", "false", "Unticked", ""] {
+            assert!(!truthy(no), "{no}");
+        }
+    }
 
     #[test]
     fn repeated_controls_can_be_told_apart() {
