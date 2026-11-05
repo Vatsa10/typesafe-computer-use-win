@@ -415,6 +415,8 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
     let mut can_scroll = true;
     let mut waits = 0;
     let mut just_pressed = false;
+    // Something was typed and nothing has acted on it yet: the job cannot be finished.
+    let mut unsent_input = false;
     let mut state = PageState::default();
     for _ in 0..MAX_MOVES {
         if cfg.cancel.is_cancelled() {
@@ -508,7 +510,9 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
                 ));
             }
             let v: Value = serde_json::from_str(&r).unwrap_or(Value::Null);
-            stats.filled += v["ok"].as_u64().unwrap_or(0) as usize;
+            let typed = v["ok"].as_u64().unwrap_or(0) as usize;
+            stats.filled += typed;
+            unsent_input = unsent_input || typed > 0;
             // Whatever this page did not have is carried on: it may be further along.
             let unplaced: Vec<String> = v["results"]
                 .as_array()
@@ -554,7 +558,7 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
             problems = Some(format!("the page objected: {}", state.summary()["appeared_since_last_look"]));
             continue;
         }
-        if decision.done && pending.is_empty() {
+        if decision.done && pending.is_empty() && !unsent_input && !progress.is_empty() {
             pursuit.mark_verified("the page shows the goal is done");
             return ExecEnd::Final(report(pursuit, stats));
         }
@@ -602,6 +606,7 @@ fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mu
                 idle = if changed { 0 } else { idle + 1 };
                 state.tried(&label, outcome);
                 just_pressed = true;
+                unsent_input = unsent_input && !changed;
             }
         }
         if idle >= MAX_IDLE_MOVES {
