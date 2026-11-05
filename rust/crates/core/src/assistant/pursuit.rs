@@ -669,6 +669,20 @@ pub const NO: f64 = 0.35;
 
 /// The verifier: exact code checks first, then TypeSafe (a Noul or a Choice, about 0.4 s) for what
 /// code cannot read exactly. It never calls the large model.
+/// What Jev chose to do next on a page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Move {
+    Press(String),
+    Scroll,
+    Stuck,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decision {
+    pub done: bool,
+    pub step: Move,
+}
+
 pub struct JevVerifier {
     classifier: Arc<dyn Classifier + Send + Sync>,
     timeout: Duration,
@@ -742,25 +756,85 @@ impl JevVerifier {
     }
 
     /// Of the visible buttons, the one that moves the task forward: `Some((index, confidence))`.
-    pub fn pick_button(&self, goal: &str, buttons: &[String], hint: &str) -> Option<(usize, f64)> {
-        if buttons.is_empty() {
-            return None;
-        }
+    /// The one question the page driver asks at every step, in one request: is the goal met, and
+    /// which control on this page moves it on? The options are the page's own controls, so the
+    /// meaning of each is judged here, not matched against any list of words.
+    pub fn next_move(
+        &self,
+        goal: &str,
+        progress: &[String],
+        still_needed: &[String],
+        controls: &[String],
+        view: &super::forms::PageView,
+        hint: &str,
+        can_scroll: bool,
+    ) -> Option<Decision> {
+        const MAX_CONTROLS: usize = 200;
+        let shown: Vec<&String> = controls.iter().filter(|c| !c.trim().is_empty()).take(MAX_CONTROLS).collect();
         let mut criteria: Vec<(String, Option<String>)> =
-            buttons.iter().enumerate().map(|(i, b)| (format!("btn_{i}"), Some(format!("Button: {b}")))).collect();
-        criteria.push(("none".into(), Some("No listed button moves the task forward.".into())));
-        let q = Question::Choice {
-            instructions: "Which button moves the goal forward: Next, Continue, Review or the final Submit? \
-                           Never Back, Cancel, Save for later, Sign in or a social login."
-                .into(),
-            criteria,
-        };
-        let state = json!({ "goal": goal, "planner_hint": hint, "buttons": buttons });
-        let answers = self.ask(state, vec![("button".to_string(), q)])?;
-        answers.into_iter().find_map(|(_, a)| match a {
-            Answer::Choice(c) => c.choice.strip_prefix("btn_")?.parse::<usize>().ok().map(|i| (i, c.confidence)),
-            _ => None,
-        })
+            shown.iter().enumerate().map(|(i, c)| (format!("c{i}"), Some(format!("Press: {c}")))).collect();
+        if can_scroll {
+            criteria.push(("scroll".into(), Some("Scroll down: what is needed may be further down this page.".into())));
+        }
+        criteria.push(("stuck".into(), Some("Nothing on this page helps with what is left of the goal.".into())));
+        let questions = vec![
+            (
+                "done".to_string(),
+                Question::Noul {
+                    instructions: "Going by `page_text` and `progress`, has the whole of `goal` been achieved, with \
+                                   nothing left to do? A page that still expects input or shows errors is not done."
+                        .into(),
+                },
+            ),
+            (
+                "next".to_string(),
+                Question::Choice {
+                    instructions: "Given `goal`, what has been done in `progress`, what could not be placed yet in \
+                                   `still_needed` and what is on the page, which one move gets closer to the goal? \
+                                   Something needed but not shown may appear after moving through the page's content. \
+                                   Anything covering the page should be cleared first. Do not repeat a move that \
+                                   changed nothing, and do not move away from the goal."
+                        .into(),
+                    criteria,
+                },
+            ),
+        ];
+        let inputs: Vec<Value> = view
+            .fields
+            .iter()
+            .map(|f| {
+                json!({ "kind": f.kind, "label": f.label, "question": f.group,
+                        "filled": !f.value.is_empty() || f.checked, "required": f.required })
+            })
+            .collect();
+        let state = json!({
+            "goal": goal,
+            "progress": progress.iter().rev().take(12).rev().collect::<Vec<_>>(),
+            "still_needed": still_needed,
+            "suggested_by_planner": hint,
+            "inputs": inputs,
+            "page_text": view.texts.iter().take(80).cloned().collect::<Vec<_>>().join("\n"),
+        });
+        let answers = self.ask(state, questions)?;
+        let mut done = false;
+        let mut step = Move::Stuck;
+        for (name, a) in answers {
+            match (name.as_str(), a) {
+                ("done", Answer::Noul(p)) => done = p >= YES,
+                ("next", Answer::Choice(c)) => {
+                    step = match c.choice.as_str() {
+                        "scroll" => Move::Scroll,
+                        other => other
+                            .strip_prefix('c')
+                            .and_then(|i| i.parse::<usize>().ok())
+                            .and_then(|i| shown.get(i))
+                            .map_or(Move::Stuck, |l| Move::Press((*l).clone())),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(Decision { done, step })
     }
 
     /// Does this text say the form was received? None when Jev could not answer.

@@ -149,17 +149,24 @@ impl Senses for Site {
     }
 }
 
-/// Jev, faked: every claim is believed, the first button is the one.
+/// Jev, faked: the goal is met when the page says so; otherwise the first control is the move.
 pub(super) struct Jev(pub AtomicUsize);
 impl Classifier for Jev {
-    fn system_one(&self, _s: &Value, qs: &[(String, Question)]) -> Result<Vec<(String, Answer)>, ApiError> {
+    fn system_one(&self, state: &Value, qs: &[(String, Question)]) -> Result<Vec<(String, Answer)>, ApiError> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        let page = state["page_text"].as_str().unwrap_or("").to_lowercase();
+        let done = page.contains("thank");
         Ok(qs
             .iter()
             .map(|(n, q)| {
                 let a = match q {
-                    Question::Noul { .. } => Answer::Noul(0.9),
-                    _ => Answer::Choice(ChoiceAnswer { choice: "btn_0".into(), confidence: 0.9, probabilities: vec![] }),
+                    Question::Noul { .. } => Answer::Noul(if done || !state.get("page_text").is_some() { 0.9 } else { 0.1 }),
+                    Question::Choice { criteria, .. } => Answer::Choice(ChoiceAnswer {
+                        choice: criteria.first().map(|c| c.0.clone()).unwrap_or_else(|| "stuck".into()),
+                        confidence: 0.9,
+                        probabilities: vec![],
+                    }),
+                    _ => Answer::Noul(0.9),
                 };
                 (n.clone(), a)
             })
@@ -248,7 +255,7 @@ fn a_two_page_form_takes_one_model_call_per_page_and_none_for_the_rest() {
     assert!(!typed.contains_key("expected salary"), "salary only from saved answers, never the model: {typed:?}");
     assert_eq!(*r.site.clicks.lock().unwrap(), vec!["Next", "Submit application"]);
     assert!(stats.left_blank.iter().any(|b| b.to_lowercase().contains("salary")), "{:?}", stats.left_blank);
-    assert_eq!(r.jev.0.load(Ordering::SeqCst), 0, "exact code checks decided everything here");
+    assert!(r.jev.0.load(Ordering::SeqCst) > 0, "Jev decides every step");
 }
 
 #[test]
@@ -313,17 +320,6 @@ fn a_planner_that_fails_hands_the_job_to_the_agent_loop() {
 }
 
 #[test]
-fn the_button_comes_from_the_hint_then_standard_labels_then_jev() {
-    let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    assert_eq!(choose_button(None, "g", &b(&["Back", "Continue"]), "").unwrap(), "Continue");
-    assert_eq!(choose_button(None, "g", &b(&["Back", "Go on"]), "go on").unwrap(), "Go on");
-    assert!(choose_button(None, "g", &b(&["Back", "Proceed with this", "Other"]), "").is_err());
-    let jev = JevVerifier::new(Arc::new(Jev(AtomicUsize::new(0))), Duration::from_secs(1), Cancel::new());
-    // Jev picks the first listed button once Back is out of the list.
-    assert_eq!(choose_button(Some(&jev), "g", &b(&["Back", "Proceed with this", "Other"]), "").unwrap(), "Proceed with this");
-}
-
-#[test]
 fn the_verifier_decides_from_the_result_before_asking_jev() {
     use crate::assistant::pursuit::{Verdict, Verifier};
     let jev = JevVerifier::new(Arc::new(Jev(AtomicUsize::new(0))), Duration::from_secs(1), Cancel::new());
@@ -356,10 +352,6 @@ fn live_jev() {
     load_env();
     let ts = Arc::new(api::typesafe::TypeSafe::from_env().expect("a TypeSafe key in .env"));
     let j = JevVerifier::new(ts, Duration::from_secs(5), Cancel::new());
-    let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let t = Instant::now();
-    let pick = j.pick_button("apply for the job", &b(&["Go on to the next part", "Save for later", "Cancel"]), "");
-    println!("JEV pick {pick:?} in {:?}", t.elapsed());
     let t = Instant::now();
     println!("JEV login page {:?} in {:?}", j.expected_page("apply for the job", "Sign in to continue. Email. Password. Forgot password?"), t.elapsed());
     println!("JEV step page {:?}", j.expected_page("apply for the job", "Step 2 of 3. Years of experience. Why this role? Next"));

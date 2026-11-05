@@ -1,13 +1,10 @@
-//! The fast planner/executor for forms: Jev decides, the LLM thinks, code executes.
+//! The page driver: Jev decides, the LLM thinks, code executes.
 //!
-//! One model call plans a page: it gets the goal, the resume facts, the answers code already has
-//! and the page's fields, and returns every answer at once with the done condition. Code then
-//! fills the page (one `form_fill` batch), reads it back, picks the button that moves on, presses
-//! it and reads the next page. Jev (TypeSafe, about 0.4 s) checks "did that work", "is this page
-//! the expected one" and "which visible button", after exact code checks. The large model is
-//! called again only on an escalation: a failed verification, a surprising page, no button that
-//! can be picked, or a budget. Nothing here knows any particular page: it works from what
-//! `form_read` shows, scrolls to reveal more, and pages on until the done condition is seen.
+//! One loop for any page. Look at what is really there, then ask Jev two things in one request: is
+//! the goal met, and which of the controls on this page moves it on. Nothing here names a button or
+//! knows what a form is: the options are the page's own controls, and meaning is Jev's job. When a
+//! page has inputs the goal needs, the LLM works out all the values in one call and code types them.
+//! When Jev cannot see a way on, the full agent loop takes over with what was learned.
 //!
 //! Every action goes through the same tools the agent uses (`form_fill`, `form_click`), so exact
 //! window binding, the password refusal and the payment confirmations all still apply.
@@ -19,15 +16,15 @@ use api::chat::{Cancel, Chat, ChatError, Usage};
 use serde_json::{json, Value};
 
 use super::forms::{norm, FormEntry, FormField, PageView};
-use super::pursuit::{Escalation, JevVerifier, Plan, PlanStep, Pursuit, Replan, StepStatus};
+use super::pursuit::{Escalation, JevVerifier, Move, Plan, PlanStep, Pursuit, Replan, StepStatus};
 use super::tasks::Tasks;
 use super::tools::{self, Kind, ToolEnv, TurnCtx};
 use super::{safety, Memory, Services};
 use crate::documents::{is_sensitive_field, Profile};
 
-const MAX_PAGES: usize = 15;
+const MAX_MOVES: usize = 40;
 const MAX_REPLANS_PER_PAGE: usize = 2;
-const MAX_SCROLLS: usize = 4;
+const MAX_IDLE_MOVES: usize = 3;
 
 /// How the executor ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -305,53 +302,6 @@ fn enabled_buttons(view: &PageView) -> Vec<String> {
     view.buttons.iter().filter(|(_, e)| *e).map(|(l, _)| l.clone()).collect()
 }
 
-const FINAL_LABELS: [&str; 7] =
-    ["submit application", "submit", "apply", "apply now", "send application", "finish", "complete application"];
-const FORWARD_LABELS: [&str; 7] = ["next", "continue", "next step", "save and continue", "review", "review application", "proceed"];
-
-fn is_final_label(l: &str) -> bool {
-    let n = norm(l);
-    FINAL_LABELS.contains(&n.as_str()) || n.contains("submit")
-}
-
-fn backwards(l: &str) -> bool {
-    let n = norm(l);
-    ["back", "previous", "cancel", "save for later", "save draft", "sign in", "log in", "login"].iter().any(|w| n.starts_with(w))
-}
-
-/// The button that moves the task on: the planner's exact hint, then an unambiguous standard
-/// label, then Jev's pick among what is visible.
-pub fn choose_button(jev: Option<&JevVerifier>, goal: &str, buttons: &[String], hint: &str) -> Result<String, String> {
-    if !hint.trim().is_empty() {
-        if let Some(b) = buttons.iter().find(|b| norm(b) == norm(hint)) {
-            return Ok(b.clone());
-        }
-    }
-    let usable: Vec<String> = buttons.iter().filter(|b| !backwards(b)).cloned().collect();
-    for tier in [&FINAL_LABELS[..], &FORWARD_LABELS[..]] {
-        let hits: Vec<&String> = usable.iter().filter(|b| tier.contains(&norm(b).as_str())).collect();
-        if hits.len() == 1 {
-            return Ok(hits[0].clone());
-        }
-    }
-    if let Some(j) = jev {
-        if let Some((i, conf)) = j.pick_button(goal, &usable, hint) {
-            if conf >= super::pursuit::YES && i < usable.len() {
-                return Ok(usable[i].clone());
-            }
-        }
-    }
-    Err(format!("no visible button could be picked from {usable:?}"))
-}
-
-/// Words on a page that say the form went through.
-fn thanks(text: &str) -> bool {
-    let t = text.to_lowercase();
-    ["thank you", "thanks for", "submitted", "application received", "we have received", "successfully", "confirmation"]
-        .iter()
-        .any(|w| t.contains(w))
-}
-
 // ---------------------------------------------------------------- the run
 
 fn call(cfg: &ExecCfg, ctx: &mut TurnCtx, stats: &mut ExecStats, name: &str, args: &Value) -> String {
@@ -433,261 +383,213 @@ pub fn run_form(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit) -> (Exe
     (end, stats)
 }
 
+/// The inputs of a page, as an identity: a new set of inputs is a new thing to think about.
+fn inputs_sig(view: &PageView) -> String {
+    view.fields.iter().map(|f| format!("{}|{}|{}", f.kind, f.group, f.label)).collect::<Vec<_>>().join("\n")
+}
+
+fn note_blank(stats: &mut ExecStats, field: &str) {
+    if !stats.left_blank.iter().any(|b| norm(b) == norm(field)) {
+        stats.left_blank.push(field.to_string());
+    }
+}
+
 fn run_inner(cfg: &ExecCfg, ctx: &mut TurnCtx, pursuit: &mut Pursuit, stats: &mut ExecStats) -> ExecEnd {
     let act = (cfg.svc.act_mode)();
-    let profile = match ensure_profile(cfg, ctx, stats) {
-        Ok(p) => p,
-        Err(e) => return ExecEnd::Handoff(format!("could not load the resume facts: {e}")),
-    };
     let goal = pursuit.goal.clone();
-    let mut planner = FormPlanner::new(cfg.chat, cfg.cancel, &goal, &profile);
     let home = cfg.svc.home.clone();
-    let mut first_page = true;
-    for _page in 0..MAX_PAGES {
+    let Some(jev) = cfg.jev else { return ExecEnd::Handoff("Jev is unavailable".into()) };
+    let mut profile: Option<Profile> = None;
+    let mut thought_about: Vec<String> = Vec::new();
+    // What the goal needs that no page has offered yet, and what has happened so far.
+    let mut pending: Vec<FormEntry> = Vec::new();
+    let mut progress: Vec<String> = Vec::new();
+    let mut problems: Option<String> = None;
+    let mut hint = String::new();
+    let mut replans = 0;
+    let mut idle = 0;
+    let mut planned_once = false;
+    let mut can_scroll = true;
+    for _ in 0..MAX_MOVES {
         if cfg.cancel.is_cancelled() {
             return ExecEnd::Cancelled;
         }
         if cfg.started.elapsed() >= cfg.time {
-            return ExecEnd::Handoff("the fast path ran out of time".into());
+            return ExecEnd::Handoff("the page driver ran out of time".into());
         }
-        let mut view = match read(cfg, ctx) {
+        let spent = stats.usage.total() as usize;
+        if let Some(why) = pursuit.out_of_budget(stats.tool_calls, cfg.started.elapsed().as_secs_f64(), spent) {
+            return ExecEnd::Handoff(format!("budget: {why}"));
+        }
+        let view = match read(cfg, ctx) {
             Ok(v) => v,
             Err(e) => return ExecEnd::Handoff(format!("could not read the page: {e}")),
         };
         stats.pages += 1;
-        // A password box: only the user can pass it.
         if view.fields.iter().any(|f| f.password) {
             return ExecEnd::NeedsUser(
                 "This page asks for a password. I never type those: please log in yourself, then tell me to carry on.".into(),
             );
         }
-        let mut retries = 0;
-        let mut problems: Option<String> = None;
-        loop {
+        // Think about inputs the first time they appear, or again when the page objected.
+        let sig = inputs_sig(&view);
+        let think = !view.fields.is_empty() && (!thought_about.contains(&sig) || problems.is_some());
+        let mut entries: Vec<FormEntry> = pending.clone();
+        if think {
+            if profile.is_none() {
+                profile = Some(ensure_profile(cfg, ctx, stats).unwrap_or_default());
+            }
+            let known = profile.clone().unwrap_or_default();
             let buttons = enabled_buttons(&view);
-            let (rules, remaining) = tools::autofill_entries(&home, &profile, &view.fields, &buttons);
-            let open: Vec<Value> = remaining
-                .iter()
-                .filter(|r| !model_may_not_answer(r["field"].as_str().unwrap_or("")))
-                .cloned()
-                .collect();
-            let blocked: Vec<String> = remaining
-                .iter()
-                .filter(|r| model_may_not_answer(r["field"].as_str().unwrap_or("")))
-                .filter_map(|r| r["field"].as_str().map(String::from))
-                .collect();
-            let need_model = first_page || !open.is_empty() || problems.is_some();
-            let mut entries = rules.clone();
-            let mut advance = String::new();
-            if need_model {
-                let page = planning_view(&view);
-                let plan = match planner.plan_page(page, &rules, &open, problems.as_deref()) {
-                    Ok(p) => p,
-                    Err(e) if e == "cancelled" => return ExecEnd::Cancelled,
-                    Err(e) => return ExecEnd::Handoff(format!("the plan call failed: {e}")),
-                };
-                if problems.is_some() {
-                    stats.replan_calls += 1;
+            let (rules, remaining) = tools::autofill_entries(&home, &known, &view.fields, &buttons);
+            let mut open: Vec<Value> = Vec::new();
+            for r in remaining {
+                let field = r["field"].as_str().unwrap_or("").to_string();
+                if model_may_not_answer(&field) {
+                    note_blank(stats, &field);
                 } else {
-                    stats.plan_calls += 1;
+                    open.push(r);
                 }
-                stats.usage = planner.usage;
-                emit_usage(cfg.svc, if problems.is_some() { "replan" } else { "plan" }, &planner.usage, planner.calls);
-                if first_page {
-                    pursuit.adopt(to_plan(&goal, &plan));
-                    first_page = false;
-                }
-                for e in &plan.entries {
-                    if model_may_not_answer(&e.field) || entries.iter().any(|x| norm(&x.field) == norm(&e.field)) {
-                        continue;
-                    }
+            }
+            let mut planner = FormPlanner::new(cfg.chat, cfg.cancel, &goal, &known);
+            let plan = match planner.plan_page(planning_view(&view), &rules, &open, problems.as_deref()) {
+                Ok(p) => p,
+                Err(e) if e == "cancelled" => return ExecEnd::Cancelled,
+                Err(e) => return ExecEnd::Handoff(format!("the plan call failed: {e}")),
+            };
+            stats.usage.add(&planner.usage);
+            if problems.is_some() {
+                stats.replan_calls += 1;
+            } else {
+                stats.plan_calls += 1;
+            }
+            emit_usage(cfg.svc, if problems.is_some() { "replan" } else { "plan" }, &planner.usage, 1);
+            if !planned_once {
+                pursuit.adopt(to_plan(&goal, &plan));
+                planned_once = true;
+            }
+            hint = plan.advance.clone();
+            for e in &rules {
+                if !entries.iter().any(|x| norm(&x.field) == norm(&e.field)) {
                     entries.push(e.clone());
                 }
-                advance = plan.advance.clone();
-
-                for s in plan.skipped.iter().chain(blocked.iter()) {
-                    if !stats.left_blank.iter().any(|b| norm(b) == norm(s)) {
-                        stats.left_blank.push(s.clone());
-                    }
+            }
+            for e in &plan.entries {
+                // Sensitive answers come only from the user's saved answers, never from the model.
+                if !model_may_not_answer(&e.field) && !entries.iter().any(|x| norm(&x.field) == norm(&e.field)) {
+                    entries.push(e.clone());
                 }
             }
-            for s in &blocked {
-                if !stats.left_blank.iter().any(|b| norm(b) == norm(s)) {
-                    stats.left_blank.push(s.clone());
-                }
+            for s in &plan.skipped {
+                note_blank(stats, s);
             }
-            // Fill: one batch, then read back.
-            if !entries.is_empty() {
-                let args = json!({ "entries": entries.iter().map(|e| json!({ "field": e.field, "value": e.value })).collect::<Vec<_>>() });
-                if let Some(blocked) = pursuit.before_call("form_fill", &args) {
+            thought_about.push(sig);
+            problems = None;
+        }
+        if !entries.is_empty() {
+            let rows: Vec<Value> = entries.iter().map(|e| json!({ "field": e.field, "value": e.value })).collect();
+            let args = json!({ "entries": rows });
+            let r = call(cfg, ctx, stats, "form_fill", &args);
+            pursuit.after_call("form_fill", &args, &r);
+            if r.starts_with("error") {
+                return if cfg.cancel.is_cancelled() { ExecEnd::Cancelled } else { ExecEnd::Handoff(r) };
+            }
+            if !act {
+                let next = if hint.is_empty() { "the next control" } else { &hint };
+                return ExecEnd::Final(format!(
+                    "Dry mode, so nothing was typed. On this page I would fill {} field(s) and then press {next}.",
+                    entries.len()
+                ));
+            }
+            let v: Value = serde_json::from_str(&r).unwrap_or(Value::Null);
+            stats.filled += v["ok"].as_u64().unwrap_or(0) as usize;
+            // Whatever this page did not have is carried on: it may be further along.
+            let unplaced: Vec<String> = v["results"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|x| x["status"] == "not_found")
+                        .filter_map(|x| x["field"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            pending = entries.into_iter().filter(|e| unplaced.contains(&e.field)).collect();
+        }
+        // Decide, from what is really on this page.
+        let wanted: Vec<String> = pending.iter().map(|e| format!("{}: {}", e.field, e.value)).collect();
+        let view = read(cfg, ctx).unwrap_or(view);
+        let controls = enabled_buttons(&view);
+        let Some(mut decision) = jev.next_move(&goal, &progress, &wanted, &controls, &view, &hint, can_scroll) else {
+            return ExecEnd::Handoff("Jev gave no answer about this page".into());
+        };
+        // The LLM read the page and named its next move: if that is a real control here, it stands.
+        // Jev still decides whether the goal is met, and decides alone when there is no suggestion.
+        if !decision.done {
+            if let Some(named) = controls.iter().find(|c| norm(c) == norm(&hint)) {
+                decision.step = Move::Press(named.clone());
+            }
+        }
+        hint.clear();
+        if std::env::var("POINTER_DEBUG_FORMS").is_ok() {
+            println!("DRIVER done={} step={:?} wanted={wanted:?} controls={controls:?}", decision.done, decision.step);
+        }
+        if decision.done && pending.is_empty() {
+            pursuit.mark_verified("the page shows the goal is done");
+            return ExecEnd::Final(report(pursuit, stats));
+        }
+        if !act {
+            return ExecEnd::Final("Dry mode, so nothing was pressed. I would take the next step on this page.".into());
+        }
+        match decision.step {
+            Move::Stuck => {
+                return ExecEnd::Handoff(format!("no control on this page moves the goal on; so far: {}", progress.join("; ")))
+            }
+            Move::Scroll => {
+                let moved = cfg.svc.senses.form_scroll(view.hwnd, true).unwrap_or(false);
+                progress.push(if moved { "scrolled down".to_string() } else { "scrolling moved nothing".to_string() });
+                can_scroll = moved;
+                idle = if moved { 0 } else { idle + 1 };
+            }
+            Move::Press(label) => {
+                let args = json!({ "label": label });
+                if let Some(blocked) = pursuit.before_call("form_click", &args) {
                     return ExecEnd::Handoff(blocked);
                 }
-                let r = call(cfg, ctx, stats, "form_fill", &args);
-                pursuit.after_call("form_fill", &args, &r);
+                let r = call(cfg, ctx, stats, "form_click", &args);
+                pursuit.after_call("form_click", &args, &r);
                 if r.starts_with("error") {
-                    return if cfg.cancel.is_cancelled() { ExecEnd::Cancelled } else { ExecEnd::Handoff(r) };
+                    return if cfg.cancel.is_cancelled() {
+                        ExecEnd::Cancelled
+                    } else if r.starts_with("denied") || r.contains("needs your") {
+                        ExecEnd::Final(format!("I stopped: {}", r.trim_start_matches("error: ")))
+                    } else {
+                        ExecEnd::Handoff(r)
+                    };
                 }
-                if !act {
-                    let n = entries.len();
-                    return ExecEnd::Final(format!(
-                        "Dry mode, so nothing was typed. On this page I would fill {n} field(s) and then press {}.",
-                        if advance.is_empty() { "the next button" } else { &advance }
-                    ));
-                }
-                let verdict = JevVerifier::code_check(&r);
                 let v: Value = serde_json::from_str(&r).unwrap_or(Value::Null);
-                stats.filled += v["ok"].as_u64().unwrap_or(0) as usize;
-                let empty: Vec<String> = v["required_still_empty"]
+                let changed = v["page_changed"].as_bool().unwrap_or(false);
+                let errors: Vec<String> = v["errors"]
                     .as_array()
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                let why = match verdict {
-                    Some(super::pursuit::Verdict::Fails(w)) => Some(w),
-                    _ if !empty.is_empty() => Some(format!("required fields are still empty: {}", empty.join(", "))),
-                    _ => None,
-                };
-                if let Some(why) = why {
-                    // Fields only the user can answer are not a failure of the plan.
-                    let user_only: Vec<&String> = empty.iter().filter(|l| model_may_not_answer(l)).collect();
-                    if !empty.is_empty() && user_only.len() == empty.len() {
-                        return ExecEnd::NeedsUser(format!(
-                            "Before I can go on I need your answer to: {}. Tell me and I will save it.",
-                            empty.join("; ")
-                        ));
+                let outcome = if changed { "the page changed" } else { "nothing changed" };
+                progress.push(format!("pressed {label:?}: {outcome}"));
+                can_scroll = can_scroll || changed;
+                idle = if changed { 0 } else { idle + 1 };
+                if !errors.is_empty() {
+                    replans += 1;
+                    if replans > MAX_REPLANS_PER_PAGE {
+                        return ExecEnd::Handoff(format!("the page keeps objecting: {}", errors.join("; ")));
                     }
-                    let esc = Escalation::FailedVerification { step: 0, why: why.clone() };
-                    retries += 1;
-                    if retries > MAX_REPLANS_PER_PAGE {
-                        return ExecEnd::Handoff(format!("the page still fails: {why}"));
-                    }
-                    problems = Some(esc_text(&esc));
-                    match read(cfg, ctx) {
-                        Ok(v) => view = v,
-                        Err(e) => return ExecEnd::Handoff(e),
-                    }
-                    continue;
-                }
-                view = read(cfg, ctx).unwrap_or(view);
-            } else if !act {
-                return ExecEnd::Final("Dry mode, so nothing was pressed. This page needs no typing; I would press the next button.".into());
-            }
-            // Choose the button, scrolling to find it if it is not in view.
-            let mut button = None;
-            for scroll in 0..=MAX_SCROLLS {
-                let buttons = enabled_buttons(&view);
-                match choose_button(cfg.jev, &goal, &buttons, &advance) {
-                    Ok(b) => {
-                        button = Some(b);
-                        break;
-                    }
-                    Err(_) if scroll < MAX_SCROLLS => {
-                        let moved = cfg.svc.senses.form_scroll(view.hwnd, true).unwrap_or(false);
-                        if !moved {
-                            break;
-                        }
-                        view = read(cfg, ctx).unwrap_or(view);
-                    }
-                    Err(_) => {}
+                    problems = Some(format!("after pressing {label:?} the page said: {}", errors.join("; ")));
                 }
             }
-            let Some(label) = button else {
-                let esc = Escalation::UnexpectedPage("no button moves this page forward".into());
-                retries += 1;
-                if retries > MAX_REPLANS_PER_PAGE {
-                    return ExecEnd::Handoff("no button that moves the form forward could be found".into());
-                }
-                problems = Some(esc_text(&esc));
-                continue;
-            };
-            let args = json!({ "label": label });
-            if let Some(blocked) = pursuit.before_call("form_click", &args) {
-                return ExecEnd::Handoff(blocked);
-            }
-            let r = call(cfg, ctx, stats, "form_click", &args);
-            pursuit.after_call("form_click", &args, &r);
-            if r.starts_with("error") {
-                return if cfg.cancel.is_cancelled() { ExecEnd::Cancelled } else if r.starts_with("denied") || r.starts_with("refused") {
-                    ExecEnd::Final(format!("I stopped: {}", r.trim_start_matches("error: ")))
-                } else {
-                    ExecEnd::Handoff(r)
-                };
-            }
-            if let Some(why) = pursuit.out_of_budget(stats.tool_calls, cfg.started.elapsed().as_secs_f64(), (stats.usage.total() + planner.usage.total()) as usize) {
-                return ExecEnd::Handoff(format!("budget: {why}"));
-            }
-            if pursuit.met() {
-                stats.usage = planner.usage;
-                return ExecEnd::Final(report(pursuit, stats));
-            }
-            // Did the press work? Exact check first.
-            if let Some(super::pursuit::Verdict::Fails(why)) = JevVerifier::code_check(&r) {
-                retries += 1;
-                if retries > MAX_REPLANS_PER_PAGE {
-                    return ExecEnd::Handoff(format!("the page would not move on: {why}"));
-                }
-                problems = Some(why);
-                view = read(cfg, ctx).unwrap_or(view);
-                continue;
-            }
-            // The next page: let it settle, then see what it is.
-            let mut next = read(cfg, ctx);
-            for _ in 0..3 {
-                if next.as_ref().is_ok_and(|v| !v.fields.is_empty() || !v.buttons.is_empty() || thanks(&v.texts.join(" "))) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-                next = read(cfg, ctx);
-            }
-            let page_text = match &next {
-                Ok(v) => v.texts.join(" "),
-                Err(_) => String::new(),
-            };
-            let new_text = serde_json::from_str::<Value>(&r).map(|v| v["new_on_page"].to_string()).unwrap_or_default();
-            let seen_done = thanks(&page_text) || thanks(&new_text);
-            let fields_gone = next.as_ref().map(|v| v.fields.is_empty()).unwrap_or(true);
-            if is_final_label(&label) && (seen_done || fields_gone) {
-                let ok = seen_done
-                    || cfg.jev.and_then(|j| j.submitted(&goal, &format!("{page_text} {new_text}"))).unwrap_or(false);
-                if ok {
-                    pursuit.mark_verified("the page confirmed the submission");
-                    stats.usage = planner.usage;
-                    return ExecEnd::Final(report(pursuit, stats));
-                }
-            }
-            if fields_gone && !seen_done {
-                if let Some(j) = cfg.jev {
-                    if let super::pursuit::Verdict::Surprise(w) = j.expected_page(&goal, &format!("{page_text} {new_text}")) {
-                        retries += 1;
-                        if retries > MAX_REPLANS_PER_PAGE {
-                            return ExecEnd::Handoff(w);
-                        }
-                        problems = Some(format!("after pressing {label:?}: {w}"));
-                        view = next.unwrap_or(view);
-                        continue;
-                    }
-                }
-            }
-            if let Ok(v) = next {
-                // On to the next page: it is planned on its own, in one call.
-                if v.fields.is_empty() && v.buttons.is_empty() {
-                    return ExecEnd::Handoff("the page after the button was empty".into());
-                }
-                break;
-            }
-            return ExecEnd::Handoff("could not read the page after the button".into());
+        }
+        if idle >= MAX_IDLE_MOVES {
+            return ExecEnd::Handoff(format!("nothing is changing the page; so far: {}", progress.join("; ")));
         }
     }
-    ExecEnd::Handoff("budget: too many pages for the fast path".into())
-}
-
-
-fn esc_text(e: &Escalation) -> String {
-    match e {
-        Escalation::UnexpectedPage(w) => format!("the page is not what was expected: {w}"),
-        Escalation::FailedVerification { why, .. } => why.clone(),
-        Escalation::StrategyExhausted => "the same moves keep failing".into(),
-        Escalation::BudgetExhausted(w) => format!("budget: {w}"),
-    }
+    ExecEnd::Handoff("budget: too many moves for the page driver".into())
 }
 
 /// Required fields with nothing in them.

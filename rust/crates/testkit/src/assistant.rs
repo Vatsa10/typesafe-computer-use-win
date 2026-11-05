@@ -230,6 +230,14 @@ impl Senses for HeadlessSenses {
         })
     }
 
+    fn form_scroll(&self, target: isize, down: bool) -> Result<bool, String> {
+        let d = lock(&self.desk);
+        window_ok(&d, &Target::Bound(target))?;
+        let by = if down { "innerHeight*0.8" } else { "-innerHeight*0.8" };
+        let js = format!("(()=>{{const y=scrollY;scrollBy(0,{by});return scrollY!==y}})()");
+        Ok(d.eval(&js)?.as_bool().unwrap_or(false))
+    }
+
     fn focus_window(&self, hwnd: isize) -> Result<(), String> {
         if hwnd == WINDOW_HWND { Ok(()) } else { Err("no such window".into()) }
     }
