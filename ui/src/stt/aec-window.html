@@ -1,0 +1,199 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pointer audio</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; media-src blob: mediastream:">
+<body>
+<audio id="out"></audio>
+<script>
+// The hidden audio window. It owns the microphone and Pointer's voice, so that Chromium's own
+// echo canceller sees what is played (the audio element below) and removes it from what is
+// recorded. It never shows anything and talks only to the shell's main process (aec.js) through
+// the preload bridge.
+//
+//   in:  capture { on }                      open or close the microphone
+//        pcm { id, rate, seq, pcm_b64, last, prebuffer_ms }   a 25 ms piece of Pointer's voice
+//        stop { id }                         cut playback now
+//   out: audio_in { pcm_b64, seq, t }        16 kHz mono 16-bit frames of 30 ms
+//        tts_state { id, state, cut? }       "started" when sound really begins, "ended"
+//        aec_ready { ready, reason? }
+//
+// Audio is base64 of little-endian 16-bit PCM: binary-safe on a line protocol.
+
+const bridge = window.aecBridge;
+const FRAME = 480; // 30 ms at 16 kHz
+
+// ---------------------------------------------------------------- microphone
+let mic = null; // { stream, ctx, node }
+let seq = 0;
+
+const WORKLET = `
+class Framer extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Int16Array(${FRAME}); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const v = Math.max(-1, Math.min(1, ch[i]));
+      this.buf[this.n++] = v < 0 ? v * 32768 : v * 32767;
+      if (this.n === ${FRAME}) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor("framer", Framer);
+`;
+
+function b64(int16) {
+  const bytes = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 4096) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
+  return btoa(s);
+}
+
+async function micOn(silent = false) {
+  if (mic) return;
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+  });
+  const ctx = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+  const node = new AudioWorkletNode(ctx, "framer", { numberOfInputs: 1, numberOfOutputs: 0 });
+  if (!silent) node.port.onmessage = (e) => bridge.send("audio_in", { pcm_b64: b64(e.data), seq: seq++, t: Date.now() });
+  ctx.createMediaStreamSource(stream).connect(node);
+  mic = { stream, ctx, node };
+}
+
+function micOff() {
+  if (!mic) return;
+  const m = mic;
+  mic = null;
+  m.node.port.onmessage = null;
+  m.stream.getTracks().forEach((t) => t.stop());
+  m.ctx.close().catch(() => {});
+}
+
+// ---------------------------------------------------------------- playback
+const out = document.getElementById("out");
+let pctx = null;
+let dest = null;
+let play = null; // { id, queue: [], sources: Set, next, startAt, started, lastSeen, ended }
+let cutUpTo = 0; // playbacks with an id up to this were cut: their late pieces are dropped
+
+function ensurePlayer() {
+  if (pctx) return;
+  pctx = new AudioContext({ latencyHint: "interactive" });
+  dest = pctx.createMediaStreamDestination();
+  out.srcObject = dest.stream;
+  out.play().catch(() => {});
+}
+
+function finish(p, cut) {
+  if (p.ended) return;
+  p.ended = true;
+  bridge.send("tts_state", { id: p.id, state: "ended", cut });
+  if (play === p) play = null;
+}
+
+function schedule(p, samples, rate) {
+  const buf = pctx.createBuffer(1, samples.length, rate);
+  const f = buf.getChannelData(0);
+  for (let i = 0; i < samples.length; i++) f[i] = samples[i] / 32768;
+  const src = pctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(dest);
+  const now = pctx.currentTime;
+  if (p.next < now) p.next = now + 0.005; // an underrun: start again as soon as we can
+  src.start(p.next);
+  p.next += buf.duration;
+  p.sources.add(src);
+  src.onended = () => {
+    p.sources.delete(src);
+    if (p.lastSeen && p.sources.size === 0) finish(p, false);
+  };
+}
+
+function release(p) {
+  // The first sound: the held pieces go out together, and "started" is reported when the device
+  // is expected to be sounding them (scheduled time plus the output latency the context reports).
+  p.started = true;
+  p.next = pctx.currentTime + 0.01;
+  const at = p.next;
+  for (const [s, r] of p.queue) schedule(p, s, r);
+  p.queue = [];
+  const wait = Math.max(0, at - pctx.currentTime + (pctx.outputLatency || 0) + (pctx.baseLatency || 0)) * 1000;
+  setTimeout(() => {
+    if (!p.ended && p.id > cutUpTo) bridge.send("tts_state", { id: p.id, state: "started" });
+  }, wait);
+}
+
+function onPcm(m) {
+  if (m.id <= cutUpTo) return;
+  ensurePlayer();
+  if (pctx.state === "suspended") pctx.resume();
+  if (!play || play.id !== m.id) {
+    if (play) stopPlayback(play.id); // a newer line replaces the old one
+    play = { id: m.id, queue: [], held: 0, sources: new Set(), next: 0, started: false, lastSeen: false, ended: false };
+  }
+  const p = play;
+  const bytes = Uint8Array.from(atob(m.pcm_b64), (c) => c.charCodeAt(0));
+  const samples = new Int16Array(bytes.buffer, 0, bytes.length >> 1);
+  if (samples.length) {
+    if (p.started) schedule(p, samples, m.rate);
+    else {
+      p.queue.push([samples, m.rate]);
+      p.held += (samples.length / m.rate) * 1000;
+    }
+  }
+  if (m.last) p.lastSeen = true;
+  if (!p.started && (p.held >= (m.prebuffer_ms || 0) || m.last)) {
+    if (p.queue.length) release(p);
+    else finish(p, false); // an empty line
+  }
+  if (p.started && p.lastSeen && p.sources.size === 0) finish(p, false);
+}
+
+function stopPlayback(id) {
+  cutUpTo = Math.max(cutUpTo, id);
+  const p = play;
+  if (!p || p.id > id) return;
+  for (const s of p.sources) {
+    s.onended = null;
+    try { s.stop(); s.disconnect(); } catch {}
+  }
+  p.sources.clear();
+  finish(p, true);
+}
+
+// ---------------------------------------------------------------- the shell
+bridge.on(async (m) => {
+  try {
+    if (m.name === "aec_capture") {
+      if (m.on) await micOn();
+      else micOff();
+    } else if (m.name === "tts_pcm") onPcm(m);
+    else if (m.name === "tts_stop") stopPlayback(m.id);
+  } catch (e) {
+    console.error(`${m.name}: ${(e && e.message) || e}`); // shell log; never audio
+    if (m.name === "aec_capture" && m.on) {
+      micOff();
+      bridge.send("aec_ready", { ready: false, reason: String((e && e.message) || e) });
+    }
+  }
+});
+
+// Open and close the microphone once before saying we are ready: the first open of the device
+// is slow, and that belongs to start-up, not to the start of the user's first sentence.
+(async () => {
+  try {
+    await micOn(true);
+    micOff();
+  } catch (e) {
+    return bridge.send("aec_ready", { ready: false, reason: String((e && e.message) || e) });
+  }
+  ensurePlayer();
+  bridge.send("aec_ready", { ready: true });
+})();
+</script>
+</body>

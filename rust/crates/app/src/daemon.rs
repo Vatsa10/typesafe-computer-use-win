@@ -169,6 +169,7 @@ impl Daemon {
         let s = self.runner.state();
         json!({ "running": s.running, "paused": s.paused, "hotkeys": self.hint(),
                 "stt": self.listener.engine(),
+                "aec": crate::voice::window::global().ready(),
                 "mode": self.brain.mode().name(),
                 "stt_lang": std::env::var("CLICKER_STT_LANG").ok().filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "en-US".into()) })
@@ -227,6 +228,50 @@ impl Daemon {
                 Ok(json!({ "listening": self.listener.start_session(conv, purpose)? }))
             }
             "listen_stop" => Ok(json!({ "heard": self.listener.stop()? })),
+            // The echo-cancelling window: its microphone frames, whether it is up, and what its
+            // player is doing (see `voice::window`).
+            "audio_in" => {
+                let pcm = param_str(params, "pcm_b64").ok_or("audio_in needs pcm_b64")?;
+                let seq = params.get("seq").and_then(Value::as_u64);
+                let sent = params.get("t").and_then(Value::as_f64);
+                let samples = crate::voice::window::global().push_mic(seq, sent, pcm)?;
+                Ok(json!({ "samples": samples }))
+            }
+            "aec_ready" => {
+                let ready = params
+                    .get("ready")
+                    .and_then(Value::as_bool)
+                    .ok_or("aec_ready needs ready: true or false")?;
+                crate::voice::window::global().set_ready(ready);
+                if !ready {
+                    if let Some(why) = param_str(params, "reason").filter(|w| !w.is_empty()) {
+                        self.out.line(format!("voice: echo-cancelling window unavailable: {why}"));
+                    }
+                }
+                Ok(json!({ "ready": ready }))
+            }
+            // Say a line aloud now, without the assistant: for the shell's own prompts and for
+            // checking the voice path end to end. Replies at once; the `speech` events follow.
+            "speak" => {
+                let text = param_str(params, "text")
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or("speak needs text")?;
+                if !wcore::config::speak_answers() {
+                    return Err("replies are muted".into());
+                }
+                Ok(json!({ "speaking": crate::tts::speak_async(text) }))
+            }
+            "tts_state" => {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or("tts_state needs an id")?;
+                let state = param_str(params, "state").ok_or("tts_state needs a state")?;
+                let cut = params.get("cut").and_then(Value::as_bool).unwrap_or(false);
+                crate::voice::window::global().on_state(id, state, cut);
+                Ok(json!({ "ok": true }))
+            }
             "heard" => {
                 // What the shell's browser recognizer heard: routed exactly as `say`, unless it
                 // was dictation, which is typed and never read as a command.
@@ -955,7 +1000,7 @@ mod tests {
         let state = d.dispatch("state", &Value::Null).unwrap();
         assert_eq!(
             state,
-            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai", "mode": "quick",
+            json!({ "running": false, "paused": false, "hotkeys": "rightalt bar", "stt": "openai", "aec": false, "mode": "quick",
                     "stt_lang": std::env::var("CLICKER_STT_LANG").unwrap_or_else(|_| "en-US".into()) })
         );
     }
@@ -1376,5 +1421,20 @@ mod tests {
         d.dispatch("set_mode", &json!({ "act": true })).unwrap();
         let (idle, _) = daemon(idle_runner(), &dir);
         assert!(!idle.escape_armed(), "Act mode but nothing running");
+    }
+    #[test]
+    fn the_window_methods_validate_and_never_touch_a_closed_microphone() {
+        let dir = std::env::temp_dir();
+        let (d, _) = daemon(Box::new(Unwired), &dir);
+        let pcm = crate::voice::window::encode(&[1, -2, 3]);
+        // Nothing is capturing: a frame is accepted and dropped.
+        assert_eq!(d.dispatch("audio_in", &json!({ "pcm_b64": pcm, "seq": 1 })).unwrap()["samples"], 0);
+        assert!(d.dispatch("audio_in", &json!({})).is_err());
+        assert!(d.dispatch("audio_in", &json!({ "pcm_b64": "***" })).is_err());
+        assert!(d.dispatch("aec_ready", &json!({})).is_err());
+        assert_eq!(d.dispatch("aec_ready", &json!({ "ready": false })).unwrap()["ready"], false);
+        assert!(d.dispatch("tts_state", &json!({ "state": "started" })).is_err());
+        // A state for a playback that is not current is ignored, not an error.
+        assert_eq!(d.dispatch("tts_state", &json!({ "id": 99, "state": "ended" })).unwrap()["ok"], true);
     }
 }

@@ -156,7 +156,54 @@ pub fn stop() {
         flag.store(true, Ordering::SeqCst);
     }
     cancel_ack();
+    // The echo-cancelling window first: it is told now, not when the playing thread next looks.
+    crate::voice::window::global().cut();
     speech::stop();
+}
+
+/// Play 16-bit mono chunks and block until heard or stopped. Through the echo-cancelling window
+/// while the microphone is open there (Chromium then holds the playback as its echo reference);
+/// otherwise, or when the window goes away before any sound, through this process's own device.
+/// `on_start` runs when sound really begins.
+fn play(
+    rate: u32,
+    rx: &Receiver<Vec<i16>>,
+    stopped: &dyn Fn() -> bool,
+    prebuffer_ms: u32,
+    on_start: impl FnOnce(),
+) -> Result<audio::PlayEnd, String> {
+    use crate::voice::window::{self, Played};
+    let mut on_start: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(on_start));
+    let link = window::global();
+    let mut replay: Vec<i16> = Vec::new();
+    if link.usable_for_playback() {
+        match link.play(rate, rx, stopped, prebuffer_ms, &mut on_start) {
+            Played::Done(end) => return Ok(end),
+            Played::Lost(kept) => {
+                crate::voice::line("voice: the echo-cancelling window closed; playing from the core");
+                replay = kept;
+            }
+        }
+    }
+    let first = on_start.take();
+    let start = move || first.map_or((), |f| f());
+    if replay.is_empty() {
+        return audio::play_stream(rate, rx, stopped, prebuffer_ms, start);
+    }
+    // What the window had been given, then the rest of the line (collected: this is the rare
+    // path, and synthesis runs faster than it plays), into the core's player.
+    loop {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(c) => replay.extend(c),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) if stopped() => break,
+            Err(_) => {}
+        }
+    }
+    let (tx2, rx2) = channel::<Vec<i16>>();
+    let _ = tx2.send(replay);
+    drop(tx2);
+    audio::play_stream(rate, &rx2, stopped, prebuffer_ms, start)
 }
 
 fn mark(action: &str, engine: Tts, cut: bool, first_audio_ms: Option<u128>) {
@@ -291,7 +338,7 @@ fn cloud_speak(engine: Tts, text: &str, stopped: &dyn Fn() -> bool, t0: Instant)
             .map_err(|e| format!("could not start the {} stream: {e}", engine.name()))?;
     }
     let started = AtomicBool::new(false);
-    let played = audio::play_stream(CLOUD_RATE, &rx, stopped, PREBUFFER_MS, || {
+    let played = play(CLOUD_RATE, &rx, stopped, PREBUFFER_MS, || {
         started.store(true, Ordering::SeqCst);
         mark("start", engine, false, Some(t0.elapsed().as_millis()));
     });
@@ -457,7 +504,7 @@ pub fn ack_if_enabled() {
         let t0 = Instant::now();
         let text = ACK_LINES[n];
         let stopped = || flag.load(Ordering::SeqCst) || SPEAKING.load(Ordering::SeqCst) > 0;
-        let result = audio::play_stream(rate, &rx, stopped, 0, || {
+        let result = play(rate, &rx, &stopped, 0, || {
             // Into the shell's echo history, so the clip heard back through the mic is not a request.
             crate::voice::emit(
                 "speech",
