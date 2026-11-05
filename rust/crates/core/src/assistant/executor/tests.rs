@@ -164,6 +164,10 @@ impl Classifier for Jev {
             .iter()
             .map(|(n, q)| {
                 let a = match q {
+                    Question::Noul { .. } if state.get("request").is_some() => {
+                        let said = state["request"].as_str().unwrap_or("").contains(state["answer"].as_str().unwrap_or("?"));
+                        Answer::Noul(if said { 0.9 } else { 0.1 })
+                    }
                     Question::Noul { .. } if n == "objected" => Answer::Noul(if page.contains("invalid") { 0.9 } else { 0.1 }),
                     Question::Noul { .. } => Answer::Noul(if done || !state.get("page_text").is_some() { 0.9 } else { 0.1 }),
                     Question::Choice { criteria, .. } => Answer::Choice(ChoiceAnswer {

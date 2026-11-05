@@ -274,7 +274,7 @@ pub fn run(
     // A goal on a page runs through the page driver first: Jev decides, code acts, the LLM is called
     // only for values and surprises. If it cannot go on, the agent loop takes over where it stopped.
     let on_a_page = |k: pursuit::GoalKind| {
-        matches!(k, pursuit::GoalKind::Form | pursuit::GoalKind::Find | pursuit::GoalKind::General)
+        matches!(k, pursuit::GoalKind::Form | pursuit::GoalKind::Find | pursuit::GoalKind::Open | pursuit::GoalKind::General)
     };
     if let Some(p) = pursuit.as_mut().filter(|p| on_a_page(p.kind)) {
         let jev = cfg.classifier.as_ref().map(|c| {

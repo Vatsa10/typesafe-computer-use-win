@@ -824,6 +824,14 @@ impl JevVerifier {
         Some(Decision { done, objected, step })
     }
 
+    /// Did the user give this answer themselves, in their own request? Used for answers that must
+    /// never be guessed. No answer from Jev means no.
+    pub fn user_stated(&self, goal: &str, field: &str, value: &str) -> bool {
+        let state = json!({ "request": goal, "field": field, "answer": value });
+        self.noul(state, "Does `request` itself clearly give `answer` for `field`, in the user's own words?")
+            .is_some_and(|p| p >= YES)
+    }
+
     /// Does this text say the form was received? None when Jev could not answer.
     pub fn submitted(&self, goal: &str, page: &str) -> Option<bool> {
         let state = json!({ "goal": goal, "page": page.chars().take(1500).collect::<String>() });

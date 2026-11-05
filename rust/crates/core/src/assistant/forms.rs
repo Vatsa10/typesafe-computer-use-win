@@ -236,10 +236,19 @@ pub fn plan(fields: &[FormField], entries: &[FormEntry]) -> (Vec<Planned>, Vec<F
             }
             continue;
         }
-        match pick(&boxes, &entry.value) {
-            Found::One(i) => planned.push(Planned { entry: e, control: i, op: Op::Check(true) }),
-            Found::Many => failed.push(fail("ambiguous")),
-            Found::None => failed.push(fail("not_found")),
+        // A group takes several answers: "Python, Rust" ticks two boxes.
+        let wanted: Vec<&str> = entry.value.split([',', ';']).map(str::trim).filter(|v| !v.is_empty()).collect();
+        let picks: Vec<Found> = wanted.iter().map(|v| pick(&boxes, v)).collect();
+        if picks.iter().any(|p| matches!(p, Found::Many)) {
+            failed.push(fail("ambiguous"));
+        } else if picks.iter().any(|p| matches!(p, Found::None)) {
+            failed.push(fail("not_found"));
+        } else {
+            for p in picks {
+                if let Found::One(i) = p {
+                    planned.push(Planned { entry: e, control: i, op: Op::Check(true) });
+                }
+            }
         }
     }
     (planned, failed)
@@ -360,6 +369,26 @@ pub fn drive(page: &dyn Page, target: isize, entries: &[FormEntry]) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_checkbox_group_takes_several_answers() {
+        let tick = |label: &str| FormField {
+            kind: "checkbox".into(),
+            label: label.into(),
+            group: "Which of these do you know?".into(),
+            value: String::new(),
+            checked: false,
+            required: false,
+            password: false,
+        };
+        let fields = vec![tick("Python"), tick("Rust"), tick("COBOL")];
+        let entry = FormEntry { field: "Which of these do you know?".into(), value: "Python, Rust".into() };
+        let (planned, failed) = plan(&fields, &[entry]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(planned.iter().map(|p| p.control).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
     #[test]
     fn a_radio_with_no_question_is_found_by_its_option() {
         let radio = |label: &str| FormField {
@@ -383,7 +412,6 @@ mod tests {
         assert_eq!(plan(&fields, &[absent]).1[0].status, "not_found");
     }
 
-    use super::*;
 
     fn f(kind: &str, label: &str, group: &str) -> FormField {
         FormField { kind: kind.into(), label: label.into(), group: group.into(), value: String::new(), checked: false, required: false, password: false }
