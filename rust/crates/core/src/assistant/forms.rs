@@ -233,7 +233,17 @@ pub fn plan(fields: &[FormField], entries: &[FormEntry]) -> (Vec<Planned>, Vec<F
             .map(|(i, f)| (i, f.label.clone()))
             .collect();
         if boxes.is_empty() {
-            failed.push(fail("not_found"));
+            // Last resort: a radio named by its own option. Pages often put the question in plain
+            // text no accessibility tree ties to the group, or the question names one of the options.
+            let options = of(&["radio"], false);
+            let named = [&entry.value, &entry.field].into_iter().find_map(|needle| match pick(&options, needle) {
+                Found::One(i) => Some(i),
+                _ => None,
+            });
+            match named {
+                Some(i) => planned.push(Planned { entry: e, control: i, op: Op::Check(true) }),
+                None => failed.push(fail("not_found")),
+            }
             continue;
         }
         match pick(&boxes, &entry.value) {
@@ -360,6 +370,29 @@ pub fn drive(page: &dyn Page, target: isize, entries: &[FormEntry]) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_radio_with_no_question_is_found_by_its_option() {
+        let radio = |label: &str| FormField {
+            kind: "radio".into(),
+            label: label.into(),
+            group: String::new(),
+            value: String::new(),
+            checked: false,
+            required: false,
+            password: false,
+        };
+        let fields = vec![radio("Product Manager"), radio("Software Engineer"), radio("Sales Rep")];
+        let by_value = FormEntry { field: "role".into(), value: "Software Engineer".into() };
+        let by_field = FormEntry { field: "Software Engineer".into(), value: "true".into() };
+        for entry in [by_value, by_field] {
+            let (planned, failed) = plan(&fields, &[entry]);
+            assert!(failed.is_empty(), "{failed:?}");
+            assert_eq!(planned[0].control, 1);
+        }
+        let absent = FormEntry { field: "role".into(), value: "Astronaut".into() };
+        assert_eq!(plan(&fields, &[absent]).1[0].status, "not_found");
+    }
+
     use super::*;
 
     fn f(kind: &str, label: &str, group: &str) -> FormField {

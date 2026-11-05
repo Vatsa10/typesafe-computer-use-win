@@ -200,7 +200,17 @@ impl Senses for HeadlessSenses {
             return Err("the button is gone".into());
         }
         d.settle(8.0);
-        let after = read_view(&d)?;
+        // As on the real desktop: a page showing a loading message has not settled yet.
+        let mut after = read_view(&d)?;
+        while started.elapsed().as_secs() < 12
+            && after.texts.iter().any(|t| {
+                let l = t.to_lowercase();
+                l.contains("loading") || l.contains("please wait")
+            })
+        {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            after = read_view(&d)?;
+        }
         let old: std::collections::HashSet<&String> = before.texts.iter().collect();
         let new_text: Vec<String> = after.texts.iter().filter(|t| !old.contains(t)).cloned().collect();
         let errors: Vec<String> = new_text.iter().filter(|t| forms::looks_like_error(t)).cloned().collect();
