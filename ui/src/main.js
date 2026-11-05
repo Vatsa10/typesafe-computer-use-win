@@ -14,6 +14,7 @@ const path = require("node:path");
 const readline = require("node:readline");
 const { createBridge } = require("./stt/bridge");
 const { createCoreSpeech, createSpeechRouter } = require("./stt/core-speech");
+const { createAec } = require("./stt/aec");
 const prefsStore = require("./assistant/prefs");
 const { createConversation } = require("./assistant/conversation");
 const { createPill } = require("./assistant/pill");
@@ -367,7 +368,12 @@ async function onSttEvent(message) {
 // While Settings records a new combo, pressing an existing one must not open the bar or the panel.
 let recordingHotkeys = false;
 
+// Mic and playback live in a hidden window so Chromium's echo canceller can hear Pointer's own voice
+// and remove it. If it cannot start, the core records and plays by itself.
+const aec = createAec({ call: (method, params) => call(method, params), log: (text) => toPanel({ event: "line", text }) });
+
 function onEvent(message) {
+  if (aec.handleEvent(message)) return;
   if (message.event === "stt") return onSttEvent(message);
   if (message.event === "transcript" && SELFTEST_HOOKS.core) SELFTEST_HOOKS.core({ event: "transcript", words: String(message.text || "").split(/\s+/).filter(Boolean).length, final: message.final });
   if (message.event === "transcript") return coreSpeech.onTranscript(message); // never logged or forwarded
@@ -886,6 +892,7 @@ function buddySelfTest() {
 /* ---------------------------------------------------------------- lifecycle */
 
 app.on("will-quit", () => {
+  aec.shutdown();
   wake.disable();
   speech.shutdown(); // the speech browser this process started
 });
@@ -894,6 +901,7 @@ app.whenReady().then(() => {
   guardMedia();
   startCore();
   createPanel();
+  aec.start(); // after the core, which it reports to
   // The mode comes from the core's settings, which are not readable until it is up.
   [800, 2500, 6000].forEach((ms) => setTimeout(refreshMode, ms));
   setInterval(refreshMode, 15000);
