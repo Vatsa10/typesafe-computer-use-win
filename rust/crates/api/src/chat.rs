@@ -351,6 +351,89 @@ pub fn parse_reply(body: &Value) -> Result<ChatReply, ChatError> {
     })
 }
 
+/// gpt-6 models only reason alongside function tools on the Responses API; on chat completions
+/// tools force reasoning off. Compatible servers keep chat completions.
+fn wants_responses(model: &str, tools: &[Value]) -> bool {
+    model.starts_with("gpt-6") && !tools.is_empty()
+}
+
+fn response_parts(content: &Value) -> Value {
+    match content.as_array() {
+        Some(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|p| match p.get("type").and_then(Value::as_str) {
+                    Some("image_url") => json!({ "type": "input_image", "image_url": p.pointer("/image_url/url") }),
+                    _ => json!({ "type": "input_text", "text": p.get("text").cloned().unwrap_or(json!("")) }),
+                })
+                .collect(),
+        ),
+        None => content.clone(),
+    }
+}
+
+/// The same conversation in Responses form: tool calls and results become their own input items.
+pub fn build_responses_request(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+    let mut input = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        match role {
+            "tool" => input.push(json!({ "type": "function_call_output", "call_id": m["tool_call_id"],
+                                         "output": m["content"].as_str().unwrap_or("") })),
+            "assistant" => {
+                if m["content"].as_str().is_some_and(|t| !t.is_empty()) {
+                    input.push(json!({ "role": "assistant", "content": m["content"] }));
+                }
+                for call in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                    input.push(json!({ "type": "function_call", "call_id": call["id"],
+                                       "name": call.pointer("/function/name"),
+                                       "arguments": call.pointer("/function/arguments") }));
+                }
+            }
+            _ => input.push(json!({ "role": role, "content": response_parts(&m["content"]) })),
+        }
+    }
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            let f = &t["function"];
+            json!({ "type": "function", "name": f["name"], "description": f["description"],
+                    "parameters": f["parameters"], "strict": false })
+        })
+        .collect();
+    json!({ "model": model, "input": input, "tools": tools, "tool_choice": "auto",
+            "reasoning": { "effort": "low" }, "store": false })
+}
+
+pub fn parse_responses_reply(body: &Value) -> Result<ChatReply, ChatError> {
+    let output = body.get("output").and_then(Value::as_array).ok_or_else(|| ChatError::Bad("no output".into()))?;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    content.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                }
+            }
+            Some("function_call") => tool_calls.push(ToolCall {
+                id: item["call_id"].as_str().unwrap_or("call").to_string(),
+                name: item["name"].as_str().ok_or_else(|| ChatError::Bad("a tool call had no name".into()))?.to_string(),
+                arguments: item["arguments"].as_str().unwrap_or("{}").to_string(),
+            }),
+            _ => {}
+        }
+    }
+    let u = |k: &str| body.pointer(&format!("/usage/{k}")).and_then(Value::as_u64).unwrap_or(0);
+    let cached = u("input_tokens_details/cached_tokens");
+    Ok(ChatReply {
+        usage: Usage { input: u("input_tokens").saturating_sub(cached), output: u("output_tokens"), cache_read: cached, cache_write: 0 },
+        content,
+        tool_calls,
+        thinking: Vec::new(),
+    })
+}
+
 impl Chat for ChatClient {
     fn complete(
         &self,
@@ -362,11 +445,14 @@ impl Chat for ChatClient {
             return Err(ChatError::Cancelled);
         }
         let provider = self.provider;
+        let responses = provider == Provider::OpenAi && wants_responses(&self.model, tools);
         let body = match provider {
+            Provider::OpenAi if responses => build_responses_request(&self.model, messages, tools),
             Provider::OpenAi => build_request(&self.model, messages, tools),
             Provider::Claude => crate::anthropic::build_request(&self.model, messages, tools),
         };
-        let url = format!("{}/chat/completions", self.base_url);
+        let path = if responses { "responses" } else { "chat/completions" };
+        let url = format!("{}/{path}", self.base_url);
         let url_base = self.base_url.clone();
         let key = self.key.clone();
         let timeout = self.timeout;
@@ -386,6 +472,7 @@ impl Chat for ChatClient {
             match rx.recv_timeout(POLL) {
                 Ok(result) => {
                     return result.and_then(|v| match provider {
+                        Provider::OpenAi if responses => parse_responses_reply(&v),
                         Provider::OpenAi => parse_reply(&v),
                         Provider::Claude => crate::anthropic::parse_reply(&v),
                     })
@@ -672,6 +759,33 @@ mod tests {
                 None => std::env::remove_var(n),
             }
         }
+    }
+
+    #[test]
+    fn a_tool_turn_converts_to_responses_and_back() {
+        let tool = json!({ "type": "function", "function": { "name": "pick", "description": "d", "parameters": {} } });
+        let messages = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "look" },
+                                                 { "type": "image_url", "image_url": { "url": "data:x" } }] }),
+            json!({ "role": "assistant", "content": "", "tool_calls": [
+                { "id": "c1", "type": "function", "function": { "name": "pick", "arguments": "{}" } }] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": "ok" }),
+        ];
+        let r = build_responses_request("gpt-6-luna", &messages, &[tool]);
+        assert_eq!(r["reasoning"]["effort"], "low");
+        assert_eq!(r["tools"][0]["name"], "pick");
+        assert_eq!(r["input"][1]["content"][1]["type"], "input_image");
+        assert_eq!(r["input"][2]["type"], "function_call");
+        assert_eq!(r["input"][3]["type"], "function_call_output");
+        let reply = parse_responses_reply(&json!({ "output": [
+            { "type": "reasoning" },
+            { "type": "message", "content": [{ "type": "output_text", "text": "hi" }] },
+            { "type": "function_call", "call_id": "c2", "name": "pick", "arguments": "{}" }],
+            "usage": { "input_tokens": 10, "output_tokens": 2, "input_tokens_details": { "cached_tokens": 4 } } })).unwrap();
+        assert_eq!((reply.content.as_str(), reply.tool_calls[0].id.as_str()), ("hi", "c2"));
+        assert_eq!((reply.usage.input, reply.usage.cache_read), (6, 4));
+        assert!(wants_responses("gpt-6-luna", &[json!({})]) && !wants_responses("gpt-6-luna", &[]));
     }
 
     #[test]
