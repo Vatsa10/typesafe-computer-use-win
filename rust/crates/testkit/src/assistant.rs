@@ -218,6 +218,16 @@ impl Senses for HeadlessSenses {
         })
     }
 
+    fn form_back(&self, target: isize) -> Result<bool, String> {
+        let d = lock(&self.desk);
+        window_ok(&d, &Target::Bound(target))?;
+        let before = read_view(&d)?;
+        d.eval("history.back();true")?;
+        d.settle(4.0);
+        let after = read_view(&d)?;
+        Ok(before.texts != after.texts)
+    }
+
     fn form_scroll(&self, target: isize, down: bool) -> Result<bool, String> {
         let d = lock(&self.desk);
         window_ok(&d, &Target::Bound(target))?;

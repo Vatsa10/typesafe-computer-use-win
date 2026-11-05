@@ -221,6 +221,11 @@ pub trait Senses: Send + Sync {
         Err("scrolling pages is not available here".into())
     }
 
+    /// The browser's Back, on the bound window. Whether the page changed.
+    fn form_back(&self, _target: isize) -> Result<bool, String> {
+        Err("going back is not available here".into())
+    }
+
     /// Bring the window `hwnd` forward. Only called in Act mode.
     fn focus_window(&self, _hwnd: isize) -> Result<(), String> {
         Err("focusing windows is not available here".into())

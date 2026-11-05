@@ -160,6 +160,16 @@ pub fn press(vk: u16, ctrl: bool) {
     }
 }
 
+/// The browser's Back: Alt+Left.
+pub fn press_back() {
+    const VK_MENU_KEY: u16 = 0x12;
+    const VK_LEFT_KEY: u16 = 0x25;
+    key_event(VK_MENU_KEY, 0, KEYBD_EVENT_FLAGS(0));
+    key_event(VK_LEFT_KEY, 0, KEYBD_EVENT_FLAGS(0));
+    key_event(VK_LEFT_KEY, 0, KEYEVENTF_KEYUP);
+    key_event(VK_MENU_KEY, 0, KEYEVENTF_KEYUP);
+}
+
 /// Type text as Unicode, one event pair per UTF-16 code unit.
 ///
 /// `KEYEVENTF_UNICODE` carries the code unit in the scan code, so the text arrives whatever

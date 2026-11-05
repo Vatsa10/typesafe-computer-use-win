@@ -171,7 +171,11 @@ impl Classifier for Jev {
                     Question::Noul { .. } if n == "objected" => Answer::Noul(if page.contains("invalid") { 0.9 } else { 0.1 }),
                     Question::Noul { .. } => Answer::Noul(if done || !state.get("page_text").is_some() { 0.9 } else { 0.1 }),
                     Question::Choice { criteria, .. } => Answer::Choice(ChoiceAnswer {
-                        choice: criteria.first().map(|c| c.0.clone()).unwrap_or_else(|| "stuck".into()),
+                        choice: if n == "left" && done {
+                            "all_done".into()
+                        } else {
+                            criteria.first().map(|c| c.0.clone()).unwrap_or_else(|| "stuck".into())
+                        },
                         confidence: 0.9,
                         probabilities: vec![],
                     }),
@@ -209,6 +213,8 @@ struct Rig {
 }
 
 fn rig(tag: &str, site: Arc<Site>, script: Vec<crate::assistant::testing::Script>) -> Rig {
+    let mut script = script;
+    script.insert(0, crate::assistant::testing::saying(r#"["apply and submit"]"#));
     let chat = FakeChat::scripted(script);
     let h = Harness::with_senses(tag, chat.clone(), Limits::default(), site.clone());
     h.act.store(true, Ordering::SeqCst);
@@ -255,8 +261,8 @@ fn a_two_page_form_takes_one_model_call_per_page_and_none_for_the_rest() {
         ExecEnd::Final(t) => assert!(t.starts_with("Done, and checked"), "{t}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(r.chat.calls().len(), 3, "one plan call per page and one check of done, nothing per field");
-    assert_eq!((stats.plan_calls, stats.replan_calls), (2, 0));
+    assert_eq!(r.chat.calls().len(), 4, "the parts, one plan per page and one check of done, nothing per field");
+    assert_eq!((stats.plan_calls, stats.replan_calls), (3, 0));
     let typed = r.site.typed.lock().unwrap().clone();
     assert_eq!(typed.get("full name").map(String::as_str), Some("Ada Lovelace"));
     assert_eq!(typed.get("email").map(String::as_str), Some("ada@example.com"));
@@ -294,9 +300,9 @@ fn a_failed_next_is_one_replan_and_then_goes_on() {
     );
     let (end, stats) = go(&r);
     assert!(matches!(end, ExecEnd::Final(_)), "{end:?}");
-    assert_eq!((stats.plan_calls, stats.replan_calls), (2, 1), "the model is called again only because the press failed");
+    assert_eq!((stats.plan_calls, stats.replan_calls), (3, 1), "the model is called again only because the press failed");
     let seen = r.chat.calls();
-    assert!(seen[1].messages[1]["content"].as_str().unwrap().contains("problems_with_the_last_attempt"));
+    assert!(seen[2].messages[1]["content"].as_str().unwrap().contains("problems_with_the_last_attempt"));
 }
 
 #[test]

@@ -643,6 +643,8 @@ pub enum Move {
     Scroll,
     /// The page has not finished showing what it is going to show.
     Wait,
+    /// Back to the previous page: this one is a dead end.
+    Back,
     Stuck,
 }
 
@@ -740,6 +742,7 @@ impl JevVerifier {
         hint: &str,
         can_scroll: bool,
         known: &super::pagestate::PageState,
+        parts: &[String],
     ) -> Option<Decision> {
         const MAX_CONTROLS: usize = 200;
         let shown: Vec<&String> = controls.iter().filter(|c| !c.trim().is_empty()).take(MAX_CONTROLS).collect();
@@ -749,14 +752,20 @@ impl JevVerifier {
             criteria.push(("scroll".into(), Some("Scroll down: what is needed may be further down this page.".into())));
         }
         criteria.push(("wait".into(), Some("The page is still loading: wait for it to finish.".into())));
+        criteria.push(("back".into(), Some("Go back to the previous page: this page is a dead end or a mistake.".into())));
         criteria.push(("stuck".into(), Some("Nothing on this page helps with what is left of the goal.".into())));
+        let mut left: Vec<(String, Option<String>)> =
+            parts.iter().enumerate().map(|(i, p)| (format!("p{i}"), Some(p.clone()))).collect();
+        left.push(("all_done".into(), Some("Every part of the goal is finished and the page shows it.".into())));
         let questions = vec![
             (
-                "done".to_string(),
-                Question::Noul {
-                    instructions: "Going by `page_text` and `progress`, has the whole of `goal` been achieved, with \
-                                   nothing left to do? A page that still expects input or shows errors is not done."
+                "left".to_string(),
+                Question::Choice {
+                    instructions: "Going through `goal_parts` in order, against `progress` and the page, which is the \
+                                   first part not finished yet? A part counts as finished only if `progress` or the \
+                                   page shows it really happened."
                         .into(),
+                    criteria: left,
                 },
             ),
             (
@@ -792,6 +801,7 @@ impl JevVerifier {
             .collect();
         let state = json!({
             "goal": goal,
+            "goal_parts": parts,
             "progress": progress.iter().rev().take(12).rev().collect::<Vec<_>>(),
             "still_needed": still_needed,
             "suggested_by_planner": hint,
@@ -805,12 +815,13 @@ impl JevVerifier {
         let mut step = Move::Stuck;
         for (name, a) in answers {
             match (name.as_str(), a) {
-                ("done", Answer::Noul(p)) => done = p >= YES,
+                ("left", Answer::Choice(c)) => done = c.choice == "all_done",
                 ("objected", Answer::Noul(p)) => objected = p >= YES,
                 ("next", Answer::Choice(c)) => {
                     step = match c.choice.as_str() {
                         "scroll" => Move::Scroll,
                         "wait" => Move::Wait,
+                        "back" => Move::Back,
                         other => other
                             .strip_prefix('c')
                             .and_then(|i| i.parse::<usize>().ok())

@@ -251,6 +251,17 @@ impl Senses for LiveSenses {
         Ok(platform::uia::page_scan(target).signature() != before)
     }
 
+    fn form_back(&self, target: isize) -> Result<bool, String> {
+        resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
+        if platform::winlist::foreground() != target {
+            return Err("the window in front is not the form's window: nothing was pressed".into());
+        }
+        let before = platform::uia::page_scan(target).signature();
+        platform::input::press_back();
+        std::thread::sleep(Duration::from_millis(600));
+        Ok(platform::uia::page_scan(target).signature() != before)
+    }
+
     fn form_click(&self, target: isize, label: &str) -> Result<wcore::assistant::forms::ClickReport, String> {
         use wcore::assistant::forms::{pick_button, verify_focus, ClickReport};
         resolve_form_window(&wcore::assistant::forms::Target::Bound(target))?;
